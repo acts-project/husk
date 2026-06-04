@@ -85,6 +85,36 @@ def test_long_build_gets_fresh_grace_at_active(clock):
     assert "rebuild" in backend.ops()
 
 
+def test_runner_loss_drains_not_unhealthy(clock):
+    # A long-lived slot whose JIT runner deregisters at job end is ACTIVE with no
+    # runner for a moment before the VM powers off. That drain window must be
+    # treated as STARTING (grace from the runner loss), NOT UNHEALTHY/rebuilt —
+    # even though the slot became ACTIVE long ago. This is the "regular" unhealthy
+    # the boot-anchored grace caused once per recycle.
+    runner = make_runner(id=1, name="husk-1-c0", status="online", busy=False)
+    backend = FakeBackend(slots=[make_slot(id="vm-1", name="husk-1", status="ACTIVE")])
+    github = FakeGitHub(runners=[runner])
+    cfg = make_config(min_ready=1, max_total=1, startup_grace=300)
+    ctrl = make_controller(backend, github, cfg, clock)
+
+    ctrl.tick()
+    clock.advance(1000)  # slot has had its runner far longer than startup_grace
+    ctrl.tick()
+    assert "rebuild" not in backend.ops()
+
+    # Job ends: runner deregisters, VM still ACTIVE momentarily.
+    github.runners = []
+    clock.advance(5)  # one fast tick later
+    ctrl.tick()
+    assert "rebuild" not in backend.ops()  # draining, not unhealthy
+    assert ("mark_active", "vm-1") in backend.calls  # origin persisted for status
+
+    # If it never powers off and stays runnerless past grace, THEN unhealthy.
+    clock.advance(400)
+    ctrl.tick()
+    assert "rebuild" in backend.ops()
+
+
 def test_active_transition_persists_grace_origin(clock):
     # After huskd sees a slot reach ACTIVE, a *separate* stateless observer (what
     # `huskctl status` is) must NOT independently classify it UNHEALTHY — huskd

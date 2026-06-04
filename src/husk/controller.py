@@ -52,6 +52,7 @@ class Controller:
         self.first_seen_state: dict[str, tuple[SlotState, float]] = {}
         self.last_provision_action: dict[str, float] = {}
         self.prev_status: dict[str, str] = {}
+        self.runner_present: set[str] = set()
         self.pending_start: set[str] = set()
         self.cycle_counter: dict[str, int] = {}
 
@@ -106,6 +107,7 @@ class Controller:
         # 2. CLASSIFY
         classified = self._classify_all(slots, runners, now)
         busy = sum(1 for _, _, st in classified if st is SlotState.BUSY)
+        self._track_runner_presence(classified, now)
 
         # 3. PER-SLOT REMEDIATION (one action max per slot)
         for s, runner, state in classified:
@@ -336,6 +338,33 @@ class Controller:
                 self.last_provision_action[slot.id] = now  # fresh grace
                 log.debug("first sight of %s: granted fresh startup grace", slot.id)
 
+    def _track_runner_presence(self, classified, now: float) -> None:
+        """Keep the no-runner grace origin anchored to 'last had a runner'.
+
+        A JIT runner deregisters at job end (and huskd deletes it on idle-reap),
+        then the VM powers off a few seconds later — so a long-lived slot spends a
+        brief ACTIVE-without-runner window before reaching SHUTOFF. Anchoring grace
+        to boot would flag that window UNHEALTHY (and rebuild the slot) every
+        recycle. Instead: while a runner is attached, refresh the origin each tick;
+        when it disappears while still ACTIVE, anchor grace to the loss and persist
+        it (so a stateless `huskctl status` reading metadata agrees) — the slot is
+        draining, not unhealthy. A slot whose runner NEVER appeared is never in
+        runner_present, so genuine cloud-init failures still go UNHEALTHY on time."""
+        for s, runner, _state in classified:
+            if runner is not None and runner.online:
+                self.last_provision_action[s.id] = now
+                self.runner_present.add(s.id)
+            elif s.id in self.runner_present:
+                self.runner_present.discard(s.id)
+                if s.status == "ACTIVE":  # draining toward SHUTOFF, not unhealthy
+                    self.last_provision_action[s.id] = now
+                    self._safe(
+                        lambda: self.backend.mark_active(s), f"mark_active {s.id}"
+                    )
+                    log.debug(
+                        "slot %s runner gone while ACTIVE; draining (grace reset)", s.id
+                    )
+
     def _note_active_transition(self, slot: Slot, now: float) -> None:
         """Restart the startup-grace clock when a slot first reaches ACTIVE.
 
@@ -369,6 +398,7 @@ class Controller:
                 if k not in live:
                     del d[k]
         self.pending_start &= live
+        self.runner_present &= live
         self._known &= live
 
     def _forget(self, slot_id: str) -> None:
@@ -377,6 +407,7 @@ class Controller:
         self.prev_status.pop(slot_id, None)
         self.cycle_counter.pop(slot_id, None)
         self.pending_start.discard(slot_id)
+        self.runner_present.discard(slot_id)
         self._known.discard(slot_id)
 
     def _provision_age(self, slot_id: str, now: float) -> float | None:
