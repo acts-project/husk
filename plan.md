@@ -158,6 +158,18 @@ Brief divergence between backends after a policy change fails closed —
 one backend may reject what another accepts for a few minutes, never
 the other way round.
 
+**Implemented (POC, 2026-06-04).** A coarse first cut of the husk egress
+policy now ships in the controller's cloud-init (`src/husk/cloudinit.py`): an
+`nftables` ruleset loaded by host root just before the (untrusted) runner
+starts — *after* provisioning, so package/runner installs keep full network
+(CERN mirrors included). It is default-*allow* with explicit drops of the
+CERN-internal CIDRs (`53`/`123` kept open, since CERN's own resolvers live in
+those ranges); idempotent, so each rebuild reapplies it. This is the
+"deny CERN-internal, allow public" property — not yet the full `husk-policy`
+single-source-of-truth repo, nor the default-deny stricter mode below. Verified
+by the `husk-firewall` workflow (see Phase 5). Rolled onto live slots with
+`huskctl recycle --all`.
+
 **Stricter mode (future).** The same machinery can render a
 default-deny ruleset from a second profile in `policy.toml`, with the
 GitHub `meta` refresh job becoming relevant for the allowlist. Selected
@@ -616,8 +628,11 @@ polish.
 ### Phase 3 — Automate via cloud-init + systemd
 
 Status: **DONE** (2026-06-04). Scope validated: **A–C (recycle mechanics)**.
-Deferred to later: network-policy/nftables tests, and re-running the full
-container/action compat matrix (already validated by hand in Phase 2).
+A coarse `nftables` egress firewall has since landed in the controller's
+cloud-init (deny CERN-internal, allow public; see *Network policy rollout* and
+the `husk-firewall` probe in Phase 5); the full `husk-policy` allowlist and the
+container/action compat re-run (already validated by hand in Phase 2) remain
+deferred.
 
 Encode Phase 2 as a reproducible cloud-init script. This is the **architecture
 that goes into Phase 6**, not a throwaway test.
@@ -975,9 +990,11 @@ keep iterating on the controller (Phase 6) against the cloud-init slot.
 
 ### Phase 5 — Deliberate failure-mode testing
 
-Status: **prioritized for a non-HA system** (2026-06-04); execution pending.
-Most scenarios are gated on the controller (Phase 6) or the firewall
-(husk-policy); only three are testable manually now.
+Status: **prioritized for a non-HA system** (2026-06-04). The controller
+(Phase 6) now exists and runs live against CERN OpenStack, and a coarse egress
+firewall ships in cloud-init — so the previously-gated controller and
+network-egress scenarios are now runnable. The fail-safe matrix is covered by
+unit tests (FakeBackend); the live smoke runs remain to be ticked off.
 
 #### Prioritization (decided 2026-06-04 — this is NOT an HA system)
 
@@ -1017,9 +1034,12 @@ bad states *detectable* for manual cleanup.
      storm; **single-controller lock** (flock pidfile, or an OpenStack-side
      lease) so an accidental double-run can't fight over slots.
 
-**Gated on the firewall** (husk-policy, deferred in Phase 3): every
-network-egress / firewall-tamper test below. Do them when the nftables policy
-exists, not before.
+**Network-egress / firewall-tamper tests** — a coarse `nftables` egress policy
+now ships in cloud-init (see *Network policy rollout*), so these are no longer
+gated. The `husk-firewall` workflow asserts the core property (public reachable,
+`landb.cern.ch:443` blocked); `evade.yml` covers firewall-tamper from inside an
+unprivileged job. The full default-deny `husk-policy` allowlist remains future
+work.
 
 **Fail-safe-only (manual recovery is fine — do NOT build auto-recovery for
 these):** rebuild-fails, hypervisor-dies-mid-rebuild, network-drop-mid-job,
@@ -1033,9 +1053,10 @@ This argues for building the `Backend` protocol seam (Phase 6) **first** so
 failures are injectable. ~4 live smokes on top: tag filter,
 broken-cred-no-destroy, over-quota-no-orphan, double-run-refused.
 
-#### Testable manually NOW (before the controller exists)
+#### Testable with just a dispatched workflow (no controller internals needed)
 
-Only three slot-level properties — the rest is gated on Phase 6 or the firewall:
+Slot-level properties testable with just a dispatched workflow (the controller
+and a coarse firewall now exist, so all four run today):
 
 1. **Unprivileged boundary** — `evade.yml` (single job, `husk-phase3` label):
    `id`, `sudo -n true`, `sudo shutdown -c`, `systemctl mask poweroff.target`,
@@ -1048,6 +1069,10 @@ Only three slot-level properties — the rest is gated on Phase 6 or the firewal
 3. **`OnFailure` poweroff** — a one-step `exit 1` job; confirm the slot powers
    off on a *failed* job too (not just success), so a crash still recycles
    instead of stranding the slot `ACTIVE`.
+4. **Egress firewall** — `husk-firewall.yml` (single job, `husk-phase3` label):
+   confirms the runner reaches the public internet but a TCP connect to
+   `landb.cern.ch:443` is refused. Green once a slot has recycled onto the coarse
+   cloud-init policy (`huskctl recycle --all` rolls it out to live slots).
 
 Optional recon (informs the Phase 6 catch): revoke the OpenStack credential,
 make one SDK call (`conn.compute.servers()`), note the exception type/message.
@@ -1141,7 +1166,23 @@ controller will handle correctly.
 
 ### Phase 6 — Build the controller (`huskd`)
 
-Status: not yet done.
+Status: **POC built and validated live (2026-06-04).** The controller runs
+against real CERN OpenStack from `src/husk/` — `Backend` protocol + slot
+classifier + non-blocking tick loop + `OpenStackBackend` + `FakeBackend`,
+`pydantic-settings` config, and the `huskd`/`huskctl` typer CLIs, behind ~80 unit
+tests. It maintains `min_ready`, respects `max_total`, recycles slots via
+rebuild→start, enforces the fail-safe invariants (list-raises aborts the tick;
+destroy only on ERROR/decommission), does hysteresis-guarded ramp-down, publishes
+a `ControllerState` snapshot served over HTTP (`/status` `/metrics` `/healthz`),
+and tracks per-slot timing (cloud-init / recycle durations, live fraction).
+Operator tooling: `huskctl status [-w]`, `huskctl recycle [--all]` (stops slots so
+the loop rebuilds them with freshly rendered cloud-init), `huskctl reap`.
+
+**Remaining for production** (the checklist below is the original target; much of
+the core is done): the prod OpenStack application credential + rotation, GitHub
+5xx/backoff hardening, the full Prometheus counter/histogram set + Grafana
+alerting (only a gauge subset is emitted today), `MAX_SLOT_AGE` periodic recycle,
+GitHub App auth (Phase 7), and PaaS deploy (Phase 6b).
 
 By this point all mechanics are validated. Implementation should be mechanical.
 
