@@ -1,2 +1,10 @@
 .env
 *.pyc
+.venv/
+__pycache__/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+husk-test
+config.toml

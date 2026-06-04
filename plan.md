@@ -1494,3 +1494,5 @@ before Phase 6:
     `husk-policy/`. Probably keep `pf` for Cilicon (native, no extra
     deps on the Mac) and `nftables` for libvirt — accept the duplicated
     template.
+11. Should we support flavor migration? If the target flavor (or image for that matter) changes,
+    the controller should try to recreate outdated VMs using the new configuration (reconcile existing vs target).
