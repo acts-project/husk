@@ -975,19 +975,102 @@ keep iterating on the controller (Phase 6) against the cloud-init slot.
 
 ### Phase 5 — Deliberate failure-mode testing
 
-Status: not yet done.
+Status: **prioritized for a non-HA system** (2026-06-04); execution pending.
+Most scenarios are gated on the controller (Phase 6) or the firewall
+(husk-policy); only three are testable manually now.
+
+#### Prioritization (decided 2026-06-04 — this is NOT an HA system)
+
+There is no HA, and after-the-fact manual recovery during edge cases is
+acceptable. So the goal of Phase 5 is **not auto-recovery**. In priority order:
+(1) are the safety boundaries actually enforced, (2) does the controller fail
+*safe* — never destroy what it didn't create, never run away creating, (3) are
+bad states *detectable* for manual cleanup.
+
+**Must test (manual recovery can't save you here):**
+
+1. **Timeout / poweroff enforcement** — the security keystone. An unprivileged
+   runner must not outlive its slot. The slot side is testable now (see below);
+   the real bound on a hung/malicious job is the **controller**, because the slot
+   does NOT self-bound a *running* job — poweroff fires only when the runner
+   *exits*, and `shutdown -h +360` is 6h out.
+   - **Timeout action = `server stop` (→ SHUTOFF → rebuild), NOT destroy.**
+     Powering off kills the runner, and SHUTOFF is already the recycle state.
+     Reserve `destroy` for unrecoverable (`ERROR`) slots.
+   - **The controller does not need to signal GitHub.** When the runner vanishes,
+     GitHub fails the job itself once heartbeats stop ("lost communication with
+     the server"). The "zombie window" (how long that takes) is worth
+     **measuring**. Optional prompt-fail: `POST /actions/runs/{run_id}/cancel`
+     (needs `Actions: write` + runner→run mapping via `/runs?status=in_progress`
+     then `/runs/{id}/jobs` matching `runner_name`) — Phase 6 polish, not required.
+     - Empirically, the zombie window is about 10 min, probably worth signaling to GitHub early, but can treat as follow up optimization
+2. **Controller fail-safe** — the only irreversible automated action.
+   - Tag filter: `list_slots()` always filters `managed-by=husk`; destroy/rebuild
+     only ever target slots returned by `list_slots()`. (Live-testable now.)
+   - Auth/API failure must **ABORT the tick**, never be read as "no slots ⇒
+     destroy". Distinct branches: list *raises* (abort) vs list returns `[]`
+     (may create). → **Phase 6 unit test** against a FakeBackend; there's no
+     reconcile loop to exercise yet.
+3. **Runaway-cost guards** — needs the pool/controller; all Phase 6:
+   - capacity full ⇒ zero creates; failed create ⇒ caught, logged, no orphaned
+     `BUILD`/`ERROR` ghost; persistent failure ⇒ one attempt/slot/tick, no retry
+     storm; **single-controller lock** (flock pidfile, or an OpenStack-side
+     lease) so an accidental double-run can't fight over slots.
+
+**Gated on the firewall** (husk-policy, deferred in Phase 3): every
+network-egress / firewall-tamper test below. Do them when the nftables policy
+exists, not before.
+
+**Fail-safe-only (manual recovery is fine — do NOT build auto-recovery for
+these):** rebuild-fails, hypervisor-dies-mid-rebuild, network-drop-mid-job,
+GitHub API outage, cloud-init-didn't-re-run. Sole requirement: the controller
+doesn't crash and doesn't react destructively (covered by fail-safe test #2).
+Ending in a *detectable* bad state is enough.
+
+**Test as unit tests (FakeBackend), not live:** all of #2's auth-safety and all
+of #3 — inject raise/empty/full, assert no-destroy / no-create / bounded-create.
+This argues for building the `Backend` protocol seam (Phase 6) **first** so
+failures are injectable. ~4 live smokes on top: tag filter,
+broken-cred-no-destroy, over-quota-no-orphan, double-run-refused.
+
+#### Testable manually NOW (before the controller exists)
+
+Only three slot-level properties — the rest is gated on Phase 6 or the firewall:
+
+1. **Unprivileged boundary** — `evade.yml` (single job, `husk-phase3` label):
+   `id`, `sudo -n true`, `sudo shutdown -c`, `systemctl mask poweroff.target`,
+   `nft flush ruleset`, then `sleep`. Every privileged attempt must fail in the
+   job log. Highest value — the premise of the untrusted-runner model.
+2. **Stop-mid-job + measure the GitHub zombie window** — during a sleeping job,
+   `openstack --os-cloud cern server stop <id>`. Confirm `SHUTOFF` + runner dies,
+   and **time how long until GitHub marks the job failed** (and capture the
+   message). Answers "do we need to signal GitHub?" empirically.
+3. **`OnFailure` poweroff** — a one-step `exit 1` job; confirm the slot powers
+   off on a *failed* job too (not just success), so a crash still recycles
+   instead of stranding the slot `ACTIVE`.
+
+Optional recon (informs the Phase 6 catch): revoke the OpenStack credential,
+make one SDK call (`conn.compute.servers()`), note the exception type/message.
+
+#### Detailed scenario reference
 
 Break things on purpose. Each scenario teaches what the controller needs.
+(Priorities above govern which of these actually get done and when.)
 
 - [ ] **Idle slot, no jobs**: bring up a slot, don't trigger any workflow
   - [ ] Verify: runner sits idle indefinitely (no native timeout)
   - [ ] Manually `DELETE /runners/{id}` → runner exits → VM powers off
   - [ ] This validates the idle-reaper mechanism
 - [ ] **Long-running job**: workflow with `run: sleep 99999`
-  - [ ] Controller force-destroy fires after `MAX_JOB_DURATION` (primary)
-  - [ ] `shutdown -h +N` fires as fallback (only effective if runner is honest;
-    runner is unprivileged so it can't `shutdown -c`)
-  - [ ] Job logs report failure on GitHub side
+  - [ ] Controller `server stop` fires after `MAX_JOB_DURATION` (primary) →
+    SHUTOFF → rebuild. NOT destroy (stop kills the runner and SHUTOFF is the
+    recycle state; destroy is only for unrecoverable slots).
+  - [ ] `shutdown -h +360` is the slot-side fallback only (6h; the runner is
+    unprivileged so it can't `shutdown -c`). The slot does NOT self-bound a
+    running job — the controller stop is the real bound.
+  - [ ] GitHub fails the job on its own after the runner stops heartbeating;
+    measure that "zombie window". Proactive cancel is optional (needs
+    `Actions: write`), not required.
 - [ ] **Non-cooperative shutdown attempt**: workflow that tries to evade timeout:
 
   ```yaml
