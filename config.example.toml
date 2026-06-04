@@ -1,0 +1,36 @@
+# Husk controller config. Precedence: env (HUSK_*) > this file > defaults.
+# Env override examples:
+#   HUSK_BACKEND__MIN_READY=2  HUSK_GITHUB__REPO=acts-project/foo
+# The GitHub PAT is NOT stored here — supply it via env HUSK_GITHUB__PAT (local
+# dev) or [github].pat_path pointing at a mounted k8s Secret file (0400).
+
+[github]
+repo = "acts-project/husk-test"
+# pat_path = "/etc/husk/github-pat"   # k8s Secret mount; or set HUSK_GITHUB__PAT
+
+[controller]
+lock_path = "/tmp/huskd.lock"
+shrink_ticks = 3                       # sustained-surplus ticks before ramp-down
+
+[runner]
+version = "2.334.0"
+labels = ["self-hosted", "linux", "x64", "husk-phase3"]
+runner_group_id = 1
+
+[backend]
+name = "openstack-cern"
+type = "openstack"
+cloud = "cern"                         # clouds.yaml profile (app credential)
+image_name = "ALMA10 - x86_64"
+flavor_name = "m2.small"
+network_name = "CERN_NETWORK"
+keypair = "acts-gha"
+rebuild_microversion = "2.79"
+min_ready = 1
+max_total = 2
+
+[timeouts]
+poll_interval_sec = 30
+idle_timeout_sec = 1800                # rebuild idle slots to refresh credentials
+startup_grace_sec = 300               # post-rebuild grace for the runner to register
+max_job_duration_sec = 21600          # 6h — stop (not destroy) busy slots beyond this
