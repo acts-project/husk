@@ -100,6 +100,43 @@ def test_rich_status_table_row_count():
     assert _status_table(_snap(classified)).row_count == 2
 
 
+def test_watch_table_width_stable_when_cells_empty():
+    # The live --watch table must not jitter as a slot's runner/task/timing flip
+    # between values and "-": min_width floors keep every column padded.
+    import io
+
+    from rich.console import Console
+
+    from husk.cli import _status_table
+
+    def widths(classified):
+        console = Console(file=io.StringIO(), width=200, color_system=None)
+        console.print(_status_table(_snap(classified)))
+        return [len(line) for line in console.file.getvalue().splitlines()]
+
+    populated = [
+        (
+            make_slot(
+                id="vm-1",
+                name="husk-1",
+                status="ACTIVE",
+                task_state="rebuilding",
+                cycle=2,
+            ),
+            make_runner(name="husk-1-c2", busy=True),
+            SlotState.STARTING,
+        )
+    ]
+    empty = [  # same slot draining: runner "-", task "-", no timing
+        (
+            make_slot(id="vm-1", name="husk-1", status="ACTIVE", cycle=2),
+            None,
+            SlotState.STARTING,
+        )
+    ]
+    assert widths(populated) == widths(empty)
+
+
 def test_rich_status_renderable_renders_text():
     import io
 

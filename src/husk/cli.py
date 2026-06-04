@@ -130,21 +130,28 @@ def _status_table(snap: ControllerState):
     from rich.text import Text
 
     table = Table(expand=False, header_style="bold")
-    cols = (
-        "ID",
-        "NAME",
-        "STATE",
-        "NOVA",
-        "TASK",
-        "RUNNER",
-        "BUSY",
-        "CYCLE",
-        "CLOUD_INIT",
-        "LIVE%",
-    )
-    for col in cols:
+    # (name, min_width, justify) — min_width keeps the live --watch view stable:
+    # columns pad to a floor sized for their widest realistic value, so cells
+    # don't jitter as values flip to "-" or states change length frame to frame.
+    cols = [
+        ("ID", 13, "left"),
+        ("NAME", 18, "left"),
+        ("STATE", 13, "left"),  # longest: needs_recycle
+        ("NOVA", 7, "left"),  # longest: SHUTOFF
+        ("TASK", 16, "left"),  # longest: rebuild_spawning
+        ("RUNNER", 22, "left"),
+        ("BUSY", 4, "left"),
+        ("CYCLE", 5, "right"),
+        ("CLOUD_INIT", 10, "right"),
+        ("LIVE%", 5, "right"),
+    ]
+    for name, min_width, justify in cols:
         table.add_column(
-            col, justify="right" if col in ("CLOUD_INIT", "LIVE%") else "left"
+            name,
+            justify=justify,
+            min_width=min_width,
+            no_wrap=True,
+            overflow="ellipsis",
         )
     for v in sorted(snap.slots, key=lambda v: (v.name, v.id)):
         if v.runner:  # red runner name encodes an offline registration
