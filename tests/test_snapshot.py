@@ -63,6 +63,76 @@ def test_print_status_renders_table(capsys):
     assert "vm-1" in out and "husk-1-c1" in out
 
 
+def test_rich_status_table_row_count():
+    from husk.cli import _status_table
+
+    classified = [
+        (
+            make_slot(id="vm-1", name="husk-1", status="ACTIVE", cycle=1),
+            make_runner(name="husk-1-c1", busy=True),
+            SlotState.BUSY,
+        ),
+        (
+            make_slot(id="vm-2", name="husk-2", status="SHUTOFF"),
+            None,
+            SlotState.NEEDS_RECYCLE,
+        ),
+    ]
+    assert _status_table(_snap(classified)).row_count == 2
+
+
+def test_rich_status_renderable_renders_text():
+    import io
+
+    from rich.console import Console
+
+    from husk.cli import _status_renderable
+
+    snap = _snap(
+        [
+            (
+                make_slot(id="vm-1", name="husk-1", status="ACTIVE", cycle=4),
+                make_runner(name="husk-1-c4", status="online", busy=True),
+                SlotState.BUSY,
+            ),
+        ]
+    )
+    console = Console(file=io.StringIO(), width=140, color_system=None)
+    console.print(_status_renderable(snap))
+    out = console.file.getvalue()
+    assert "backend" in out and "husk-1" in out and "busy" in out and "CYCLE" in out
+
+
+def test_watch_status_stops_on_interrupt(monkeypatch):
+    from husk import cli
+
+    frames = []
+
+    def fake_sleep(_):
+        frames.append(1)
+        if len(frames) >= 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+    snap = _snap([(make_slot(), make_runner(), SlotState.IDLE)])
+    cli._watch_status(lambda: snap, interval=0.0)  # exits cleanly, no exception
+    assert len(frames) >= 2
+
+
+def test_watch_status_survives_observe_error(monkeypatch):
+    from husk import cli
+
+    def fake_sleep(_):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+
+    def boom():
+        raise RuntimeError("list failed")
+
+    cli._watch_status(boom, interval=0.0)  # error rendered, not raised
+
+
 def test_table_alignment():
     rendered = _table(["A", "BB"], [["x", "yy"], ["longer", "z"]])
     lines = rendered.splitlines()

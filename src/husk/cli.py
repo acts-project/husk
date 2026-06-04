@@ -95,6 +95,84 @@ def _table(headers: list[str], rows: list[list[str]]) -> str:
     return "\n".join(line.rstrip() for line in out)
 
 
+_STATE_STYLE = {
+    "idle": "green",
+    "busy": "cyan",
+    "starting": "yellow",
+    "needs_recycle": "blue",
+    "unhealthy": "red",
+    "error": "bold red",
+}
+
+
+def _status_table(snap: ControllerState):
+    """A rich Table of the classified slots (used by the live --watch view)."""
+    from rich.table import Table
+    from rich.text import Text
+
+    table = Table(expand=False, header_style="bold")
+    for col in ("ID", "NAME", "STATE", "NOVA", "TASK", "RUNNER", "BUSY", "CYCLE"):
+        table.add_column(col)
+    for v in sorted(snap.slots, key=lambda v: (v.state, v.name)):
+        if v.runner:  # red runner name encodes an offline registration
+            runner = Text(v.runner, style="red" if v.runner_status == "offline" else "")
+        else:
+            runner = Text("-", style="dim")
+        table.add_row(
+            v.id,
+            v.name,
+            Text(v.state, style=_STATE_STYLE.get(v.state, "")),
+            v.status,
+            v.task_state or "-",
+            runner,
+            Text("yes", style="cyan") if v.busy else "-",
+            str(v.cycle),
+        )
+    return table
+
+
+def _status_renderable(snap: ControllerState):
+    """A rich renderable (summary header + slot table) for one frame."""
+    from rich.console import Group
+    from rich.text import Text
+
+    when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(snap.last_reconcile_epoch))
+    counts = "  ".join(
+        (f"[{_STATE_STYLE[k]}]{k}={v}[/]" if v and k in _STATE_STYLE else f"{k}={v}")
+        for k, v in snap.counts.items()
+    )
+    header = Text.from_markup(
+        f"[bold]backend[/] : {snap.backend}\n"
+        f"[bold]sizing [/] : desired={snap.desired_total}  "
+        f"min_ready={snap.min_ready}  max_total={snap.max_total}\n"
+        f"[bold]updated[/] : {when}  (gen {snap.generation})\n"
+        f"[bold]states [/] : {counts}"
+    )
+    if not snap.slots:
+        return Group(header, Text("\n(no managed slots)", style="dim"))
+    return Group(header, Text(""), _status_table(snap))
+
+
+def _watch_status(observe, interval: float) -> None:
+    """Full-screen live-updating status until Ctrl-C."""
+    from rich.console import Console
+    from rich.live import Live
+    from rich.text import Text
+
+    console = Console()
+    try:
+        with Live(console=console, screen=True, auto_refresh=False) as live:
+            while True:
+                try:
+                    renderable = _status_renderable(observe())
+                except Exception as e:  # read-only: show the error, keep watching
+                    renderable = Text(f"observe failed: {e}", style="red")
+                live.update(renderable, refresh=True)
+                time.sleep(interval)
+    except KeyboardInterrupt:
+        pass
+
+
 def _print_status(snap: ControllerState | None) -> None:
     if snap is None:
         typer.echo("no snapshot yet")
@@ -180,16 +258,24 @@ def status(
     secrets_dir: _SecretsOpt = None,
     log_level: _LogLevelOpt = None,
     json_out: Annotated[bool, typer.Option("--json", help="Emit JSON")] = False,
+    watch: Annotated[
+        bool, typer.Option("--watch", "-w", help="Live-updating view (rich)")
+    ] = False,
+    interval: Annotated[
+        float, typer.Option("--interval", "-n", help="Watch refresh seconds")
+    ] = 2.0,
 ) -> None:
     """Show the current pool state (read-only)."""
     _setup_logging(log_level)
     cfg = _load(config, secrets_dir)
     backend, github = _build(cfg)
-    snap = Controller(backend, github, cfg).observe()
-    if json_out:
-        typer.echo(json.dumps(snap.to_dict(), indent=2))
+    ctrl = Controller(backend, github, cfg)
+    if watch:
+        _watch_status(ctrl.observe, interval)
+    elif json_out:
+        typer.echo(json.dumps(ctrl.observe().to_dict(), indent=2))
     else:
-        _print_status(snap)
+        _print_status(ctrl.observe())
 
 
 @huskctl_app.command()
