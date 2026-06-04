@@ -3,7 +3,10 @@
 The template installs rootless Podman + the Docker→Podman compatibility shim and
 runs a single-use JIT runner that powers the slot off when the job finishes
 (`husk-poweroff.service`), which the controller observes as SHUTOFF → recycle.
-The firewall is intentionally omitted (the network-policy milestone is gated).
+A coarse egress firewall (allow the public internet, deny CERN-internal CIDRs)
+is loaded just before the runner starts — see the husk-egress.nft block. It is
+applied AFTER provisioning so package/runner installs keep full network (CERN
+mirrors included) and only the untrusted job runs locked down.
 
 `@@JIT@@` / `@@RUNNER_URL@@` are substituted per recycle. The runner is pinned to
 uid 1000 so `/run/user/1000` lines up with the systemd unit.
@@ -26,6 +29,7 @@ packages:
   - curl
   - jq
   - git
+  - nftables        # coarse egress firewall, loaded in runcmd before the runner
 
 users:
   - name: runner
@@ -133,6 +137,35 @@ write_files:
       Type=oneshot
       ExecStart=/sbin/poweroff
 
+  # Coarse egress firewall: allow the public internet, deny CERN-internal
+  # networks (the security property — no lateral access to e.g. landb.cern.ch).
+  # `inet` covers v4+v6. Idempotent (drop-then-recreate our own table) so the
+  # runcmd re-run on every rebuild reapplies it without disturbing other tables.
+  - path: /etc/nftables/husk-egress.nft
+    content: |
+      #!/usr/sbin/nft -f
+      table inet husk {}
+      delete table inet husk
+
+      table inet husk {
+        chain output {
+          type filter hook output priority 0; policy accept;
+
+          oif "lo" accept
+          ct state established,related accept
+
+          # Keep name resolution + time sync working: CERN's own resolvers/NTP
+          # live inside the blocked ranges, so allow 53/123 to anywhere first.
+          udp dport { 53, 123 } accept
+          tcp dport 53 accept
+
+          # Deny all other egress to CERN-internal networks. Public internet
+          # falls through to `policy accept`. Extend these sets as needed.
+          ip daddr { 128.141.0.0/16, 128.142.0.0/16, 137.138.0.0/16, 188.184.0.0/15 } drop
+          ip6 daddr { 2001:1458::/32, 2001:1459::/32 } drop
+        }
+      }
+
 runcmd:
   # Install the runner as the runner user (runuser, not sudo — sudo isn't on the
   # base image and runuser needs no PAM/sudoers).
@@ -157,6 +190,11 @@ runcmd:
   # point it at the podman socket. Dangling until the socket appears, which is
   # fine. tmpfiles.d above re-creates it on reboot.
   - ln -sf /run/user/1000/podman/podman.sock /run/docker.sock
+
+  # Lock down egress just before the (untrusted) runner starts. Everything
+  # above ran with full network (CERN package mirrors included); the job that
+  # the runner executes below runs under the coarse husk egress firewall.
+  - /usr/sbin/nft -f /etc/nftables/husk-egress.nft
 
   # cloud-init runcmd is the SOLE orchestrator each boot (first boot AND every
   # rebuild — Phase 1 proved runcmd re-runs). The unit is NOT enabled for

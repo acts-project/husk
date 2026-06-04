@@ -439,6 +439,124 @@ def reap(
     typer.echo(f"reaped {len(names)} offline runner(s): {names}")
 
 
+def _recycle(backend, github, *, names, all_slots, force, dry_run):
+    """Select and stop slots so huskd rebuilds them on its next tick.
+
+    Stopping a slot drives it to SHUTOFF, which the controller classifies as
+    NEEDS_RECYCLE and rebuilds with freshly rendered cloud-init. Pure of console
+    I/O so it's testable against the fakes; returns (acted, skipped, unknown)
+    where acted = slots stopped (or, under dry_run, that would be), skipped =
+    [(slot, reason)], unknown = unmatched tokens. Busy and non-ACTIVE slots are
+    skipped unless `force` (busy only — a non-ACTIVE slot is already mid-cycle)."""
+    from husk.slot import match_runner
+
+    current = backend.list_slots()  # may raise ListSlotsError → caller aborts
+    try:
+        runners = github.list_runners()
+    except Exception:
+        runners = []  # busy detection is best-effort; without it, don't block
+
+    if all_slots:
+        targets, unknown = list(current), []
+    else:
+        by_id = {s.id: s for s in current}
+        by_name = {s.name: s for s in current}
+        targets, unknown, seen = [], [], set()
+        for tok in names:
+            s = by_id.get(tok) or by_name.get(tok)
+            if s is None:
+                unknown.append(tok)
+            elif s.id not in seen:
+                seen.add(s.id)
+                targets.append(s)
+
+    acted, skipped = [], []
+    for s in targets:
+        if s.status != "ACTIVE":
+            skipped.append((s, f"not ACTIVE (status={s.status}) — already mid-cycle"))
+            continue
+        r = match_runner(runners, s)
+        if r is not None and r.online and r.busy and not force:
+            skipped.append((s, "busy — use --force to recycle anyway"))
+            continue
+        if not dry_run:
+            backend.stop_slot(s)
+        acted.append(s)
+    return acted, skipped, unknown
+
+
+@huskctl_app.command()
+def recycle(
+    names: Annotated[
+        Optional[list[str]],
+        typer.Argument(help="Slot id(s) or name(s) to recycle (omit when using --all)"),
+    ] = None,
+    config: _ConfigOpt = Path("config.toml"),
+    secrets_dir: _SecretsOpt = None,
+    log_level: _LogLevelOpt = None,
+    all_slots: Annotated[
+        bool, typer.Option("--all", help="Recycle every idle slot")
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force", "-f", help="Also recycle a busy slot (kills its running job)"
+        ),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Show what would be recycled; change nothing"),
+    ] = False,
+) -> None:
+    """Stop slots so huskd rebuilds them on its next tick.
+
+    A stop drives the slot to SHUTOFF, which the controller reads as
+    NEEDS_RECYCLE and rebuilds with freshly rendered cloud-init — the way to roll
+    out a new image or firewall onto already-running slots. huskd must be running
+    for the rebuild to follow; this command only issues the stop. Busy and
+    non-ACTIVE slots are skipped unless --force."""
+    _setup_logging(log_level)
+    if all_slots and names:
+        typer.echo("--all takes no slot arguments", err=True)
+        raise typer.Exit(code=2)
+    if not all_slots and not names:
+        typer.echo("specify slot id(s)/name(s) or --all", err=True)
+        raise typer.Exit(code=2)
+
+    cfg = _load(config, secrets_dir)
+    backend, github = _build(cfg)
+    try:
+        acted, skipped, unknown = _recycle(
+            backend,
+            github,
+            names=names or [],
+            all_slots=all_slots,
+            force=force,
+            dry_run=dry_run,
+        )
+    except Exception as e:
+        typer.echo(f"recycle failed: {e}", err=True)
+        raise typer.Exit(code=1)
+
+    verb = "would recycle" if dry_run else "recycling"
+    for s in acted:
+        typer.echo(f"{verb}: {s.name} ({s.id}) cycle={s.cycle}")
+    for s, why in skipped:
+        typer.echo(f"skipped {s.name} ({s.id}): {why}", err=True)
+    for tok in unknown:
+        typer.echo(f"not found (managed-by=husk): {tok}", err=True)
+
+    if not acted and not skipped and not unknown:
+        typer.echo("no matching slots")
+    elif acted and not dry_run:
+        typer.echo(
+            f"\nstopped {len(acted)} slot(s) → SHUTOFF; huskd will rebuild them "
+            "with fresh cloud-init on the next tick (watch: huskctl status -w)."
+        )
+    if unknown:
+        raise typer.Exit(code=1)
+
+
 def huskd() -> None:
     huskd_app()
 
