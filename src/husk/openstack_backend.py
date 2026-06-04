@@ -163,6 +163,15 @@ class OpenStackBackend:
         except Exception:
             log.warning("could not update husk metadata on %s", slot.id, exc_info=True)
 
+    def mark_active(self, slot: Slot) -> None:
+        try:
+            self.conn.compute.set_server_metadata(
+                slot.id, **{"husk-provisioned-at": f"{time.time():.0f}"}
+            )
+            log.debug("marked %s ACTIVE; reset husk-provisioned-at", slot.id)
+        except Exception:
+            log.warning("could not mark %s active (metadata)", slot.id, exc_info=True)
+
     def start_slot(self, slot: Slot) -> None:
         self._action(slot, {"os-start": None})
 

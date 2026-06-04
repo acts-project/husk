@@ -85,6 +85,33 @@ def test_long_build_gets_fresh_grace_at_active(clock):
     assert "rebuild" in backend.ops()
 
 
+def test_active_transition_persists_grace_origin(clock):
+    # After huskd sees a slot reach ACTIVE, a *separate* stateless observer (what
+    # `huskctl status` is) must NOT independently classify it UNHEALTHY — huskd
+    # persists the grace origin to durable metadata so the observer agrees.
+    import time as _t
+
+    old = _t.time() - 600  # created long ago (wall clock), still installing runner
+    backend = FakeBackend(
+        slots=[make_slot(id="vm-1", name="husk-1", status="BUILD", provisioned_at=old)]
+    )
+    github = FakeGitHub()
+    cfg = make_config(min_ready=1, max_total=1, startup_grace=300)
+
+    huskd = make_controller(backend, github, cfg, clock)
+    huskd.tick()  # BUILD -> STARTING, prev=BUILD
+    backend.set_status("vm-1", status="ACTIVE", task_state=None)
+    huskd.tick()  # ACTIVE transition -> mark_active persists a fresh origin
+
+    assert ("mark_active", "vm-1") in backend.calls
+    assert backend.slots[0].provisioned_at > old  # durable origin refreshed
+
+    # A fresh, stateless controller observing the same backend now reads STARTING.
+    snap = make_controller(backend, github, cfg, FakeClock()).observe()
+    assert snap.counts["unhealthy"] == 0
+    assert snap.counts["starting"] == 1
+
+
 def test_durable_cycle_seeds_runner_name():
     # husk-cycle metadata=4 → next recycle mints cycle 5 (unique JIT name across
     # restarts without relying on the 409-retry).

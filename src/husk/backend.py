@@ -58,6 +58,15 @@ class Backend(Protocol):
         """os-start a slot (used after a rebuild settles to SHUTOFF)."""
         ...
 
+    def mark_active(self, slot: Slot) -> None:
+        """Persist the startup-grace origin once a slot has reached ACTIVE.
+
+        Resets the durable `husk-provisioned-at` so stateless observers
+        (`huskctl status`) and a restarted controller anchor the grace to the
+        boot, not the (long, on CERN) create — otherwise a freshly-built slot
+        reads UNHEALTHY before cloud-init can register its runner."""
+        ...
+
     def stop_slot(self, slot: Slot) -> None:
         """os-stop a slot → SHUTOFF. The timeout action (NOT a destroy)."""
         ...

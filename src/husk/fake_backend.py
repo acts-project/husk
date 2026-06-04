@@ -9,6 +9,7 @@ mutators (`set_status`, `set_runner`) let a test drive multi-tick narratives.
 from __future__ import annotations
 
 import itertools
+import time
 
 from husk.backend import ListSlotsError
 from husk.slot import Capacity, Runner, Slot
@@ -58,6 +59,10 @@ class FakeBackend:
     def start_slot(self, slot: Slot) -> None:
         self.calls.append(("start", slot.id))
         self.set_status(slot.id, status="ACTIVE", task_state=None)
+
+    def mark_active(self, slot: Slot) -> None:
+        self.calls.append(("mark_active", slot.id))
+        self.set_status(slot.id, provisioned_at=time.time())
 
     def stop_slot(self, slot: Slot) -> None:
         self.calls.append(("stop", slot.id))

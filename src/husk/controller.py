@@ -351,6 +351,10 @@ class Controller:
         prev = self.prev_status.get(slot.id)
         if slot.status == "ACTIVE" and prev is not None and prev != "ACTIVE":
             self.last_provision_action[slot.id] = now
+            # Persist the grace origin so stateless observers (huskctl status) and
+            # a restarted controller agree with us instead of re-deriving grace
+            # from the create-time metadata (which would read UNHEALTHY).
+            self._safe(lambda: self.backend.mark_active(slot), f"mark_active {slot.id}")
             log.debug("slot %s reached ACTIVE; (re)starting startup grace", slot.id)
         self.prev_status[slot.id] = slot.status
 
