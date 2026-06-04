@@ -7,6 +7,9 @@ thin renderers of this same object — no controller change required.
 
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 import time
 from dataclasses import dataclass, field
 
@@ -92,3 +95,42 @@ class ControllerState:
             "counts": dict(self.counts),
             "slots": [vars(v) for v in self.slots],
         }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ControllerState":
+        return cls(
+            generation=d["generation"],
+            last_reconcile_epoch=d["last_reconcile_epoch"],
+            backend=d["backend"],
+            min_ready=d["min_ready"],
+            max_total=d["max_total"],
+            desired_total=d["desired_total"],
+            counts=dict(d["counts"]),
+            slots=[SlotView(**sv) for sv in d["slots"]],
+        )
+
+
+def write_state(path: str, state: ControllerState) -> None:
+    """Atomically publish the snapshot to `path` (tmp file + rename)."""
+    data = json.dumps(state.to_dict())
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".huskd-state-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def read_state(path: str) -> ControllerState | None:
+    """Read a published snapshot; None if missing or unparseable."""
+    try:
+        with open(path) as f:
+            return ControllerState.from_dict(json.load(f))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None

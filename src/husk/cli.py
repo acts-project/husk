@@ -104,6 +104,17 @@ _STATE_STYLE = {
     "error": "bold red",
 }
 
+_STALE_AFTER_SEC = 60  # snapshot older than this likely means huskd is behind/down
+
+
+def _age_str(epoch: float) -> str:
+    age = max(0.0, time.time() - epoch)
+    if age < 90:
+        return f"{age:.0f}s ago"
+    if age < 5400:
+        return f"{age / 60:.0f}m ago"
+    return f"{age / 3600:.1f}h ago"
+
 
 def _status_table(snap: ControllerState):
     """A rich Table of the classified slots (used by the live --watch view)."""
@@ -137,6 +148,9 @@ def _status_renderable(snap: ControllerState):
     from rich.text import Text
 
     when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(snap.last_reconcile_epoch))
+    age = _age_str(snap.last_reconcile_epoch)
+    stale = (time.time() - snap.last_reconcile_epoch) > _STALE_AFTER_SEC
+    age_markup = f"[red]{age} — huskd stale?[/]" if stale else f"[dim]{age}[/]"
     counts = "  ".join(
         (f"[{_STATE_STYLE[k]}]{k}={v}[/]" if v and k in _STATE_STYLE else f"{k}={v}")
         for k, v in snap.counts.items()
@@ -145,7 +159,7 @@ def _status_renderable(snap: ControllerState):
         f"[bold]backend[/] : {snap.backend}\n"
         f"[bold]sizing [/] : desired={snap.desired_total}  "
         f"min_ready={snap.min_ready}  max_total={snap.max_total}\n"
-        f"[bold]updated[/] : {when}  (gen {snap.generation})\n"
+        f"[bold]updated[/] : {when}  ({age_markup}, gen {snap.generation})\n"
         f"[bold]states [/] : {counts}"
     )
     if not snap.slots:
@@ -183,7 +197,14 @@ def _print_status(snap: ControllerState | None) -> None:
         f"sizing  : desired={snap.desired_total}  "
         f"min_ready={snap.min_ready}  max_total={snap.max_total}"
     )
-    typer.echo(f"updated : {when}  (gen {snap.generation})")
+    stale = (
+        " — huskd stale?"
+        if (time.time() - snap.last_reconcile_epoch) > _STALE_AFTER_SEC
+        else ""
+    )
+    typer.echo(
+        f"updated : {when}  ({_age_str(snap.last_reconcile_epoch)}{stale}, gen {snap.generation})"
+    )
     # All states, including zeros, so the summary line is stable/scannable.
     typer.echo("states  : " + "  ".join(f"{k}={v}" for k, v in snap.counts.items()))
 
@@ -264,18 +285,68 @@ def status(
     interval: Annotated[
         float, typer.Option("--interval", "-n", help="Watch refresh seconds")
     ] = 2.0,
+    live: Annotated[
+        bool,
+        typer.Option(
+            "--live",
+            help="Query OpenStack/GitHub directly instead of huskd's published state",
+        ),
+    ] = False,
 ) -> None:
-    """Show the current pool state (read-only)."""
+    """Show the current pool state.
+
+    By default this renders huskd's published snapshot (its exact view, no extra
+    API calls). With --live it independently queries OpenStack/GitHub — useful
+    when huskd isn't running, but it can't see huskd's in-memory grace tracking so
+    transient STARTING/draining slots may read UNHEALTHY."""
     _setup_logging(log_level)
     cfg = _load(config, secrets_dir)
-    backend, github = _build(cfg)
-    ctrl = Controller(backend, github, cfg)
+    getter = _snapshot_getter(cfg, live)
+
     if watch:
-        _watch_status(ctrl.observe, interval)
-    elif json_out:
-        typer.echo(json.dumps(ctrl.observe().to_dict(), indent=2))
+        _watch_status(getter, interval)
+        return
+    try:
+        snap = getter()
+    except Exception as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(code=1)
+    if json_out:
+        typer.echo(json.dumps(snap.to_dict(), indent=2))
     else:
-        _print_status(ctrl.observe())
+        _print_status(snap)
+
+
+def _snapshot_getter(cfg: Config, live: bool):
+    """Return a callable yielding a fresh ControllerState each call.
+
+    Default: read huskd's published state file. --live: recompute by querying the
+    backends (lazily building them on first call so a missing state file with a
+    bad cloud still surfaces a clear error only in --live mode)."""
+    from husk.snapshot import read_state
+
+    if not live:
+        path = cfg.controller.state_path
+
+        def from_file() -> ControllerState:
+            snap = read_state(path)
+            if snap is None:
+                raise RuntimeError(
+                    f"no huskd state at {path} — is huskd running? (use --live to query directly)"
+                )
+            return snap
+
+        return from_file
+
+    ctrl: list = []  # built lazily, reused across watch frames
+
+    def from_live() -> ControllerState:
+        if not ctrl:
+            backend, github = _build(cfg)
+            ctrl.append(Controller(backend, github, cfg))
+        return ctrl[0].observe()
+
+    return from_live
 
 
 @huskctl_app.command()

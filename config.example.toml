@@ -16,6 +16,7 @@ repo = "acts-project/husk-test"
 
 [controller]
 lock_path = "/tmp/huskd.lock"
+state_path = "/tmp/huskd-state.json"   # huskd publishes its snapshot here; huskctl status reads it
 shrink_ticks = 3                       # sustained-surplus ticks before ramp-down
 
 [runner]

@@ -56,6 +56,7 @@ class TimeoutsConfig:
 @dataclass(frozen=True)
 class ControllerConfig:
     lock_path: str = "/tmp/huskd.lock"
+    state_path: str = "/tmp/huskd-state.json"
     shrink_ticks: int = 3
 
 
@@ -117,6 +118,7 @@ def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
 
     class _Controller(BaseModel):
         lock_path: str = "/tmp/huskd.lock"
+        state_path: str = "/tmp/huskd-state.json"
         shrink_ticks: int = 3
 
     class _Settings(BaseSettings):
@@ -196,6 +198,7 @@ def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
         ),
         controller=ControllerConfig(
             lock_path=s.controller.lock_path,
+            state_path=s.controller.state_path,
             shrink_ticks=s.controller.shrink_ticks,
         ),
     )

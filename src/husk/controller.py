@@ -23,7 +23,7 @@ from husk.backend import ListSlotsError
 from husk.cloudinit import render_cloud_init
 from husk.config import Config
 from husk.slot import Runner, Slot, SlotState, classify, match_runner
-from husk.snapshot import ControllerState
+from husk.snapshot import ControllerState, write_state
 
 log = logging.getLogger("husk.controller")
 
@@ -178,7 +178,19 @@ class Controller:
             self._generation,
             {k: v for k, v in self.snapshot.counts.items() if v},
         )
+        self._publish()
         return self.snapshot
+
+    def _publish(self) -> None:
+        """Write the snapshot so `huskctl status` renders huskd's exact view
+        rather than independently (and divergently) recomputing it."""
+        path = self.cfg.controller.state_path
+        if not path or self.snapshot is None:
+            return
+        try:
+            write_state(path, self.snapshot)
+        except Exception:
+            log.warning("could not publish state to %s", path, exc_info=True)
 
     def observe(self) -> ControllerState:
         """Read-only classification snapshot for `huskctl status` — no mutations.
