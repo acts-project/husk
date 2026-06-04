@@ -48,7 +48,17 @@ class GitHubClient:
             r.raise_for_status()
         except requests.RequestException as e:
             raise GitHubError(f"list runners failed: {e}") from e
-        return r.json().get("runners", [])
+        runners = r.json().get("runners", [])
+        log.debug(
+            "GET runners -> HTTP %d, %d runner(s): %s",
+            r.status_code,
+            len(runners),
+            [
+                f"{x['name']}={x['status']}{'/busy' if x.get('busy') else ''}"
+                for x in runners
+            ],
+        )
+        return runners
 
     def list_runners(self) -> list[Runner]:
         return [
@@ -73,6 +83,7 @@ class GitHubClient:
             "work_folder": "_work",
         }
         url = f"{GH_API}/repos/{self.repo}/actions/runners/generate-jitconfig"
+        log.debug("POST generate-jitconfig name=%s labels=%s", name, self.labels)
         r = self._s.post(url, json=body)
         if r.status_code == 409:
             existing = self.find_runner(name)
@@ -86,6 +97,7 @@ class GitHubClient:
             r = self._s.post(url, json=body)
         if r.status_code != 201:
             raise GitHubError(f"JIT mint failed: HTTP {r.status_code}: {r.text[:300]}")
+        log.debug("minted JIT for runner %s", name)
         return r.json()["encoded_jit_config"]
 
     def delete_runner(self, runner_id: int) -> None:
@@ -99,6 +111,7 @@ class GitHubClient:
             raise GitHubError(
                 f"delete runner {runner_id}: HTTP {r.status_code}: {r.text[:200]}"
             )
+        log.debug("DELETE runner %d -> HTTP %d", runner_id, r.status_code)
 
     def reap_offline(self) -> list[str]:
         """Delete every offline runner — clears leftover/dead JIT registrations."""

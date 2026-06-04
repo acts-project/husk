@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -21,11 +22,24 @@ _ConfigOpt = Annotated[Path, typer.Option("--config", "-c", help="Path to config
 _SecretsOpt = Annotated[
     Optional[Path], typer.Option("--secrets-dir", help="k8s secrets mount")
 ]
+_LogLevelOpt = Annotated[
+    Optional[str],
+    typer.Option(
+        "--log-level",
+        "-l",
+        help="DEBUG/INFO/WARNING/ERROR (default: $HUSK_LOG_LEVEL or INFO)",
+    ),
+]
 
 
-def _setup_logging() -> None:
+def _setup_logging(level: Optional[str]) -> None:
+    name = (level or os.environ.get("HUSK_LOG_LEVEL") or "INFO").upper()
+    resolved = logging.getLevelName(name)
+    if not isinstance(resolved, int):  # unknown name → fall back to INFO
+        typer.echo(f"unknown log level {name!r}; using INFO", err=True)
+        resolved = logging.INFO
     logging.basicConfig(
-        level=logging.INFO,
+        level=resolved,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
@@ -74,12 +88,13 @@ def _print_status(snap: ControllerState | None) -> None:
 def run(
     config: _ConfigOpt = Path("config.toml"),
     secrets_dir: _SecretsOpt = None,
+    log_level: _LogLevelOpt = None,
     once: Annotated[
         bool, typer.Option(help="Run a single reconcile tick then exit")
     ] = False,
 ) -> None:
     """Run the reconcile loop (or a single tick with --once)."""
-    _setup_logging()
+    _setup_logging(log_level)
     cfg = _load(config, secrets_dir)
     lock = SingleControllerLock(cfg.controller.lock_path)
     try:
@@ -104,9 +119,11 @@ def run(
 def status(
     config: _ConfigOpt = Path("config.toml"),
     secrets_dir: _SecretsOpt = None,
+    log_level: _LogLevelOpt = None,
     json_out: Annotated[bool, typer.Option("--json", help="Emit JSON")] = False,
 ) -> None:
     """Show the current pool state (read-only)."""
+    _setup_logging(log_level)
     cfg = _load(config, secrets_dir)
     backend, github = _build(cfg)
     snap = Controller(backend, github, cfg).observe()
@@ -120,8 +137,10 @@ def status(
 def reap(
     config: _ConfigOpt = Path("config.toml"),
     secrets_dir: _SecretsOpt = None,
+    log_level: _LogLevelOpt = None,
 ) -> None:
     """Delete all offline runner registrations from GitHub."""
+    _setup_logging(log_level)
     cfg = _load(config, secrets_dir)
     _, github = _build(cfg)
     names = github.reap_offline()

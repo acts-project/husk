@@ -95,6 +95,8 @@ class Controller:
             )
             return self.snapshot
 
+        log.debug("tick: %d managed slot(s), %d runner(s)", len(slots), len(runners))
+
         self._gc_bookkeeping({s.id for s in slots})
         for s in slots:
             self._first_sight(s, now)
@@ -137,6 +139,15 @@ class Controller:
         # 4/5. GROW or RAMP DOWN (mutually exclusive — never thrash within a tick)
         desired = min(self.cfg.backend.max_total, busy + self.cfg.backend.min_ready)
         total = len(slots)
+        log.debug(
+            "pool: busy=%d total=%d desired=%d (min_ready=%d max_total=%d) surplus_ticks=%d",
+            busy,
+            total,
+            desired,
+            self.cfg.backend.min_ready,
+            self.cfg.backend.max_total,
+            self._surplus_ticks,
+        )
         if desired - total > 0:
             self._surplus_ticks = 0
             self._grow(desired - total, now)
@@ -157,6 +168,11 @@ class Controller:
             max_total=self.cfg.backend.max_total,
             desired_total=desired,
             classified=classified,
+        )
+        log.debug(
+            "tick %d done: %s",
+            self._generation,
+            {k: v for k, v in self.snapshot.counts.items() if v},
         )
         return self.snapshot
 
@@ -190,13 +206,24 @@ class Controller:
         classified: list[tuple[Slot, Runner | None, SlotState]] = []
         for s in slots:
             runner = match_runner(runners, s)
+            prov_age = self._provision_age(s.id, now)
             state = classify(
                 s,
                 runner,
-                provision_age=self._provision_age(s.id, now),
+                provision_age=prov_age,
                 startup_grace=self.cfg.timeouts.startup_grace_sec,
             )
             self._age_state(s.id, state, now)
+            log.debug(
+                "classify %s (%s): status=%s task=%s runner=%s prov_age=%s -> %s",
+                s.id,
+                s.name,
+                s.status,
+                s.task_state,
+                runner.status if runner else "none",
+                f"{prov_age:.0f}s" if prov_age is not None else "n/a",
+                state.value,
+            )
             classified.append((s, runner, state))
         return classified
 
@@ -214,29 +241,45 @@ class Controller:
         self.cycle_counter[slot.id] = cycle
         self.last_provision_action[slot.id] = now
         self.pending_start.add(slot.id)
+        log.info("rebuilt slot %s as runner %s (cycle %d)", slot.id, name, cycle)
 
     def _drain_pending_start(self, slot: Slot, now: float) -> None:
         """Issue os-start once a rebuild has settled. Nova preserves power state,
         so a slot that was SHUTOFF before rebuild is SHUTOFF again — which would
         re-trigger NEEDS_RECYCLE if we didn't intercept it here first."""
         if slot.task_state is not None:
+            log.debug(
+                "slot %s pending-start: still settling (task=%s)",
+                slot.id,
+                slot.task_state,
+            )
             return  # still settling
         if slot.status == "SHUTOFF":
+            log.info("slot %s rebuild settled to SHUTOFF; os-starting", slot.id)
             self._safe(lambda: self.backend.start_slot(slot), f"start {slot.id}")
             self.last_provision_action[slot.id] = now  # reset grace for runner-online
             self.pending_start.discard(slot.id)
         elif slot.status == "ACTIVE":
+            log.debug("slot %s rebuilt while ACTIVE; no os-start needed", slot.id)
             self.pending_start.discard(slot.id)  # rebuilt-while-ACTIVE: no start needed
 
     def _grow(self, want: int, now: float) -> None:
         cap = self.backend.capacity()
         budget = min(want, cap.free_instances) if cap.can_create else 0
+        log.debug(
+            "grow: want=%d capacity(can_create=%s free=%d) -> budget=%d",
+            want,
+            cap.can_create,
+            cap.free_instances,
+            budget,
+        )
         for _ in range(max(0, budget)):
             self._create_one(now)
 
     def _create_one(self, now: float) -> None:
         vm = vm_name("husk", next(self._namer))
         name = runner_name(vm, 0)
+        log.debug("creating slot %s (runner %s)", vm, name)
         try:
             jit = self.github.generate_jitconfig(name)
             user_data = render_cloud_init(jit, self.cfg.runner.url)
@@ -247,6 +290,7 @@ class Controller:
         self.cycle_counter[slot.id] = 0
         self.last_provision_action[slot.id] = now
         self._known.add(slot.id)
+        log.info("created slot %s (%s)", slot.id, vm)
 
     def _ramp_down(self, classified) -> None:
         idle = [(s, r) for s, r, st in classified if st is SlotState.IDLE]
@@ -280,8 +324,15 @@ class Controller:
             if slot.provisioned_at is not None:
                 age = max(0.0, time.time() - slot.provisioned_at)
                 self.last_provision_action[slot.id] = now - age
+                log.debug(
+                    "first sight of %s: seeded provision age %.0fs from metadata (cycle %d)",
+                    slot.id,
+                    age,
+                    slot.cycle,
+                )
             else:
                 self.last_provision_action[slot.id] = now  # fresh grace
+                log.debug("first sight of %s: granted fresh startup grace", slot.id)
 
     def _gc_bookkeeping(self, live: set[str]) -> None:
         for d in (

@@ -1,4 +1,5 @@
 # Husk controller config. Precedence: env (HUSK_*) > this file > defaults.
+# Log verbosity: --log-level DEBUG (or -l), or $HUSK_LOG_LEVEL (default INFO).
 # Env override examples:
 #   HUSK_BACKEND__MIN_READY=2  HUSK_GITHUB__REPO=acts-project/foo
 # The GitHub PAT is NOT stored here. It is resolved in priority order:

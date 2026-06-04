@@ -101,11 +101,18 @@ class OpenStackBackend:
             servers = list(self.conn.compute.servers(details=True))
         except Exception as e:  # auth expiry, 5xx, network — MUST raise, never []
             raise ListSlotsError(f"list servers failed: {e}") from e
-        return [
+        slots = [
             self._slot(s)
             for s in servers
             if (getattr(s, "metadata", None) or {}).get("managed-by") == MANAGED_BY
         ]
+        log.debug(
+            "listed %d server(s), %d managed-by=%s",
+            len(servers),
+            len(slots),
+            MANAGED_BY,
+        )
+        return slots
 
     def create_slot(self, *, user_data: bytes, name: str, cycle: int) -> Slot:
         server = self.conn.compute.create_server(
@@ -121,10 +128,18 @@ class OpenStackBackend:
                 "husk-provisioned-at": f"{time.time():.0f}",
             },
         )
+        log.debug("create_server %s -> id=%s status=%s", name, server.id, server.status)
         return self._slot(server)
 
     def rebuild_slot(self, slot: Slot, *, user_data: bytes, cycle: int) -> None:
         # Minimal CERN-compatible rebuild: NO name field, pinned microversion.
+        log.debug(
+            "POST rebuild %s image=%s microversion=%s cycle=%d",
+            slot.id,
+            self.image_id,
+            self.cfg.rebuild_microversion,
+            cycle,
+        )
         resp = self.conn.compute.post(
             f"/servers/{slot.id}/action",
             json={"rebuild": {"imageRef": self.image_id, "user_data": b64(user_data)}},
@@ -155,10 +170,12 @@ class OpenStackBackend:
         self._action(slot, {"os-stop": None})
 
     def _action(self, slot: Slot, body: dict) -> None:
+        action = list(body)[0]
+        log.debug("POST action %s on %s", action, slot.id)
         resp = self.conn.compute.post(f"/servers/{slot.id}/action", json=body)
         if resp.status_code not in (200, 202):
             raise RuntimeError(
-                f"action {list(body)[0]} on {slot.id} rejected: "
+                f"action {action} on {slot.id} rejected: "
                 f"HTTP {resp.status_code}: {resp.text[:200]}"
             )
 
@@ -176,6 +193,12 @@ class OpenStackBackend:
                 limits, "instances_used", 0
             )
             free = max(0, int(max_instances) - int(used))
+            log.debug(
+                "compute limits: instances used=%s max=%s -> free=%d",
+                used,
+                max_instances,
+                free,
+            )
             return Capacity(can_create=free > 0, free_instances=free)
         except Exception:
             # Best-effort second guard; max_total is the primary clamp. If we
