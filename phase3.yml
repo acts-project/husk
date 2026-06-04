@@ -1,0 +1,27 @@
+name: husk-phase3
+
+# Phase 3 recycle probe. Single job on purpose: JIT runners are single-use
+# (one job, then deregister + exit), so a multi-job workflow would strand the
+# later jobs with no runner. The driver (phase3-recycle.py) dispatches this
+# once per recycle cycle.
+on:
+  workflow_dispatch:
+
+jobs:
+  recycle-probe:
+    runs-on: [self-hosted, linux, x64, husk-phase3]
+    steps:
+      - name: Identity
+        run: |
+          echo "hello from $(hostname)"
+          echo "user: $(whoami)  uid: $(id -u)"
+          echo "DOCKER_HOST=$DOCKER_HOST"
+      - name: No state leaked from previous job
+        run: |
+          if [ -e /tmp/husk-leak-canary ]; then
+            echo "LEAK: canary from a previous job is present" && exit 1
+          fi
+          echo "clean: canary absent"
+          touch /tmp/husk-leak-canary
+      - name: Docker shim reaches podman
+        run: docker version --format "server {{.Server.APIVersion}}"

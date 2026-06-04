@@ -1,0 +1,7 @@
+#cloud-config
+write_files:
+  - path: /tmp/hello
+    content: "cloud-init ran at boot\n"
+runcmd:
+  - date >> /tmp/hello
+  - echo "user-data executed" | systemd-cat -t hello-test
