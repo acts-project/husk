@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -83,19 +84,62 @@ def _build(cfg: Config):
     return backend, github
 
 
+def _table(headers: list[str], rows: list[list[str]]) -> str:
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+    fmt = "  ".join("{:<%d}" % w for w in widths)
+    out = [fmt.format(*headers), fmt.format(*("-" * w for w in widths))]
+    out += [fmt.format(*row) for row in rows]
+    return "\n".join(line.rstrip() for line in out)
+
+
 def _print_status(snap: ControllerState | None) -> None:
     if snap is None:
         typer.echo("no snapshot yet")
         return
+    when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(snap.last_reconcile_epoch))
+    typer.echo(f"backend : {snap.backend}")
     typer.echo(
-        f"backend={snap.backend} gen={snap.generation} "
-        f"desired={snap.desired_total} (min_ready={snap.min_ready} max_total={snap.max_total})"
+        f"sizing  : desired={snap.desired_total}  "
+        f"min_ready={snap.min_ready}  max_total={snap.max_total}"
     )
-    for state, n in snap.counts.items():
-        if n:
-            typer.echo(f"  {state:14s} {n}")
-    for v in snap.slots:
-        typer.echo(f"    {v.id:18s} {v.name:24s} {v.state:14s} ({v.status})")
+    typer.echo(f"updated : {when}  (gen {snap.generation})")
+    # All states, including zeros, so the summary line is stable/scannable.
+    typer.echo("states  : " + "  ".join(f"{k}={v}" for k, v in snap.counts.items()))
+
+    if not snap.slots:
+        typer.echo("\n(no managed slots)")
+        return
+
+    headers = [
+        "ID",
+        "NAME",
+        "STATE",
+        "NOVA",
+        "TASK",
+        "RUNNER",
+        "RUNNER_ST",
+        "BUSY",
+        "CYCLE",
+    ]
+    rows = [
+        [
+            v.id,
+            v.name,
+            v.state,
+            v.status,
+            v.task_state or "-",
+            v.runner or "-",
+            v.runner_status or "-",
+            "yes" if v.busy else "-",
+            str(v.cycle),
+        ]
+        for v in sorted(snap.slots, key=lambda v: (v.state, v.name))
+    ]
+    typer.echo("")
+    typer.echo(_table(headers, rows))
 
 
 # --------------------------------------------------------------------- huskd

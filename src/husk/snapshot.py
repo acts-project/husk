@@ -19,8 +19,13 @@ class SlotView:
 
     id: str
     name: str
-    state: str  # SlotState.value
-    status: str  # backend status (ACTIVE/SHUTOFF/...)
+    state: str  # SlotState.value (husk's classification)
+    status: str  # backend/Nova status (ACTIVE/SHUTOFF/...)
+    task_state: str | None  # in-flight provisioning task, if any
+    runner: str | None  # matched GitHub runner name, if any
+    runner_status: str | None  # "online" | "offline" | None
+    busy: bool  # runner currently running a job
+    cycle: int  # recycle cycle (durable husk-cycle)
 
 
 @dataclass(frozen=True)
@@ -49,11 +54,19 @@ class ControllerState:
     ) -> "ControllerState":
         counts = {st.value: 0 for st in SlotState}
         views: list[SlotView] = []
-        for slot, _runner, state in classified:
+        for slot, runner, state in classified:
             counts[state.value] += 1
             views.append(
                 SlotView(
-                    id=slot.id, name=slot.name, state=state.value, status=slot.status
+                    id=slot.id,
+                    name=slot.name,
+                    state=state.value,
+                    status=slot.status,
+                    task_state=slot.task_state,
+                    runner=runner.name if runner else None,
+                    runner_status=runner.status if runner else None,
+                    busy=runner.busy if runner else False,
+                    cycle=slot.cycle,
                 )
             )
         return cls(
