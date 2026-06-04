@@ -8,7 +8,7 @@ from husk.slot import SlotState
 from husk.timing import SlotTiming
 
 
-def test_busy_fraction_accumulates(clock):
+def test_live_fraction_accumulates(clock):
     runner = make_runner(id=1, name="husk-1-c0", status="online", busy=True)
     backend = FakeBackend(slots=[make_slot(id="vm-1", name="husk-1", status="ACTIVE")])
     github = FakeGitHub(runners=[runner])
@@ -23,8 +23,8 @@ def test_busy_fraction_accumulates(clock):
 
     t = ctrl.timing["vm-1"]
     assert t.state_seconds["busy"] == 200.0
-    # 200s busy of 200s tracked so far -> 1.0; will fall as idle time accrues.
-    assert t.busy_fraction == 1.0
+    # busy + idle = available to serve; 200s of 200s tracked so far -> 1.0.
+    assert t.live_fraction == 1.0
 
 
 def test_cloudinit_and_recycle_measured_on_bringup(clock):
@@ -67,16 +67,18 @@ def test_timing_surfaces_in_snapshot(clock):
     snap = ctrl.tick()
 
     v = snap.slots[0]
-    assert v.busy_fraction == 1.0
-    assert "busy_fraction" in v.__dict__ and "cloudinit_seconds" in v.__dict__
+    assert v.live_fraction == 1.0
+    assert "live_fraction" in v.__dict__ and "cloudinit_seconds" in v.__dict__
 
 
 def test_slottiming_unit():
     t = SlotTiming(first_seen=0.0)
-    assert t.busy_fraction is None  # no time tracked yet
+    assert t.live_fraction is None  # no time tracked yet
+    # 30s busy + 10s idle = 40s available; +20s starting = 60s total -> 40/60.
     t.accumulate(SlotState.BUSY, 30)
     t.accumulate(SlotState.IDLE, 10)
-    assert t.busy_fraction == 0.75
+    t.accumulate(SlotState.STARTING, 20)
+    assert t.live_fraction == 40 / 60
     t.on_issued(100)
     t.on_active(160)  # boot = 60
     t.on_runner_online(220)  # cloud-init = 60, recycle = 120

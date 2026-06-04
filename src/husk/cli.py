@@ -140,11 +140,11 @@ def _status_table(snap: ControllerState):
         "BUSY",
         "CYCLE",
         "CLOUD_INIT",
-        "BUSY%",
+        "LIVE%",
     )
     for col in cols:
         table.add_column(
-            col, justify="right" if col in ("CLOUD_INIT", "BUSY%") else "left"
+            col, justify="right" if col in ("CLOUD_INIT", "LIVE%") else "left"
         )
     for v in sorted(snap.slots, key=lambda v: (v.name, v.id)):
         if v.runner:  # red runner name encodes an offline registration
@@ -161,7 +161,7 @@ def _status_table(snap: ControllerState):
             Text("yes", style="cyan") if v.busy else "-",
             str(v.cycle),
             _secs(v.cloudinit_seconds),
-            _pct(v.busy_fraction),
+            _pct(v.live_fraction),
         )
     return table
 
@@ -248,7 +248,7 @@ def _print_status(snap: ControllerState | None) -> None:
         "CYCLE",
         "CLOUD_INIT",
         "RECYCLE",
-        "BUSY%",
+        "LIVE%",
     ]
     rows = [
         [
@@ -263,7 +263,7 @@ def _print_status(snap: ControllerState | None) -> None:
             str(v.cycle),
             _secs(v.cloudinit_seconds),
             _secs(v.recycle_seconds),
-            _pct(v.busy_fraction),
+            _pct(v.live_fraction),
         ]
         for v in sorted(snap.slots, key=lambda v: (v.name, v.id))
     ]

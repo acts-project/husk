@@ -33,7 +33,9 @@ class SlotView:
         None  # last ACTIVE→runner-online (cloud-init step)
     )
     recycle_seconds: float | None = None  # last issue→runner-online (whole bring-up)
-    busy_fraction: float | None = None  # busy time / total tracked time ("live-time")
+    live_fraction: float | None = (
+        None  # (busy+idle) / total tracked ("available to serve")
+    )
 
 
 @dataclass(frozen=True)
@@ -67,7 +69,7 @@ class ControllerState:
         for slot, runner, state in classified:
             counts[state.value] += 1
             t = timing.get(slot.id)
-            bf = t.busy_fraction if t is not None else None
+            lf = t.live_fraction if t is not None else None
             views.append(
                 SlotView(
                     id=slot.id,
@@ -89,7 +91,7 @@ class ControllerState:
                         if t is not None and t.last_recycle_seconds is not None
                         else None
                     ),
-                    busy_fraction=round(bf, 3) if bf is not None else None,
+                    live_fraction=round(lf, 3) if lf is not None else None,
                 )
             )
         return cls(

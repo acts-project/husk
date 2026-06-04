@@ -83,13 +83,13 @@ def render_prometheus(s: ControllerState) -> str:
         if v.recycle_seconds is not None
     ]
     out += [
-        "# HELP husk_slot_busy_fraction Fraction of tracked time the slot was busy",
-        "# TYPE husk_slot_busy_fraction gauge",
+        "# HELP husk_slot_live_fraction Fraction of tracked time the slot was available to serve (busy or idle)",
+        "# TYPE husk_slot_live_fraction gauge",
     ]
     out += [
-        f'husk_slot_busy_fraction{{backend="{b}",slot="{v.name}"}} {v.busy_fraction}'
+        f'husk_slot_live_fraction{{backend="{b}",slot="{v.name}"}} {v.live_fraction}'
         for v in s.slots
-        if v.busy_fraction is not None
+        if v.live_fraction is not None
     ]
     return "\n".join(out) + "\n"
 

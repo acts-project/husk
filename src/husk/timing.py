@@ -39,9 +39,18 @@ class SlotTiming:
         return sum(self.state_seconds.values())
 
     @property
-    def busy_fraction(self) -> float | None:
+    def live_fraction(self) -> float | None:
+        """Fraction of tracked time the slot was *available to serve* — running a
+        job (BUSY) or warm and waiting for one (IDLE) — vs. overhead time spent
+        starting/rebuilding/recycling/broken."""
         total = self.total_seconds
-        return self.state_seconds[SlotState.BUSY.value] / total if total > 0 else None
+        if total <= 0:
+            return None
+        live = (
+            self.state_seconds[SlotState.BUSY.value]
+            + self.state_seconds[SlotState.IDLE.value]
+        )
+        return live / total
 
     def accumulate(self, state: SlotState, dt: float) -> None:
         if dt > 0:
