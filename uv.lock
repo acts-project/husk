@@ -286,6 +286,7 @@ dependencies = [
     { name = "openstacksdk" },
     { name = "pydantic-settings" },
     { name = "requests" },
+    { name = "rich" },
     { name = "typer" },
 ]
 
@@ -301,6 +302,7 @@ requires-dist = [
     { name = "pydantic-settings", specifier = ">=2" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "requests" },
+    { name = "rich", specifier = ">=13" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15" },
     { name = "typer", specifier = ">=0.12" },
 ]

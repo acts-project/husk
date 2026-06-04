@@ -113,7 +113,7 @@ def _status_table(snap: ControllerState):
     table = Table(expand=False, header_style="bold")
     for col in ("ID", "NAME", "STATE", "NOVA", "TASK", "RUNNER", "BUSY", "CYCLE"):
         table.add_column(col)
-    for v in sorted(snap.slots, key=lambda v: (v.state, v.name)):
+    for v in sorted(snap.slots, key=lambda v: (v.name, v.id)):
         if v.runner:  # red runner name encodes an offline registration
             runner = Text(v.runner, style="red" if v.runner_status == "offline" else "")
         else:
@@ -214,7 +214,7 @@ def _print_status(snap: ControllerState | None) -> None:
             "yes" if v.busy else "-",
             str(v.cycle),
         ]
-        for v in sorted(snap.slots, key=lambda v: (v.state, v.name))
+        for v in sorted(snap.slots, key=lambda v: (v.name, v.id))
     ]
     typer.echo("")
     typer.echo(_table(headers, rows))

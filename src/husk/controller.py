@@ -51,6 +51,7 @@ class Controller:
 
         self.first_seen_state: dict[str, tuple[SlotState, float]] = {}
         self.last_provision_action: dict[str, float] = {}
+        self.prev_status: dict[str, str] = {}
         self.pending_start: set[str] = set()
         self.cycle_counter: dict[str, int] = {}
 
@@ -100,6 +101,7 @@ class Controller:
         self._gc_bookkeeping({s.id for s in slots})
         for s in slots:
             self._first_sight(s, now)
+            self._note_active_transition(s, now)
 
         # 2. CLASSIFY
         classified = self._classify_all(slots, runners, now)
@@ -334,10 +336,29 @@ class Controller:
                 self.last_provision_action[slot.id] = now  # fresh grace
                 log.debug("first sight of %s: granted fresh startup grace", slot.id)
 
+    def _note_active_transition(self, slot: Slot, now: float) -> None:
+        """Restart the startup-grace clock when a slot first reaches ACTIVE.
+
+        The clock is otherwise stamped at create/rebuild *issue* time, but a fresh
+        CERN create spends minutes in BUILD (Neutron) before the VM is ACTIVE —
+        which can exceed startup_grace on its own, so the slot would be judged
+        UNHEALTHY the instant it boots, before cloud-init can register the runner.
+        Anchoring grace to the ACTIVE transition makes it cover only the
+        cloud-init / runner-registration phase, independent of build time. We only
+        reset on an observed non-ACTIVE→ACTIVE edge (prev seen this process), so a
+        controller restart that first sees an already-ACTIVE slot keeps its
+        first-sight grace instead of resetting on every restart."""
+        prev = self.prev_status.get(slot.id)
+        if slot.status == "ACTIVE" and prev is not None and prev != "ACTIVE":
+            self.last_provision_action[slot.id] = now
+            log.debug("slot %s reached ACTIVE; (re)starting startup grace", slot.id)
+        self.prev_status[slot.id] = slot.status
+
     def _gc_bookkeeping(self, live: set[str]) -> None:
         for d in (
             self.first_seen_state,
             self.last_provision_action,
+            self.prev_status,
             self.cycle_counter,
         ):
             for k in list(d):
@@ -349,6 +370,7 @@ class Controller:
     def _forget(self, slot_id: str) -> None:
         self.first_seen_state.pop(slot_id, None)
         self.last_provision_action.pop(slot_id, None)
+        self.prev_status.pop(slot_id, None)
         self.cycle_counter.pop(slot_id, None)
         self.pending_start.discard(slot_id)
         self._known.discard(slot_id)

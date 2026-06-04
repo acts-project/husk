@@ -63,6 +63,25 @@ def test_print_status_renders_table(capsys):
     assert "vm-1" in out and "husk-1-c1" in out
 
 
+def test_status_table_sorted_by_name():
+    from husk.cli import _status_table
+
+    classified = [
+        (
+            make_slot(id="vm-z", name="husk-9", status="SHUTOFF"),
+            None,
+            SlotState.NEEDS_RECYCLE,
+        ),
+        (
+            make_slot(id="vm-a", name="husk-1", status="ACTIVE", cycle=1),
+            make_runner(name="husk-1-c1", busy=True),
+            SlotState.BUSY,
+        ),
+    ]
+    table = _status_table(_snap(classified))
+    assert list(table.columns[0]._cells) == ["vm-a", "vm-z"]
+
+
 def test_rich_status_table_row_count():
     from husk.cli import _status_table
 

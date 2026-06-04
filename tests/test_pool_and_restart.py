@@ -54,6 +54,37 @@ def test_restart_uses_durable_provisioned_at():
     assert "rebuild" in backend.ops()
 
 
+def test_long_build_gets_fresh_grace_at_active(clock):
+    # Repro: a fresh create spends longer in BUILD than startup_grace (CERN's
+    # ~5min Neutron phase). When it finally reaches ACTIVE with no runner yet, it
+    # must be STARTING (grace anchored to ACTIVE), NOT UNHEALTHY → rebuilt.
+    backend = FakeBackend(slots=[])
+    github = FakeGitHub()
+    cfg = make_config(min_ready=1, max_total=1, startup_grace=300)
+    ctrl = make_controller(backend, github, cfg, clock)
+
+    ctrl.tick()  # creates one slot (BUILD)
+    sid = backend.slots[0].id
+
+    # Long build, well past the grace window — still BUILD → STARTING, no rebuild.
+    backend.set_status(sid, status="BUILD", task_state=None)
+    clock.advance(600)
+    ctrl.tick()
+    assert "rebuild" not in backend.ops()
+
+    # Now it boots: BUILD → ACTIVE, runner not registered yet.
+    backend.set_status(sid, status="ACTIVE", task_state=None)
+    clock.advance(10)
+    ctrl.tick()  # grace restarts at ACTIVE → STARTING, NOT unhealthy
+    assert "rebuild" not in backend.ops()
+
+    # Only once the grace elapses *after* ACTIVE (cloud-init genuinely failed)
+    # does it become UNHEALTHY and get rebuilt.
+    clock.advance(400)
+    ctrl.tick()
+    assert "rebuild" in backend.ops()
+
+
 def test_durable_cycle_seeds_runner_name():
     # husk-cycle metadata=4 → next recycle mints cycle 5 (unique JIT name across
     # restarts without relying on the 409-retry).
