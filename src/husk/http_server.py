@@ -62,6 +62,35 @@ def render_prometheus(s: ControllerState) -> str:
         "# TYPE husk_reconcile_generation counter",
         f'husk_reconcile_generation{{backend="{b}"}} {s.generation}',
     ]
+    # Per-slot timing (low cardinality — slots are long-lived). Emit only when
+    # a value exists so a never-recycled slot doesn't report a bogus 0.
+    out += [
+        "# HELP husk_slot_last_cloudinit_seconds Last ACTIVE->runner-online duration",
+        "# TYPE husk_slot_last_cloudinit_seconds gauge",
+    ]
+    out += [
+        f'husk_slot_last_cloudinit_seconds{{backend="{b}",slot="{v.name}"}} {v.cloudinit_seconds}'
+        for v in s.slots
+        if v.cloudinit_seconds is not None
+    ]
+    out += [
+        "# HELP husk_slot_last_recycle_seconds Last issue->runner-online duration",
+        "# TYPE husk_slot_last_recycle_seconds gauge",
+    ]
+    out += [
+        f'husk_slot_last_recycle_seconds{{backend="{b}",slot="{v.name}"}} {v.recycle_seconds}'
+        for v in s.slots
+        if v.recycle_seconds is not None
+    ]
+    out += [
+        "# HELP husk_slot_busy_fraction Fraction of tracked time the slot was busy",
+        "# TYPE husk_slot_busy_fraction gauge",
+    ]
+    out += [
+        f'husk_slot_busy_fraction{{backend="{b}",slot="{v.name}"}} {v.busy_fraction}'
+        for v in s.slots
+        if v.busy_fraction is not None
+    ]
     return "\n".join(out) + "\n"
 
 

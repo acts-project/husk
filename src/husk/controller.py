@@ -24,6 +24,7 @@ from husk.cloudinit import render_cloud_init
 from husk.config import Config
 from husk.slot import Runner, Slot, SlotState, classify, match_runner
 from husk.snapshot import ControllerState, write_state
+from husk.timing import SlotTiming
 
 log = logging.getLogger("husk.controller")
 
@@ -38,6 +39,10 @@ def vm_name(prefix: str, n: int) -> str:
 def runner_name(vm: str, cycle: int) -> str:
     """GitHub runner name — unique per recycle cycle (GitHub-side only)."""
     return f"{vm}-c{cycle}"
+
+
+def _fmt(v: float | None) -> str:
+    return f"{v:.0f}" if v is not None else "?"
 
 
 class Controller:
@@ -55,8 +60,10 @@ class Controller:
         self.runner_present: set[str] = set()
         self.pending_start: set[str] = set()
         self.cycle_counter: dict[str, int] = {}
+        self.timing: dict[str, SlotTiming] = {}
 
         self._known: set[str] = set()
+        self._last_tick: float | None = None
         self._surplus_ticks = 0
         self._generation = 0
         self._namer = itertools.count(1)
@@ -103,6 +110,17 @@ class Controller:
         for s in slots:
             self._first_sight(s, now)
             self._note_active_transition(s, now)
+
+        # Account the just-elapsed interval to each slot's prior state (read from
+        # first_seen_state before this tick's classify overwrites it).
+        dt = (now - self._last_tick) if self._last_tick is not None else 0.0
+        self._last_tick = now
+        if dt > 0:
+            for s in slots:
+                prev = self.first_seen_state.get(s.id)
+                t = self.timing.get(s.id)
+                if prev is not None and t is not None:
+                    t.accumulate(prev[0], dt)
 
         # 2. CLASSIFY
         classified = self._classify_all(slots, runners, now)
@@ -172,6 +190,7 @@ class Controller:
             max_total=self.cfg.backend.max_total,
             desired_total=desired,
             classified=classified,
+            timing=self.timing,
         )
         log.debug(
             "tick %d done: %s",
@@ -213,6 +232,7 @@ class Controller:
             max_total=self.cfg.backend.max_total,
             desired_total=desired,
             classified=classified,
+            timing=self.timing,
         )
         return self.snapshot
 
@@ -257,6 +277,9 @@ class Controller:
         self.cycle_counter[slot.id] = cycle
         self.last_provision_action[slot.id] = now
         self.pending_start.add(slot.id)
+        t = self.timing.get(slot.id)
+        if t is not None:
+            t.on_issued(now)
         log.info("rebuilt slot %s as runner %s (cycle %d)", slot.id, name, cycle)
 
     def _drain_pending_start(self, slot: Slot, now: float) -> None:
@@ -306,6 +329,7 @@ class Controller:
         self.cycle_counter[slot.id] = 0
         self.last_provision_action[slot.id] = now
         self._known.add(slot.id)
+        self.timing[slot.id] = SlotTiming(first_seen=now, issued_at=now)
         log.info("created slot %s (%s)", slot.id, vm)
 
     def _ramp_down(self, classified) -> None:
@@ -335,6 +359,7 @@ class Controller:
         if slot.id in self._known:
             return
         self._known.add(slot.id)
+        self.timing.setdefault(slot.id, SlotTiming(first_seen=now))
         self.cycle_counter.setdefault(slot.id, slot.cycle)
         if slot.id not in self.last_provision_action:
             if slot.provisioned_at is not None:
@@ -364,6 +389,16 @@ class Controller:
         runner_present, so genuine cloud-init failures still go UNHEALTHY on time."""
         for s, runner, _state in classified:
             if runner is not None and runner.online:
+                if s.id not in self.runner_present:  # runner just came online
+                    t = self.timing.get(s.id)
+                    if t is not None:
+                        t.on_runner_online(now)
+                        log.debug(
+                            "slot %s runner online: cloud-init=%ss recycle=%ss",
+                            s.id,
+                            _fmt(t.last_cloudinit_seconds),
+                            _fmt(t.last_recycle_seconds),
+                        )
                 self.last_provision_action[s.id] = now
                 self.runner_present.add(s.id)
             elif s.id in self.runner_present:
@@ -392,6 +427,9 @@ class Controller:
         prev = self.prev_status.get(slot.id)
         if slot.status == "ACTIVE" and prev is not None and prev != "ACTIVE":
             self.last_provision_action[slot.id] = now
+            t = self.timing.get(slot.id)
+            if t is not None:
+                t.on_active(now)
             # Persist the grace origin so stateless observers (huskctl status) and
             # a restarted controller agree with us instead of re-deriving grace
             # from the create-time metadata (which would read UNHEALTHY).
@@ -405,6 +443,7 @@ class Controller:
             self.last_provision_action,
             self.prev_status,
             self.cycle_counter,
+            self.timing,
         ):
             for k in list(d):
                 if k not in live:
@@ -418,6 +457,7 @@ class Controller:
         self.last_provision_action.pop(slot_id, None)
         self.prev_status.pop(slot_id, None)
         self.cycle_counter.pop(slot_id, None)
+        self.timing.pop(slot_id, None)
         self.pending_start.discard(slot_id)
         self.runner_present.discard(slot_id)
         self._known.discard(slot_id)

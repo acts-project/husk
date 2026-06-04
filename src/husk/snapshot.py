@@ -29,6 +29,11 @@ class SlotView:
     runner_status: str | None  # "online" | "offline" | None
     busy: bool  # runner currently running a job
     cycle: int  # recycle cycle (durable husk-cycle)
+    cloudinit_seconds: float | None = (
+        None  # last ACTIVE→runner-online (cloud-init step)
+    )
+    recycle_seconds: float | None = None  # last issue→runner-online (whole bring-up)
+    busy_fraction: float | None = None  # busy time / total tracked time ("live-time")
 
 
 @dataclass(frozen=True)
@@ -54,11 +59,15 @@ class ControllerState:
         max_total: int,
         desired_total: int,
         classified: list[tuple],  # list of (Slot, Runner|None, SlotState)
+        timing: dict | None = None,  # slot_id -> SlotTiming (optional)
     ) -> "ControllerState":
+        timing = timing or {}
         counts = {st.value: 0 for st in SlotState}
         views: list[SlotView] = []
         for slot, runner, state in classified:
             counts[state.value] += 1
+            t = timing.get(slot.id)
+            bf = t.busy_fraction if t is not None else None
             views.append(
                 SlotView(
                     id=slot.id,
@@ -70,6 +79,17 @@ class ControllerState:
                     runner_status=runner.status if runner else None,
                     busy=runner.busy if runner else False,
                     cycle=slot.cycle,
+                    cloudinit_seconds=(
+                        round(t.last_cloudinit_seconds, 1)
+                        if t is not None and t.last_cloudinit_seconds is not None
+                        else None
+                    ),
+                    recycle_seconds=(
+                        round(t.last_recycle_seconds, 1)
+                        if t is not None and t.last_recycle_seconds is not None
+                        else None
+                    ),
+                    busy_fraction=round(bf, 3) if bf is not None else None,
                 )
             )
         return cls(

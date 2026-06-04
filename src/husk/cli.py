@@ -107,6 +107,14 @@ _STATE_STYLE = {
 _STALE_AFTER_SEC = 60  # snapshot older than this likely means huskd is behind/down
 
 
+def _secs(v: float | None) -> str:
+    return f"{v:.0f}s" if v is not None else "-"
+
+
+def _pct(v: float | None) -> str:
+    return f"{v * 100:.0f}%" if v is not None else "-"
+
+
 def _age_str(epoch: float) -> str:
     age = max(0.0, time.time() - epoch)
     if age < 90:
@@ -122,8 +130,22 @@ def _status_table(snap: ControllerState):
     from rich.text import Text
 
     table = Table(expand=False, header_style="bold")
-    for col in ("ID", "NAME", "STATE", "NOVA", "TASK", "RUNNER", "BUSY", "CYCLE"):
-        table.add_column(col)
+    cols = (
+        "ID",
+        "NAME",
+        "STATE",
+        "NOVA",
+        "TASK",
+        "RUNNER",
+        "BUSY",
+        "CYCLE",
+        "CLOUD_INIT",
+        "BUSY%",
+    )
+    for col in cols:
+        table.add_column(
+            col, justify="right" if col in ("CLOUD_INIT", "BUSY%") else "left"
+        )
     for v in sorted(snap.slots, key=lambda v: (v.name, v.id)):
         if v.runner:  # red runner name encodes an offline registration
             runner = Text(v.runner, style="red" if v.runner_status == "offline" else "")
@@ -138,6 +160,8 @@ def _status_table(snap: ControllerState):
             runner,
             Text("yes", style="cyan") if v.busy else "-",
             str(v.cycle),
+            _secs(v.cloudinit_seconds),
+            _pct(v.busy_fraction),
         )
     return table
 
@@ -222,6 +246,9 @@ def _print_status(snap: ControllerState | None) -> None:
         "RUNNER_ST",
         "BUSY",
         "CYCLE",
+        "CLOUD_INIT",
+        "RECYCLE",
+        "BUSY%",
     ]
     rows = [
         [
@@ -234,6 +261,9 @@ def _print_status(snap: ControllerState | None) -> None:
             v.runner_status or "-",
             "yes" if v.busy else "-",
             str(v.cycle),
+            _secs(v.cloudinit_seconds),
+            _secs(v.recycle_seconds),
+            _pct(v.busy_fraction),
         ]
         for v in sorted(snap.slots, key=lambda v: (v.name, v.id))
     ]
