@@ -16,7 +16,8 @@ repo = "acts-project/husk-test"
 
 [controller]
 lock_path = "/tmp/huskd.lock"
-state_path = "/tmp/huskd-state.json"   # huskd publishes its snapshot here; huskctl status reads it
+state_path = "/tmp/huskd-state.json"   # same-host fallback snapshot file
+http_addr = "127.0.0.1:9100"           # huskd serves /status /metrics /healthz; "0.0.0.0:9100" to expose; "" to disable
 shrink_ticks = 3                       # sustained-surplus ticks before ramp-down
 
 [runner]

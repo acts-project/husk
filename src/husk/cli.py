@@ -260,6 +260,7 @@ def run(
     except LockHeld as e:
         typer.echo(str(e), err=True)
         raise typer.Exit(code=1)
+    server = None
     try:
         backend, github = _build(cfg)
         ctrl = Controller(backend, github, cfg)
@@ -267,8 +268,19 @@ def run(
             ctrl.tick()
             _print_status(ctrl.snapshot)
         else:
-            ctrl.run()
+            if cfg.controller.http_addr:
+                from husk.http_server import StatusServer, parse_addr
+
+                host, port = parse_addr(cfg.controller.http_addr)
+                server = StatusServer(lambda: ctrl.snapshot, host, port)
+                server.start()
+            try:
+                ctrl.run()
+            except KeyboardInterrupt:
+                typer.echo("shutting down", err=True)
     finally:
+        if server is not None:
+            server.stop()
         lock.release()
 
 
@@ -285,6 +297,12 @@ def status(
     interval: Annotated[
         float, typer.Option("--interval", "-n", help="Watch refresh seconds")
     ] = 2.0,
+    url: Annotated[
+        Optional[str],
+        typer.Option(
+            "--url", help="huskd status URL (default: from controller.http_addr)"
+        ),
+    ] = None,
     live: Annotated[
         bool,
         typer.Option(
@@ -295,13 +313,13 @@ def status(
 ) -> None:
     """Show the current pool state.
 
-    By default this renders huskd's published snapshot (its exact view, no extra
-    API calls). With --live it independently queries OpenStack/GitHub — useful
-    when huskd isn't running, but it can't see huskd's in-memory grace tracking so
-    transient STARTING/draining slots may read UNHEALTHY."""
+    Source priority: --live (query OpenStack/GitHub directly) > --url / huskd's
+    HTTP endpoint > the published state file. The default renders huskd's exact
+    snapshot with no extra API calls; --live can't see huskd's in-memory grace
+    tracking, so transient STARTING/draining slots may read UNHEALTHY there."""
     _setup_logging(log_level)
     cfg = _load(config, secrets_dir)
-    getter = _snapshot_getter(cfg, live)
+    getter = _snapshot_getter(cfg, live=live, url=url)
 
     if watch:
         _watch_status(getter, interval)
@@ -317,36 +335,57 @@ def status(
         _print_status(snap)
 
 
-def _snapshot_getter(cfg: Config, live: bool):
+def _snapshot_getter(cfg: Config, *, live: bool, url: Optional[str] = None):
     """Return a callable yielding a fresh ControllerState each call.
 
-    Default: read huskd's published state file. --live: recompute by querying the
-    backends (lazily building them on first call so a missing state file with a
-    bad cloud still surfaces a clear error only in --live mode)."""
+    Priority: --live (recompute) > HTTP (--url or controller.http_addr) > the
+    published state file. Each getter raises a clear error on failure so the
+    one-shot exits non-zero and the watcher shows the error and keeps polling."""
+    from husk.snapshot import ControllerState as _CS
     from husk.snapshot import read_state
 
-    if not live:
-        path = cfg.controller.state_path
+    if live:
+        ctrl: list = []  # built lazily, reused across watch frames
 
-        def from_file() -> ControllerState:
-            snap = read_state(path)
-            if snap is None:
+        def from_live() -> ControllerState:
+            if not ctrl:
+                backend, github = _build(cfg)
+                ctrl.append(Controller(backend, github, cfg))
+            return ctrl[0].observe()
+
+        return from_live
+
+    target = url or (
+        f"http://{cfg.controller.http_addr}/status"
+        if cfg.controller.http_addr
+        else None
+    )
+    if target:
+        import urllib.request
+
+        def from_http() -> ControllerState:
+            try:
+                with urllib.request.urlopen(target, timeout=5) as r:
+                    return _CS.from_dict(json.loads(r.read()))
+            except Exception as e:
                 raise RuntimeError(
-                    f"no huskd state at {path} — is huskd running? (use --live to query directly)"
+                    f"could not fetch status from {target}: {e} "
+                    "(is huskd running? use --live to query directly)"
                 )
-            return snap
 
-        return from_file
+        return from_http
 
-    ctrl: list = []  # built lazily, reused across watch frames
+    path = cfg.controller.state_path
 
-    def from_live() -> ControllerState:
-        if not ctrl:
-            backend, github = _build(cfg)
-            ctrl.append(Controller(backend, github, cfg))
-        return ctrl[0].observe()
+    def from_file() -> ControllerState:
+        snap = read_state(path)
+        if snap is None:
+            raise RuntimeError(
+                f"no huskd state at {path} — is huskd running? (use --live to query directly)"
+            )
+        return snap
 
-    return from_live
+    return from_file
 
 
 @huskctl_app.command()

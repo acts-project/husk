@@ -57,6 +57,9 @@ class TimeoutsConfig:
 class ControllerConfig:
     lock_path: str = "/tmp/huskd.lock"
     state_path: str = "/tmp/huskd-state.json"
+    http_addr: str = (
+        "127.0.0.1:9100"  # huskd serves /status /metrics /healthz; "" disables
+    )
     shrink_ticks: int = 3
 
 
@@ -119,6 +122,7 @@ def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
     class _Controller(BaseModel):
         lock_path: str = "/tmp/huskd.lock"
         state_path: str = "/tmp/huskd-state.json"
+        http_addr: str = "127.0.0.1:9100"
         shrink_ticks: int = 3
 
     class _Settings(BaseSettings):
@@ -199,6 +203,7 @@ def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
         controller=ControllerConfig(
             lock_path=s.controller.lock_path,
             state_path=s.controller.state_path,
+            http_addr=s.controller.http_addr,
             shrink_ticks=s.controller.shrink_ticks,
         ),
     )
