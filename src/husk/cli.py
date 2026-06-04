@@ -27,21 +27,36 @@ _LogLevelOpt = Annotated[
     typer.Option(
         "--log-level",
         "-l",
-        help="DEBUG/INFO/WARNING/ERROR (default: $HUSK_LOG_LEVEL or INFO)",
+        help="husk log level: DEBUG/INFO/WARNING/ERROR (default: $HUSK_LOG_LEVEL or "
+        "INFO). Third-party libs stay at WARNING; raise via $HUSK_ROOT_LOG_LEVEL.",
     ),
 ]
 
 
+def _resolve_level(name: str, default: int) -> int:
+    resolved = logging.getLevelName(name.upper())
+    return resolved if isinstance(resolved, int) else default
+
+
 def _setup_logging(level: Optional[str]) -> None:
     name = (level or os.environ.get("HUSK_LOG_LEVEL") or "INFO").upper()
-    resolved = logging.getLevelName(name)
-    if not isinstance(resolved, int):  # unknown name → fall back to INFO
+    husk_level = logging.getLevelName(name)
+    if not isinstance(husk_level, int):  # unknown name → fall back to INFO
         typer.echo(f"unknown log level {name!r}; using INFO", err=True)
-        resolved = logging.INFO
+        husk_level = logging.INFO
+
+    # Keep the root logger (and thus noisy third-party libs like keystoneauth,
+    # urllib3, openstack) at WARNING, and set ONLY the husk logger to the
+    # requested level — so `-l DEBUG` shows husk's trace without the low-level
+    # HTTP/auth chatter. Power users can raise the floor via $HUSK_ROOT_LOG_LEVEL.
+    root_level = _resolve_level(
+        os.environ.get("HUSK_ROOT_LOG_LEVEL", "WARNING"), logging.WARNING
+    )
     logging.basicConfig(
-        level=resolved,
+        level=root_level,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    logging.getLogger("husk").setLevel(husk_level)
 
 
 def _load(config: Path, secrets_dir: Optional[Path]) -> Config:
