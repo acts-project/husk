@@ -1,12 +1,15 @@
 # Husk controller config. Precedence: env (HUSK_*) > this file > defaults.
 # Env override examples:
 #   HUSK_BACKEND__MIN_READY=2  HUSK_GITHUB__REPO=acts-project/foo
-# The GitHub PAT is NOT stored here — supply it via env HUSK_GITHUB__PAT (local
-# dev) or [github].pat_path pointing at a mounted k8s Secret file (0400).
+# The GitHub PAT is NOT stored here. It is resolved in priority order:
+#   1. $HUSK_GITHUB__PAT            (explicit override)
+#   2. $GH_TOKEN                    (local dev — just `export GH_TOKEN=ghp_...`)
+#   3. [github].pat_path file       (k8s Secret mount, 0400)
 
 [github]
 repo = "acts-project/husk-test"
-# pat_path = "/etc/husk/github-pat"   # k8s Secret mount; or set HUSK_GITHUB__PAT
+# pat_env = "GH_TOKEN"              # env var name for local dev (this is the default)
+# pat_path = "/etc/husk/github-pat" # k8s Secret mount
 
 [controller]
 lock_path = "/tmp/huskd.lock"

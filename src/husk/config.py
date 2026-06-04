@@ -75,6 +75,7 @@ def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
     pydantic-settings is imported lazily here so the rest of the package (and the
     unit tests) stay pydantic-free; pydantic is scoped to this loading boundary.
     """
+    import os
     from pathlib import Path
 
     from pydantic import BaseModel
@@ -87,8 +88,9 @@ def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
 
     class _Github(BaseModel):
         repo: str
-        pat: str | None = None        # secret value (env HUSK_GITHUB__PAT); never in TOML
-        pat_path: str | None = None   # k8s: path to a mounted Secret file
+        pat: str | None = None  # secret value (env HUSK_GITHUB__PAT); never in TOML
+        pat_path: str | None = None  # k8s: path to a mounted Secret file
+        pat_env: str = "GH_TOKEN"  # local dev: env var to read the PAT from
 
     class _Runner(BaseModel):
         version: str
@@ -141,18 +143,30 @@ def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
         ):
             toml = TomlConfigSettingsSource(settings_cls, toml_file=path)
             # priority high → low: env > TOML > file-secrets > defaults
-            return (env_settings, dotenv_settings, toml, file_secret_settings, init_settings)
+            return (
+                env_settings,
+                dotenv_settings,
+                toml,
+                file_secret_settings,
+                init_settings,
+            )
 
     s = _Settings()
 
-    # Resolve the PAT: env-injected value, else a mounted file, else fail closed.
+    # Resolve the PAT, in priority order:
+    #   1. HUSK_GITHUB__PAT        — explicit override (pydantic-nested env)
+    #   2. $GH_TOKEN (= pat_env)   — local dev convenience (matches the .env flow)
+    #   3. [github].pat_path file  — k8s Secret mount
+    # then fail closed.
     token = s.github.pat
+    if not token and s.github.pat_env:
+        token = os.environ.get(s.github.pat_env)
     if not token and s.github.pat_path:
         token = Path(s.github.pat_path).read_text().strip()
     if not token:
         raise RuntimeError(
-            "GitHub PAT not configured: set HUSK_GITHUB__PAT or [github].pat_path "
-            "(a file path, e.g. a mounted k8s Secret)"
+            f"GitHub PAT not configured: set ${s.github.pat_env}, HUSK_GITHUB__PAT, "
+            "or [github].pat_path (a file path, e.g. a mounted k8s Secret)"
         )
 
     return Config(
