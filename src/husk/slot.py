@@ -15,26 +15,30 @@ from dataclasses import dataclass
 class SlotState(enum.Enum):
     """The lifecycle state the controller acts on each tick."""
 
-    IDLE = "idle"                    # warm, runner online, waiting for a job
-    BUSY = "busy"                    # runner online and running a job
-    STARTING = "starting"            # provisioning / cloud-init still installing runner
-    NEEDS_RECYCLE = "needs_recycle"  # SHUTOFF — job done, poweroff fired, ready to rebuild
-    UNHEALTHY = "unhealthy"          # ACTIVE but no runner past the startup grace
-    ERROR = "error"                  # Nova ERROR — the only state that earns a destroy
+    IDLE = "idle"  # warm, runner online, waiting for a job
+    BUSY = "busy"  # runner online and running a job
+    STARTING = "starting"  # provisioning / cloud-init still installing runner
+    NEEDS_RECYCLE = (
+        "needs_recycle"  # SHUTOFF — job done, poweroff fired, ready to rebuild
+    )
+    UNHEALTHY = "unhealthy"  # ACTIVE but no runner past the startup grace
+    ERROR = "error"  # Nova ERROR — the only state that earns a destroy
 
 
 @dataclass(frozen=True)
 class Slot:
     """A normalized view of one backend VM ("slot")."""
 
-    id: str                 # backend id (Nova server id) — stable across rebuilds
-    name: str               # VM name (timestamped; stable across rebuilds)
-    status: str             # ACTIVE | SHUTOFF | REBUILD | BUILD | ERROR
-    task_state: str | None  # in-flight provisioning task (rebuilding/spawning/...) or None
-    created_at: float       # backend creation epoch (wall-clock; NOT used for age timers)
-    flavor_id: str          # running flavor — seam for future flavor migration
-    image_id: str           # booted image — seam for future image migration
-    cycle: int = 0          # from durable metadata husk-cycle (see controller restart)
+    id: str  # backend id (Nova server id) — stable across rebuilds
+    name: str  # VM name (timestamped; stable across rebuilds)
+    status: str  # ACTIVE | SHUTOFF | REBUILD | BUILD | ERROR
+    task_state: (
+        str | None
+    )  # in-flight provisioning task (rebuilding/spawning/...) or None
+    created_at: float  # backend creation epoch (wall-clock; NOT used for age timers)
+    flavor_id: str  # running flavor — seam for future flavor migration
+    image_id: str  # booted image — seam for future image migration
+    cycle: int = 0  # from durable metadata husk-cycle (see controller restart)
     provisioned_at: float | None = None  # durable metadata husk-provisioned-at (epoch)
     fault: str | None = None
 
@@ -53,7 +57,7 @@ class Runner:
 
     id: int
     name: str
-    status: str   # "online" | "offline"
+    status: str  # "online" | "offline"
     busy: bool
 
     @property

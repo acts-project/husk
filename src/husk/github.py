@@ -77,8 +77,11 @@ class GitHubClient:
         if r.status_code == 409:
             existing = self.find_runner(name)
             if existing:
-                log.info("runner %s already exists (%s); deleting and retrying",
-                         name, existing.get("status"))
+                log.info(
+                    "runner %s already exists (%s); deleting and retrying",
+                    name,
+                    existing.get("status"),
+                )
                 self.delete_runner(existing["id"])
             r = self._s.post(url, json=body)
         if r.status_code != 201:
@@ -87,11 +90,15 @@ class GitHubClient:
 
     def delete_runner(self, runner_id: int) -> None:
         try:
-            r = self._s.delete(f"{GH_API}/repos/{self.repo}/actions/runners/{runner_id}")
+            r = self._s.delete(
+                f"{GH_API}/repos/{self.repo}/actions/runners/{runner_id}"
+            )
         except requests.RequestException as e:
             raise GitHubError(f"delete runner {runner_id} failed: {e}") from e
         if r.status_code not in (204, 404):
-            raise GitHubError(f"delete runner {runner_id}: HTTP {r.status_code}: {r.text[:200]}")
+            raise GitHubError(
+                f"delete runner {runner_id}: HTTP {r.status_code}: {r.text[:200]}"
+            )
 
     def reap_offline(self) -> list[str]:
         """Delete every offline runner — clears leftover/dead JIT registrations."""

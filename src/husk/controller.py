@@ -41,7 +41,9 @@ def runner_name(vm: str, cycle: int) -> str:
 
 
 class Controller:
-    def __init__(self, backend, github, config: Config, *, clock=time.monotonic) -> None:
+    def __init__(
+        self, backend, github, config: Config, *, clock=time.monotonic
+    ) -> None:
         self.backend = backend
         self.github = github
         self.cfg = config
@@ -88,7 +90,9 @@ class Controller:
         try:
             runners: list[Runner] = self.github.list_runners()
         except Exception:
-            log.error("list_runners failed; aborting tick (no mutations)", exc_info=True)
+            log.error(
+                "list_runners failed; aborting tick (no mutations)", exc_info=True
+            )
             return self.snapshot
 
         self._gc_bookkeeping({s.id for s in slots})
@@ -113,11 +117,20 @@ class Controller:
                     log.warning("slot %s busy past max_job_duration; stopping", s.id)
                     self._safe(lambda: self.backend.stop_slot(s), f"stop {s.id}")
             elif state is SlotState.IDLE:
-                if runner and self._state_age(s.id, now) > self.cfg.timeouts.idle_timeout_sec:
-                    log.info("slot %s idle past idle_timeout; deregistering runner", s.id)
-                    self._safe(lambda: self.github.delete_runner(runner.id), "delete_runner")
+                if (
+                    runner
+                    and self._state_age(s.id, now) > self.cfg.timeouts.idle_timeout_sec
+                ):
+                    log.info(
+                        "slot %s idle past idle_timeout; deregistering runner", s.id
+                    )
+                    self._safe(
+                        lambda: self.github.delete_runner(runner.id), "delete_runner"
+                    )
             elif state is SlotState.UNHEALTHY:
-                log.warning("slot %s unhealthy (no runner past grace); rebuilding", s.id)
+                log.warning(
+                    "slot %s unhealthy (no runner past grace); rebuilding", s.id
+                )
                 self._rebuild_then_start(s, now)
             # STARTING: nothing — re-check next tick.
 
@@ -171,7 +184,9 @@ class Controller:
         )
         return self.snapshot
 
-    def _classify_all(self, slots, runners, now) -> list[tuple[Slot, Runner | None, SlotState]]:
+    def _classify_all(
+        self, slots, runners, now
+    ) -> list[tuple[Slot, Runner | None, SlotState]]:
         classified: list[tuple[Slot, Runner | None, SlotState]] = []
         for s in slots:
             runner = match_runner(runners, s)
@@ -244,7 +259,9 @@ class Controller:
         self._destroy(slot, "decommission")
 
     def _destroy(self, slot: Slot, reason: str) -> None:
-        self._safe(lambda: self.backend.destroy_slot(slot, reason=reason), f"destroy {slot.id}")
+        self._safe(
+            lambda: self.backend.destroy_slot(slot, reason=reason), f"destroy {slot.id}"
+        )
         self._forget(slot.id)
 
     # ------------------------------------------------------------ bookkeeping
@@ -267,7 +284,11 @@ class Controller:
                 self.last_provision_action[slot.id] = now  # fresh grace
 
     def _gc_bookkeeping(self, live: set[str]) -> None:
-        for d in (self.first_seen_state, self.last_provision_action, self.cycle_counter):
+        for d in (
+            self.first_seen_state,
+            self.last_provision_action,
+            self.cycle_counter,
+        ):
             for k in list(d):
                 if k not in live:
                     del d[k]

@@ -18,7 +18,9 @@ huskd_app = typer.Typer(help="Husk controller daemon", add_completion=False)
 huskctl_app = typer.Typer(help="Husk operator CLI", add_completion=False)
 
 _ConfigOpt = Annotated[Path, typer.Option("--config", "-c", help="Path to config.toml")]
-_SecretsOpt = Annotated[Optional[Path], typer.Option("--secrets-dir", help="k8s secrets mount")]
+_SecretsOpt = Annotated[
+    Optional[Path], typer.Option("--secrets-dir", help="k8s secrets mount")
+]
 
 
 def _setup_logging() -> None:
@@ -30,7 +32,9 @@ def _setup_logging() -> None:
 
 def _load(config: Path, secrets_dir: Optional[Path]) -> Config:
     try:
-        return load_config(str(config), secrets_dir=str(secrets_dir) if secrets_dir else None)
+        return load_config(
+            str(config), secrets_dir=str(secrets_dir) if secrets_dir else None
+        )
     except Exception as e:
         typer.echo(f"config error: {e}", err=True)
         raise typer.Exit(code=2)
@@ -70,7 +74,9 @@ def _print_status(snap: ControllerState | None) -> None:
 def run(
     config: _ConfigOpt = Path("config.toml"),
     secrets_dir: _SecretsOpt = None,
-    once: Annotated[bool, typer.Option(help="Run a single reconcile tick then exit")] = False,
+    once: Annotated[
+        bool, typer.Option(help="Run a single reconcile tick then exit")
+    ] = False,
 ) -> None:
     """Run the reconcile loop (or a single tick with --once)."""
     _setup_logging()

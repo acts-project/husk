@@ -117,7 +117,9 @@ def gh_mint_jit(s, name):
     if r.status_code == 409:
         existing = gh_find_runner(s, name)
         if existing:
-            print(f"    runner '{name}' already exists ({existing['status']}); deleting and retrying")
+            print(
+                f"    runner '{name}' already exists ({existing['status']}); deleting and retrying"
+            )
             gh_delete_runner(s, existing["id"])
         r = s.post(url, json=body)
     if r.status_code != 201:
@@ -367,7 +369,9 @@ def task_state(server):
     )
 
 
-def wait_for_status(conn, server, target, deadline_s, valid_intermediate, require_seen=None):
+def wait_for_status(
+    conn, server, target, deadline_s, valid_intermediate, require_seen=None
+):
     t0 = time.monotonic()
     valid = set(valid_intermediate) | {target, "ERROR"}
     last, last_task = None, "__unset__"
@@ -376,10 +380,10 @@ def wait_for_status(conn, server, target, deadline_s, valid_intermediate, requir
         server = conn.compute.get_server(server.id)
         ts = task_state(server)
         if server.status != last:
-            print(f"    status -> {server.status} (+{time.monotonic()-t0:.0f}s)")
+            print(f"    status -> {server.status} (+{time.monotonic() - t0:.0f}s)")
             last = server.status
         if ts != last_task:
-            print(f"    task_state -> {ts} (+{time.monotonic()-t0:.0f}s)")
+            print(f"    task_state -> {ts} (+{time.monotonic() - t0:.0f}s)")
             last_task = ts
         if require_seen and server.status == require_seen:
             seen_required = True
@@ -390,7 +394,9 @@ def wait_for_status(conn, server, target, deadline_s, valid_intermediate, requir
         if server.status not in valid:
             print(f"    !! unexpected status: {server.status}")
         time.sleep(POLL_INTERVAL)
-    raise TimeoutError(f"Timed out waiting for {target} (last={last}, task={last_task})")
+    raise TimeoutError(
+        f"Timed out waiting for {target} (last={last}, task={last_task})"
+    )
 
 
 def wait_for_ip(conn, server, deadline_s=60):
@@ -406,12 +412,19 @@ def wait_for_ip(conn, server, deadline_s=60):
 
 def ssh(ip, key_path, command, timeout=60):
     cmd = [
-        "ssh", "-i", key_path,
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "ConnectTimeout=10",
-        "-o", "LogLevel=ERROR",
-        f"{SSH_USER}@{ip}", command,
+        "ssh",
+        "-i",
+        key_path,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "LogLevel=ERROR",
+        f"{SSH_USER}@{ip}",
+        command,
     ]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     return p.returncode, p.stdout.strip(), p.stderr.strip()
@@ -421,11 +434,18 @@ def rebuild_with_user_data(conn, server, jit_blob, image_id):
     """POST a minimal rebuild action with fresh user_data (CERN-compatible)."""
     resp = conn.compute.post(
         f"/servers/{server.id}/action",
-        json={"rebuild": {"imageRef": image_id, "user_data": b64(render_cloud_init(jit_blob))}},
+        json={
+            "rebuild": {
+                "imageRef": image_id,
+                "user_data": b64(render_cloud_init(jit_blob)),
+            }
+        },
         headers={"OpenStack-API-Version": f"compute {REBUILD_MICROVERSION}"},
     )
     if resp.status_code not in (200, 202):
-        raise RuntimeError(f"rebuild rejected: HTTP {resp.status_code}: {resp.text[:300]}")
+        raise RuntimeError(
+            f"rebuild rejected: HTTP {resp.status_code}: {resp.text[:300]}"
+        )
 
 
 def wait_rebuild_done(conn, server, deadline_s):
@@ -440,10 +460,10 @@ def wait_rebuild_done(conn, server, deadline_s):
         server = conn.compute.get_server(server.id)
         ts = task_state(server)
         if server.status != last:
-            print(f"    status -> {server.status} (+{time.monotonic()-t0:.0f}s)")
+            print(f"    status -> {server.status} (+{time.monotonic() - t0:.0f}s)")
             last = server.status
         if ts != last_task:
-            print(f"    task_state -> {ts} (+{time.monotonic()-t0:.0f}s)")
+            print(f"    task_state -> {ts} (+{time.monotonic() - t0:.0f}s)")
             last_task = ts
         if server.status == "ERROR":
             raise RuntimeError(f"Server entered ERROR: {server.fault}")
@@ -463,10 +483,16 @@ def recycle_rebuild(conn, server, jit_blob, image_id):
     server = conn.compute.get_server(server.id)
     server = wait_rebuild_done(conn, server, MAX_WAIT_REBUILD)
     if server.status != "ACTIVE":
-        print(f"    rebuild settled to {server.status}; os-start (Nova preserves power state)")
+        print(
+            f"    rebuild settled to {server.status}; os-start (Nova preserves power state)"
+        )
         conn.compute.start_server(server)
         server = wait_for_status(
-            conn, server, "ACTIVE", MAX_WAIT_REBUILD, valid_intermediate={"SHUTOFF", "BUILD"}
+            conn,
+            server,
+            "ACTIVE",
+            MAX_WAIT_REBUILD,
+            valid_intermediate={"SHUTOFF", "BUILD"},
         )
     return server
 
@@ -479,7 +505,7 @@ def wait_runner_online(s, name, deadline_s):
         r = gh_find_runner(s, name)
         status = r["status"] if r else "absent"
         if status != last:
-            print(f"    runner[{name}] -> {status} (+{time.monotonic()-t0:.0f}s)")
+            print(f"    runner[{name}] -> {status} (+{time.monotonic() - t0:.0f}s)")
             last = status
         if status == "online":
             return time.monotonic() - t0
@@ -494,7 +520,7 @@ def wait_shutoff(conn, server, deadline_s):
     while time.monotonic() - t0 < deadline_s:
         server = conn.compute.get_server(server.id)
         if server.status != last:
-            print(f"    slot -> {server.status} (+{time.monotonic()-t0:.0f}s)")
+            print(f"    slot -> {server.status} (+{time.monotonic() - t0:.0f}s)")
             last = server.status
         if server.status == "SHUTOFF":
             return time.monotonic() - t0
@@ -555,16 +581,20 @@ def cmd_create(args):
         metadata={"managed-by": TAG},
     )
     print(f"  created {server.id}")
-    server = wait_for_status(conn, server, "ACTIVE", MAX_WAIT_ACTIVE, valid_intermediate={"BUILD"})
+    server = wait_for_status(
+        conn, server, "ACTIVE", MAX_WAIT_ACTIVE, valid_intermediate={"BUILD"}
+    )
     ip = wait_for_ip(conn, server)
-    print(f"  ACTIVE ip={ip} (+{time.monotonic()-t0:.0f}s) — cloud-init now installing runner")
+    print(
+        f"  ACTIVE ip={ip} (+{time.monotonic() - t0:.0f}s) — cloud-init now installing runner"
+    )
 
     elapsed = wait_runner_online(s, name, MAX_WAIT_RUNNER)
     if elapsed is None:
         print("  runner did NOT come online in time. Debug with:")
         print(f"    python {sys.argv[0]} diag {server.id}")
         sys.exit(1)
-    print(f"  RUNNER ONLINE after +{time.monotonic()-t0:.0f}s total")
+    print(f"  RUNNER ONLINE after +{time.monotonic() - t0:.0f}s total")
     print("\nNext: dispatch a job and watch it recycle:")
     print(f"    python {sys.argv[0]} loop --server {server.id} --cycles 1")
     print(f"    python {sys.argv[0]} watch {server.id}")
@@ -581,13 +611,34 @@ def cmd_diag(args):
         sys.exit("no IP")
     probes = [
         ("cloud-init status", "cloud-init status --long 2>&1 | head -20"),
-        ("cloud-init errors", "grep -iE 'error|fail|traceback' /var/log/cloud-init-output.log 2>&1 | tail -30"),
-        ("runner unit", "systemctl status husk-runner.service --no-pager 2>&1 | head -25"),
-        ("runner journal", "journalctl -u husk-runner.service --no-pager 2>&1 | tail -40"),
-        ("podman socket (runner)", "sudo -u runner XDG_RUNTIME_DIR=/run/user/1000 systemctl --user status podman.socket --no-pager 2>&1 | head -10"),
-        ("docker shim", "/usr/bin/env -u DOCKER_HOST /usr/local/bin/docker version --format '{{.Server.APIVersion}}' 2>&1 | tail -3"),
-        ("docker.sock", "ls -l /run/docker.sock /run/user/1000/podman/podman.sock 2>&1"),
-        ("runner _diag tail", "ls -t /opt/actions-runner/_diag/*.log 2>/dev/null | head -1 | xargs tail -20 2>&1"),
+        (
+            "cloud-init errors",
+            "grep -iE 'error|fail|traceback' /var/log/cloud-init-output.log 2>&1 | tail -30",
+        ),
+        (
+            "runner unit",
+            "systemctl status husk-runner.service --no-pager 2>&1 | head -25",
+        ),
+        (
+            "runner journal",
+            "journalctl -u husk-runner.service --no-pager 2>&1 | tail -40",
+        ),
+        (
+            "podman socket (runner)",
+            "sudo -u runner XDG_RUNTIME_DIR=/run/user/1000 systemctl --user status podman.socket --no-pager 2>&1 | head -10",
+        ),
+        (
+            "docker shim",
+            "/usr/bin/env -u DOCKER_HOST /usr/local/bin/docker version --format '{{.Server.APIVersion}}' 2>&1 | tail -3",
+        ),
+        (
+            "docker.sock",
+            "ls -l /run/docker.sock /run/user/1000/podman/podman.sock 2>&1",
+        ),
+        (
+            "runner _diag tail",
+            "ls -t /opt/actions-runner/_diag/*.log 2>/dev/null | head -1 | xargs tail -20 2>&1",
+        ),
     ]
     for label, cmd in probes:
         print(f"\n----- {label} -----")
@@ -627,8 +678,12 @@ def _one_cycle(s, conn, image, server, cycle, dispatch=True):
         print("  dispatching workflow...")
         gh_dispatch(s)
     else:
-        print(f"  >>> TRIGGER the husk-phase3 workflow now (runner '{name}' is online):")
-        print(f"  >>>   gh workflow run {WORKFLOW_FILE} -R {REPO}   (or the Actions UI)")
+        print(
+            f"  >>> TRIGGER the husk-phase3 workflow now (runner '{name}' is online):"
+        )
+        print(
+            f"  >>>   gh workflow run {WORKFLOW_FILE} -R {REPO}   (or the Actions UI)"
+        )
         print("  >>> waiting for the job to run and the slot to power off...")
     t_disp = time.monotonic()
     el = wait_shutoff(conn, conn.compute.get_server(server.id), MAX_WAIT_JOB)
@@ -659,18 +714,28 @@ def cmd_loop(args):
         name = runner_name(vm, 0)
         jit = gh_mint_jit(s, name)
         server = conn.compute.create_server(
-            name=vm, image_id=image.id, flavor_id=flavor.id,
-            networks=[{"uuid": network.id}], key_name=KEYPAIR_NAME,
-            user_data=b64(render_cloud_init(jit)), metadata={"managed-by": TAG},
+            name=vm,
+            image_id=image.id,
+            flavor_id=flavor.id,
+            networks=[{"uuid": network.id}],
+            key_name=KEYPAIR_NAME,
+            user_data=b64(render_cloud_init(jit)),
+            metadata={"managed-by": TAG},
         )
         print(f"  created {server.id}")
-        server = wait_for_status(conn, server, "ACTIVE", MAX_WAIT_ACTIVE, valid_intermediate={"BUILD"})
+        server = wait_for_status(
+            conn, server, "ACTIVE", MAX_WAIT_ACTIVE, valid_intermediate={"BUILD"}
+        )
         wait_for_ip(conn, server)
         if wait_runner_online(s, name, MAX_WAIT_RUNNER) is None:
-            print(f"  runner never came online; debug: python {sys.argv[0]} diag {server.id}")
+            print(
+                f"  runner never came online; debug: python {sys.argv[0]} diag {server.id}"
+            )
             sys.exit(1)
         if args.no_dispatch:
-            print(f"  >>> TRIGGER husk-phase3 now (runner '{name}' online): gh workflow run {WORKFLOW_FILE} -R {REPO}")
+            print(
+                f"  >>> TRIGGER husk-phase3 now (runner '{name}' online): gh workflow run {WORKFLOW_FILE} -R {REPO}"
+            )
         else:
             gh_dispatch(s)
         if wait_shutoff(conn, conn.compute.get_server(server.id), MAX_WAIT_JOB) is None:
@@ -682,7 +747,9 @@ def cmd_loop(args):
     try:
         for cycle in range(start_cycle, start_cycle + args.cycles):
             try:
-                server, t = _one_cycle(s, conn, image, server, cycle, dispatch=not args.no_dispatch)
+                server, t = _one_cycle(
+                    s, conn, image, server, cycle, dispatch=not args.no_dispatch
+                )
                 timings.append((cycle, t))
             except Exception as e:
                 print(f"  cycle {cycle} failed: {e}")
@@ -695,14 +762,18 @@ def cmd_loop(args):
             run = t.get("run")
             run_s = f"{run[0]}/{run[1]}" if run else "?"
             print(
-                f"  {cycle:>5}  {t.get('active_s',0):>7.0f}s  {t.get('online_s',0):>7.0f}s"
-                f"  {t.get('job_to_shutoff_s',0):>8.0f}s  {run_s}"
+                f"  {cycle:>5}  {t.get('active_s', 0):>7.0f}s  {t.get('online_s', 0):>7.0f}s"
+                f"  {t.get('job_to_shutoff_s', 0):>8.0f}s  {run_s}"
             )
         if timings:
             best = min(t["online_s"] for _, t in timings)
-            print(f"\n  Best recycle (rebuild->runner online): {best:.0f}s  (target <60s)")
+            print(
+                f"\n  Best recycle (rebuild->runner online): {best:.0f}s  (target <60s)"
+            )
         print(f"\n  Slot left SHUTOFF: {server.id}")
-        print(f"  Reap runners + delete VM with: python {sys.argv[0]} clean {server.id}")
+        print(
+            f"  Reap runners + delete VM with: python {sys.argv[0]} clean {server.id}"
+        )
 
 
 def cmd_recycle(args):
@@ -715,11 +786,11 @@ def cmd_recycle(args):
     jit = gh_mint_jit(s, name)
     t0 = time.monotonic()
     server = recycle_rebuild(conn, server, jit, image.id)
-    print(f"  ACTIVE after +{time.monotonic()-t0:.0f}s")
+    print(f"  ACTIVE after +{time.monotonic() - t0:.0f}s")
     online = wait_runner_online(s, name, MAX_WAIT_RUNNER)
     if online is None:
         sys.exit("runner never came online")
-    print(f"  RUNNER ONLINE — recycle time +{time.monotonic()-t0:.0f}s")
+    print(f"  RUNNER ONLINE — recycle time +{time.monotonic() - t0:.0f}s")
 
 
 def cmd_clean(args):
@@ -760,8 +831,11 @@ def main():
     sp = sub.add_parser("loop", help="C: N timed recycle cycles on one slot")
     sp.add_argument("--server", help="adopt an existing SHUTOFF slot")
     sp.add_argument("--cycles", type=int, default=5)
-    sp.add_argument("--no-dispatch", action="store_true",
-                    help="don't auto-trigger the workflow; you run it manually each cycle")
+    sp.add_argument(
+        "--no-dispatch",
+        action="store_true",
+        help="don't auto-trigger the workflow; you run it manually each cycle",
+    )
     sp.set_defaults(func=cmd_loop)
 
     sp = sub.add_parser("clean", help="reap offline runners (+ optionally delete VM)")

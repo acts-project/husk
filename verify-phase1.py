@@ -110,10 +110,10 @@ def wait_for_status(
         server = conn.compute.get_server(server.id)
         ts = task_state(server)
         if server.status != last:
-            print(f"    status -> {server.status} (+{time.monotonic()-t0:.0f}s)")
+            print(f"    status -> {server.status} (+{time.monotonic() - t0:.0f}s)")
             last = server.status
         if ts != last_task:
-            print(f"    task_state -> {ts} (+{time.monotonic()-t0:.0f}s)")
+            print(f"    task_state -> {ts} (+{time.monotonic() - t0:.0f}s)")
             last_task = ts
         if require_seen and server.status == require_seen:
             seen_required = True
@@ -124,7 +124,9 @@ def wait_for_status(
         if server.status not in valid:
             print(f"    !! unexpected status: {server.status}")
         time.sleep(POLL_INTERVAL)
-    raise TimeoutError(f"Timed out waiting for {target} (last={last}, task={last_task})")
+    raise TimeoutError(
+        f"Timed out waiting for {target} (last={last}, task={last_task})"
+    )
 
 
 def wait_for_ip(conn, server, deadline_s):
@@ -235,7 +237,9 @@ def verify_marker(ip, key_path, expected_tag, results, phase):
         # Nothing below is trustworthy without a shell. Fail explicitly rather
         # than letting empty reads produce misleading PASSes.
         results.check(f"{phase}: SSH login as {SSH_USER}", False, content)
-        results.check(f"{phase}: marker file contains PHASE1-MARKER-{expected_tag}", False)
+        results.check(
+            f"{phase}: marker file contains PHASE1-MARKER-{expected_tag}", False
+        )
         results.check(f"{phase}: runcmd-{expected_tag} executed", False)
         if expected_tag == "B":
             results.check("rebuild: stale MARKER-A absent", False)
@@ -325,7 +329,7 @@ def main():
             conn, server, "ACTIVE", MAX_WAIT_ACTIVE, valid_intermediate={"BUILD"}
         )
         ip = wait_for_ip(conn, server, deadline_s=60)
-        print(f"  ACTIVE, ip={ip}, boot took {time.monotonic()-t0:.0f}s")
+        print(f"  ACTIVE, ip={ip}, boot took {time.monotonic() - t0:.0f}s")
         verify_marker(ip, args.key, "A", results, phase="first-boot")
 
         # --- Rebuild with marker B (the critical test) ---
@@ -360,7 +364,7 @@ def main():
         )
         ip2 = first_ip(server)
         results.check("rebuild: IP preserved", ip2 == ip, f"{ip} -> {ip2}")
-        print(f"  ACTIVE, ip={ip2}, rebuild took {time.monotonic()-t0:.0f}s")
+        print(f"  ACTIVE, ip={ip2}, rebuild took {time.monotonic() - t0:.0f}s")
         verify_marker(ip2, args.key, "B", results, phase="rebuild")
 
     finally:

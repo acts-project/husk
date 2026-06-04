@@ -40,7 +40,9 @@ GRACE = 300.0
 )
 def test_classify(status, task, runner, prov_age, expected):
     slot = make_slot(status=status, task_state=task)
-    assert classify(slot, runner, provision_age=prov_age, startup_grace=GRACE) is expected
+    assert (
+        classify(slot, runner, provision_age=prov_age, startup_grace=GRACE) is expected
+    )
 
 
 def test_match_runner_prefix_and_prefers_online():

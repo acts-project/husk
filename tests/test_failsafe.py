@@ -24,7 +24,7 @@ def test_list_raises_no_destroy(clock):
     ctrl.tick()
 
     assert backend.calls == []  # no destroy, no rebuild, no create
-    assert github.calls == []   # no mint, no delete_runner
+    assert github.calls == []  # no mint, no delete_runner
 
 
 def test_github_list_raises_no_mutation(clock):
@@ -73,10 +73,10 @@ def test_busy_over_timeout_stop_not_destroy(clock):
     # max_total=1 so the busy slot doesn't trigger a warm-spare create; isolates timeout.
     ctrl = _run(backend, github, make_config(max_job_duration=10, max_total=1), clock)
 
-    ctrl.tick()                      # BUSY, age 0
+    ctrl.tick()  # BUSY, age 0
     assert backend.calls == []
     clock.advance(20)
-    ctrl.tick()                      # BUSY past timeout
+    ctrl.tick()  # BUSY past timeout
 
     assert "stop" in backend.ops()
     assert "destroy" not in backend.ops()
@@ -86,7 +86,9 @@ def test_busy_under_timeout_noop(clock):
     runner = make_runner(name="husk-1-c0", busy=True)
     backend = FakeBackend(slots=[make_slot(id="vm-1", name="husk-1", status="ACTIVE")])
     github = FakeGitHub(runners=[runner])
-    ctrl = _run(backend, github, make_config(max_job_duration=10_000, max_total=1), clock)
+    ctrl = _run(
+        backend, github, make_config(max_job_duration=10_000, max_total=1), clock
+    )
 
     ctrl.tick()
     clock.advance(20)
@@ -101,12 +103,12 @@ def test_idle_over_timeout_deregisters_runner(clock):
     github = FakeGitHub(runners=[runner])
     ctrl = _run(backend, github, make_config(idle_timeout=10), clock)
 
-    ctrl.tick()                      # IDLE, age 0
+    ctrl.tick()  # IDLE, age 0
     clock.advance(20)
-    ctrl.tick()                      # IDLE past timeout
+    ctrl.tick()  # IDLE past timeout
 
     assert ("delete_runner", 5) in github.calls
-    assert backend.calls == []       # reaper is GitHub-side; no Nova mutation
+    assert backend.calls == []  # reaper is GitHub-side; no Nova mutation
 
 
 def test_starting_within_grace_noop(clock):
@@ -125,10 +127,10 @@ def test_unhealthy_past_grace_rebuild(clock):
     github = FakeGitHub()
     ctrl = _run(backend, github, make_config(startup_grace=10), clock)
 
-    ctrl.tick()                      # within grace → STARTING
+    ctrl.tick()  # within grace → STARTING
     assert backend.calls == []
     clock.advance(30)
-    ctrl.tick()                      # no runner past grace → UNHEALTHY → rebuild
+    ctrl.tick()  # no runner past grace → UNHEALTHY → rebuild
 
     assert "rebuild" in backend.ops()
     assert "destroy" not in backend.ops()

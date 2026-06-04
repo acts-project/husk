@@ -19,7 +19,7 @@ class SlotView:
 
     id: str
     name: str
-    state: str   # SlotState.value
+    state: str  # SlotState.value
     status: str  # backend status (ACTIVE/SHUTOFF/...)
 
 
@@ -33,7 +33,7 @@ class ControllerState:
     min_ready: int
     max_total: int
     desired_total: int
-    counts: dict[str, int]          # SlotState.value -> count
+    counts: dict[str, int]  # SlotState.value -> count
     slots: list[SlotView] = field(default_factory=list)
 
     @classmethod
@@ -52,7 +52,9 @@ class ControllerState:
         for slot, _runner, state in classified:
             counts[state.value] += 1
             views.append(
-                SlotView(id=slot.id, name=slot.name, state=state.value, status=slot.status)
+                SlotView(
+                    id=slot.id, name=slot.name, state=state.value, status=slot.status
+                )
             )
         return cls(
             generation=generation,

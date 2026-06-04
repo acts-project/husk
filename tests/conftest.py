@@ -40,7 +40,9 @@ def make_config(
 ) -> Config:
     return Config(
         github=GithubConfig(repo="acts-project/husk-test", token="x"),
-        runner=RunnerConfig(version="2.334.0", labels=["self-hosted"], runner_group_id=1),
+        runner=RunnerConfig(
+            version="2.334.0", labels=["self-hosted"], runner_group_id=1
+        ),
         backend=BackendConfig(
             name="fake",
             type="fake",
@@ -85,7 +87,9 @@ def make_slot(
     )
 
 
-def make_runner(id: int = 1, name: str = "husk-1-c0", status: str = "online", busy: bool = False) -> Runner:
+def make_runner(
+    id: int = 1, name: str = "husk-1-c0", status: str = "online", busy: bool = False
+) -> Runner:
     return Runner(id=id, name=name, status=status, busy=busy)
 
 
@@ -94,5 +98,7 @@ def clock() -> FakeClock:
     return FakeClock()
 
 
-def make_controller(backend: FakeBackend, github: FakeGitHub, config: Config, clock) -> Controller:
+def make_controller(
+    backend: FakeBackend, github: FakeGitHub, config: Config, clock
+) -> Controller:
     return Controller(backend, github, config, clock=clock)

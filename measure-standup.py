@@ -322,7 +322,7 @@ def run_once(conn, image, flavor, network, with_ssh_probe, rebuild_cycles):
 
         # Optional rebuild cycles
         for i in range(rebuild_cycles):
-            label = f"rebuild{i+1}"
+            label = f"rebuild{i + 1}"
             server, ip = do_rebuild(
                 conn, server, image, with_ssh_probe, timings, label=label
             )
@@ -368,7 +368,9 @@ def summarize(all_timings):
                     stages.append(stage)
 
         print(f"\n=== Summary: {label} cycle ===")
-        header = f"{'stage':<28} " + " ".join(f"run{i+1:>3}" for i in range(len(runs)))
+        header = f"{'stage':<28} " + " ".join(
+            f"run{i + 1:>3}" for i in range(len(runs))
+        )
         print(header)
         print("-" * len(header))
         for stage in stages:

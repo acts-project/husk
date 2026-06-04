@@ -11,7 +11,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest", "ruff>=0.15"]
 
 [project.scripts]
 huskd = "husk.cli:huskd"

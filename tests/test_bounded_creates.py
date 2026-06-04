@@ -10,7 +10,9 @@ from husk.slot import Capacity
 def test_empty_bounded_create(clock):
     backend = FakeBackend(slots=[])
     github = FakeGitHub()
-    ctrl = make_controller(backend, github, make_config(min_ready=1, max_total=2), clock)
+    ctrl = make_controller(
+        backend, github, make_config(min_ready=1, max_total=2), clock
+    )
 
     ctrl.tick()
 
@@ -18,9 +20,13 @@ def test_empty_bounded_create(clock):
 
 
 def test_full_capacity_no_create(clock):
-    backend = FakeBackend(slots=[], capacity=Capacity(can_create=False, free_instances=0))
+    backend = FakeBackend(
+        slots=[], capacity=Capacity(can_create=False, free_instances=0)
+    )
     github = FakeGitHub()
-    ctrl = make_controller(backend, github, make_config(min_ready=1, max_total=2), clock)
+    ctrl = make_controller(
+        backend, github, make_config(min_ready=1, max_total=2), clock
+    )
 
     ctrl.tick()
 
@@ -29,9 +35,13 @@ def test_full_capacity_no_create(clock):
 
 def test_capacity_clamps_partial(clock):
     # desired=2 (min_ready), pool empty → need 2, but only 1 instance free.
-    backend = FakeBackend(slots=[], capacity=Capacity(can_create=True, free_instances=1))
+    backend = FakeBackend(
+        slots=[], capacity=Capacity(can_create=True, free_instances=1)
+    )
     github = FakeGitHub()
-    ctrl = make_controller(backend, github, make_config(min_ready=2, max_total=2), clock)
+    ctrl = make_controller(
+        backend, github, make_config(min_ready=2, max_total=2), clock
+    )
 
     ctrl.tick()
 
@@ -48,7 +58,10 @@ def test_rampdown_hysteresis(clock):
         ]
     )
     github = FakeGitHub(
-        runners=[make_runner(id=1, name="husk-a-c0"), make_runner(id=2, name="husk-b-c0")]
+        runners=[
+            make_runner(id=1, name="husk-a-c0"),
+            make_runner(id=2, name="husk-b-c0"),
+        ]
     )
     ctrl = make_controller(
         backend, github, make_config(min_ready=1, max_total=2, shrink_ticks=3), clock
@@ -64,7 +77,7 @@ def test_rampdown_hysteresis(clock):
 
     destroys = [c for c in backend.calls if c[0] == "destroy"]
     assert len(destroys) == 1
-    assert destroys[0][1] == "vm-a"          # oldest idle
+    assert destroys[0][1] == "vm-a"  # oldest idle
     assert destroys[0][2] == "decommission"  # distinct from the ERROR-only destroy
     assert ("delete_runner", 1) in github.calls
 
@@ -77,17 +90,25 @@ def test_rampdown_resets_on_balance(clock):
         ]
     )
     github = FakeGitHub(
-        runners=[make_runner(id=1, name="husk-a-c0"), make_runner(id=2, name="husk-b-c0")]
+        runners=[
+            make_runner(id=1, name="husk-a-c0"),
+            make_runner(id=2, name="husk-b-c0"),
+        ]
     )
     ctrl = make_controller(
         backend, github, make_config(min_ready=1, max_total=2, shrink_ticks=3), clock
     )
 
-    clock.advance(5); ctrl.tick()   # surplus 1
-    clock.advance(5); ctrl.tick()   # surplus 2
+    clock.advance(5)
+    ctrl.tick()  # surplus 1
+    clock.advance(5)
+    ctrl.tick()  # surplus 2
 
     # Load arrives: one runner goes busy → desired=2 → pool is balanced again.
-    github.runners = [make_runner(id=1, name="husk-a-c0", busy=True), make_runner(id=2, name="husk-b-c0")]
+    github.runners = [
+        make_runner(id=1, name="husk-a-c0", busy=True),
+        make_runner(id=2, name="husk-b-c0"),
+    ]
 
     for _ in range(3):
         clock.advance(5)

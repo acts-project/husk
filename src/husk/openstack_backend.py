@@ -30,7 +30,9 @@ MANAGED_BY = "husk"  # metadata value tagging controller-owned slots
 
 
 def _task_state(server) -> str | None:
-    return getattr(server, "task_state", None) or server.to_dict().get("OS-EXT-STS:task_state")
+    return getattr(server, "task_state", None) or server.to_dict().get(
+        "OS-EXT-STS:task_state"
+    )
 
 
 def _epoch(iso: str | None) -> float:
@@ -126,14 +128,22 @@ class OpenStackBackend:
         resp = self.conn.compute.post(
             f"/servers/{slot.id}/action",
             json={"rebuild": {"imageRef": self.image_id, "user_data": b64(user_data)}},
-            headers={"OpenStack-API-Version": f"compute {self.cfg.rebuild_microversion}"},
+            headers={
+                "OpenStack-API-Version": f"compute {self.cfg.rebuild_microversion}"
+            },
         )
         if resp.status_code not in (200, 202):
-            raise RuntimeError(f"rebuild rejected: HTTP {resp.status_code}: {resp.text[:300]}")
+            raise RuntimeError(
+                f"rebuild rejected: HTTP {resp.status_code}: {resp.text[:300]}"
+            )
         # Update durable state so a restart recovers cycle + provision clock.
         try:
             self.conn.compute.set_server_metadata(
-                slot.id, **{"husk-cycle": str(cycle), "husk-provisioned-at": f"{time.time():.0f}"}
+                slot.id,
+                **{
+                    "husk-cycle": str(cycle),
+                    "husk-provisioned-at": f"{time.time():.0f}",
+                },
             )
         except Exception:
             log.warning("could not update husk metadata on %s", slot.id, exc_info=True)
@@ -159,12 +169,18 @@ class OpenStackBackend:
     def capacity(self) -> Capacity:
         try:
             limits = self.conn.compute.get_limits().absolute
-            max_instances = getattr(limits, "instances", None) or getattr(limits, "max_total_instances", 0)
-            used = getattr(limits, "total_instances_used", 0) or getattr(limits, "instances_used", 0)
+            max_instances = getattr(limits, "instances", None) or getattr(
+                limits, "max_total_instances", 0
+            )
+            used = getattr(limits, "total_instances_used", 0) or getattr(
+                limits, "instances_used", 0
+            )
             free = max(0, int(max_instances) - int(used))
             return Capacity(can_create=free > 0, free_instances=free)
         except Exception:
             # Best-effort second guard; max_total is the primary clamp. If we
             # can't read limits, defer to max_total rather than blocking growth.
-            log.warning("could not read compute limits; deferring to max_total", exc_info=True)
+            log.warning(
+                "could not read compute limits; deferring to max_total", exc_info=True
+            )
             return Capacity(can_create=True, free_instances=10**6)

@@ -174,7 +174,9 @@ runcmd:
 def render_cloud_init(jit_blob: str, runner_url: str) -> bytes:
     """Substitute the JIT config and runner download URL into the template."""
     return (
-        RUNNER_CLOUD_INIT.replace("@@JIT@@", jit_blob).replace("@@RUNNER_URL@@", runner_url)
+        RUNNER_CLOUD_INIT.replace("@@JIT@@", jit_blob).replace(
+            "@@RUNNER_URL@@", runner_url
+        )
     ).encode()
 
 
