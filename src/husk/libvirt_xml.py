@@ -195,6 +195,7 @@ def domain_xml(
     network: str,
     metadata: str,
     gpu_pci_address: str | None = None,
+    console_log_path: str | None = None,
     emulator: str = DEFAULT_EMULATOR,
 ) -> str:
     """Full libvirt domain XML for one slot.
@@ -203,8 +204,23 @@ def domain_xml(
     a NAT-network NIC, the durable husk `<metadata>`, and — only when
     `gpu_pci_address` is set — the GPU `<hostdev>`. CPU slots omit the hostdev and
     are otherwise byte-for-byte the same shape.
+
+    When `console_log_path` is given the serial console is captured to that host
+    file (the guest is never SSHed, so this file is how we observe cloud-init);
+    otherwise it falls back to an interactive `pty`.
     """
     hostdev = _pci_hostdev(gpu_pci_address) if gpu_pci_address else ""
+    if console_log_path:
+        # A single file-backed serial on port 0 (NOT also a <console> on the same
+        # path — two file chardevs on one path makes qemu trip over cleanup). Alma
+        # cloud images log kernel + cloud-init to ttyS0, so this captures the whole
+        # boot. libvirt implicitly exposes it as the console.
+        console = (
+            f"<serial type='file'><source path='{escape(console_log_path)}' append='on'/>"
+            "<target port='0'/></serial>"
+        )
+    else:
+        console = "<console type='pty'/>"
     return (
         "<domain type='kvm'>"
         f"<name>{escape(name)}</name>"
@@ -234,7 +250,7 @@ def domain_xml(
         "</disk>"
         f"<interface type='network'><source network='{escape(network)}'/>"
         "<model type='virtio'/></interface>"
-        "<console type='pty'/>"
+        f"{console}"
         "<channel type='unix'>"
         "<target type='virtio' name='org.qemu.guest_agent.0'/></channel>"
         f"{hostdev}"

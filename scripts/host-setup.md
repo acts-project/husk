@@ -141,6 +141,21 @@ podman run --rm --device nvidia.com/gpu=all <cuda-img> nvidia-smi
 For a quick **CPU-path** smoke test you don't need the golden image — a stock
 AlmaLinux 10 GenericCloud qcow2 in the pool works as the backing image.
 
+### Debugging a guest's boot / cloud-init
+
+The guest is never SSHed, so to watch a slot's boot + cloud-init, attach to its
+serial console from the control machine (Ctrl-] to detach):
+
+```bash
+virsh -c qemu+ssh://USER@HOST/system console <domain-name>
+```
+
+> A file-backed serial log (`domain_xml` supports `console_log_path`) is **not**
+> enabled by default: under SELinux the `qemu` user must own/relabel the log file
+> in the pool dir, which fails while the pool dir is owned by the SSH user. Enabling
+> it is deferred to host setup (root-owned pool dir + a `qemu`-writable console dir,
+> or a relabel rule) — a natural Ansible concern.
+
 ## 7. Control machine (where huskd runs)
 
 huskd needs `libvirt-python`, which builds against the libvirt client libs:

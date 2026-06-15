@@ -179,6 +179,19 @@ def test_domain_xml_gpu_has_hostdev():
     assert "function='0x0'" in xml
 
 
+def test_domain_xml_console_pty_by_default():
+    xml = _domain()
+    assert "<console type='pty'/>" in xml
+    assert "<serial type='file'>" not in xml
+
+
+def test_domain_xml_console_log_to_file_when_set():
+    xml = _domain(console_log_path="/var/lib/libvirt/images/husk/husk-123-console.log")
+    assert "<serial type='file'>" in xml
+    assert "husk-123-console.log" in xml
+    assert "<console type='pty'/>" not in xml
+
+
 def test_domain_xml_embeds_husk_metadata():
     xml = _domain()
     assert lx.HUSK_NS in xml

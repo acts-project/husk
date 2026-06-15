@@ -254,6 +254,11 @@ class LibvirtBackend:
             network=host.cfg.network,
             metadata=meta,
             gpu_pci_address=unit if lx.is_gpu_unit(unit) else None,
+            # console_log_path intentionally unset → interactive pty console.
+            # A file-backed serial log (domain_xml supports it) needs the qemu
+            # user to own/relabel the file in the pool dir; under SELinux + the
+            # SSH-user-owned pool that fails without weakening host perms, so it's
+            # deferred to host setup. Debug via `virsh console` meanwhile.
         )
         dom = conn.defineXML(xml)
         dom.create()  # boot
@@ -316,7 +321,8 @@ class LibvirtBackend:
         self._ssh(
             host,
             f"rm -f {shlex.quote(pool + '/' + name + '.qcow2')} "
-            f"{shlex.quote(pool + '/' + name + '-seed.iso')}",
+            f"{shlex.quote(pool + '/' + name + '-seed.iso')} "
+            f"{shlex.quote(pool + '/' + name + '-console.log')}",
         )
 
     def capacity(self) -> Capacity:
