@@ -18,8 +18,8 @@ shrink_ticks = 3
 name = "libvirt-gpu"
 type = "libvirt"
 image_name = "husk-gpu-golden.qcow2"   # golden qcow2 filename in each host's pool dir
-min_ready = 1                          # global warm-pool size across all hosts
-max_total = 1                          # one GPU host, one GPU → 1 (raise as the pool grows)
+min_ready = 2                          # global warm-pool size across all hosts
+max_total = 2                          # one GPU host, one GPU → 1 (raise as the pool grows)
 
 # One entry per VM-host. GPU host: list gpu_pci_addresses (one slot per GPU).
 # CPU host: omit them and set max_slots (default 1). Setting both is rejected.

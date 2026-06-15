@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import shlex
 import subprocess
+import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
@@ -29,10 +30,25 @@ from husk.slot import Capacity, Slot
 
 log = logging.getLogger("husk.libvirt")
 
+# Timeouts — a control plane must never be wedged by one unresponsive host.
+_SSH_TIMEOUT_S = 60  # cap each host-side qemu-img/genisoimage/rm command
+_SSH_CONNECT_TIMEOUT_S = 15  # cap the ssh TCP/auth handshake
+# libvirt RPC keepalive: probe every N seconds, drop the connection after C
+# misses (~N*C s). This is what stops an in-flight call to a frozen host from
+# blocking the reconcile loop forever; it needs the event loop (below) running.
+_KEEPALIVE_INTERVAL_S = 5
+_KEEPALIVE_COUNT = 3
+
 try:  # optional extra: pip install husk[libvirt]
     import libvirt
 except ImportError:  # pragma: no cover - exercised only without the extra
     libvirt = None
+
+
+def _run_libvirt_event_loop() -> None:  # pragma: no cover - needs the extra
+    while True:
+        libvirt.virEventRunDefaultImpl()
+
 
 if libvirt is not None:  # pragma: no cover - needs the extra + a live host
     # libvirt echoes every raised error to stderr via its default callback —
@@ -42,6 +58,12 @@ if libvirt is not None:  # pragma: no cover - needs the extra + a live host
     libvirt.registerErrorHandler(
         lambda _ctx, err: log.debug("libvirt: %s", err[2]), None
     )
+    # Drive libvirt's event loop in a daemon thread so connection keepalive timers
+    # fire — without it, an in-flight RPC to a wedged host would block forever.
+    libvirt.virEventRegisterDefaultImpl()
+    threading.Thread(
+        target=_run_libvirt_event_loop, name="husk-libvirt-events", daemon=True
+    ).start()
 
 
 class _HostConn:
@@ -59,6 +81,10 @@ class _HostConn:
         if self._conn is None or not self._alive():
             log.debug("opening libvirt connection %s", self.cfg.libvirt_uri)
             self._conn = libvirt.open(self.cfg.libvirt_uri)
+            try:  # bound in-flight RPCs to a wedged host (needs the event loop)
+                self._conn.setKeepAlive(_KEEPALIVE_INTERVAL_S, _KEEPALIVE_COUNT)
+            except libvirt.libvirtError:
+                log.debug("keepalive unsupported on %s", self.cfg.libvirt_uri)
         return self._conn
 
     def _alive(self) -> bool:
@@ -107,11 +133,30 @@ class LibvirtBackend:
     ) -> bytes:
         """Run a command on the host (over SSH, or locally if no ssh_target)."""
         if host.cfg.ssh_target:
-            argv = ["ssh", "-o", "BatchMode=yes", host.cfg.ssh_target, remote_cmd]
+            argv = [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                f"ConnectTimeout={_SSH_CONNECT_TIMEOUT_S}",
+                host.cfg.ssh_target,
+                remote_cmd,
+            ]
         else:
             argv = ["bash", "-c", remote_cmd]
         log.debug("host[%s] exec: %s", host.cfg.name, remote_cmd)
-        r = subprocess.run(argv, input=data, capture_output=True)
+        try:
+            r = subprocess.run(
+                argv, input=data, capture_output=True, timeout=_SSH_TIMEOUT_S
+            )
+        except subprocess.TimeoutExpired as e:
+            # A frozen/overloaded host must NOT hang the reconcile loop forever.
+            # Raising here means list_slots → ListSlotsError aborts the tick
+            # (fail-safe), and mutations fail-and-retry next tick instead of
+            # blocking indefinitely on a wedged host.
+            raise BackendError(
+                f"host {host.cfg.name} cmd timed out after {_SSH_TIMEOUT_S}s"
+            ) from e
         if r.returncode != 0:
             raise BackendError(
                 f"host {host.cfg.name} cmd failed ({r.returncode}): "
@@ -163,8 +208,14 @@ class LibvirtBackend:
     def _read_meta(self, dom) -> dict | None:
         try:
             xml = dom.metadata(libvirt.VIR_DOMAIN_METADATA_ELEMENT, lx.HUSK_NS)
-        except libvirt.libvirtError:
-            return None  # no husk metadata → not a managed slot
+        except libvirt.libvirtError as e:
+            if e.get_error_code() == libvirt.VIR_ERR_NO_DOMAIN_METADATA:
+                return None  # legitimately not a husk slot (e.g. fedora-gpu)
+            # Any OTHER error (broken/timed-out connection, host wedged) must NOT
+            # be read as "not managed" — that would drop a real slot from
+            # list_slots, making the controller spawn duplicates and never settle.
+            # Propagate so list_slots → ListSlotsError aborts the tick (fail-safe).
+            raise
         return lx.parse_metadata(xml)
 
     def _write_meta(
