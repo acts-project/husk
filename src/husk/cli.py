@@ -72,9 +72,15 @@ def _load(config: Path, secrets_dir: Optional[Path]) -> Config:
 
 def _build(cfg: Config):
     from husk.github import GitHubClient
-    from husk.openstack_backend import OpenStackBackend
 
-    backend = OpenStackBackend(cfg.backend)
+    if cfg.backend.type == "libvirt":
+        from husk.libvirt_backend import LibvirtBackend
+
+        backend = LibvirtBackend(cfg.backend)
+    else:
+        from husk.openstack_backend import OpenStackBackend
+
+        backend = OpenStackBackend(cfg.backend)
     github = GitHubClient(
         repo=cfg.github.repo,
         token=cfg.github.token,

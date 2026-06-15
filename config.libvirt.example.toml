@@ -1,0 +1,48 @@
+# Example huskd config for the libvirt/QEMU backend (GPU CI runners).
+# See config.example.toml for the OpenStack backend.
+
+[github]
+repo = "acts-project/husk-test"
+pat_env = "GH_TOKEN"          # secret from env; never written to this file
+
+[runner]
+version = "2.334.0"
+labels = ["self-hosted", "linux", "x64", "gpu"]   # jobs target the GPU pool via `gpu`
+runner_group_id = 1
+
+[controller]
+lock_path = "/tmp/huskd.lock"
+shrink_ticks = 3
+
+[backend]
+name = "libvirt-gpu"
+type = "libvirt"
+image_name = "husk-gpu-golden.qcow2"   # golden qcow2 filename in each host's pool dir
+min_ready = 1                          # global warm-pool size across all hosts
+max_total = 1                          # one GPU host, one GPU → 1 (raise as the pool grows)
+
+# One entry per VM-host. GPU host: list gpu_pci_addresses (one slot per GPU).
+# CPU host: omit them and set max_slots (default 1). Setting both is rejected.
+[[backend.hosts]]
+name = "fedora-gpu-01"
+libvirt_uri = "qemu+ssh://USER@HOST/system"
+# ssh_target = "USER@HOST"             # optional; derived from libvirt_uri if omitted
+pool = "husk"
+network = "default"
+memory_mb = 8192
+vcpus = 8
+gpu_pci_addresses = ["0000:01:00.0"]   # → one slot, GPU passed through via <hostdev>
+
+# --- A CPU-only host would look like this instead (no GPU required): ---
+# [[backend.hosts]]
+# name = "cpu-host-01"
+# libvirt_uri = "qemu+ssh://USER@CPUHOST/system"
+# memory_mb = 4096
+# vcpus = 4
+# max_slots = 2                        # two plain CPU VMs on this host
+
+[timeouts]
+poll_interval_sec = 30
+idle_timeout_sec = 1800
+startup_grace_sec = 300
+max_job_duration_sec = 21600

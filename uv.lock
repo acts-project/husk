@@ -295,9 +295,13 @@ dev = [
     { name = "pytest" },
     { name = "ruff" },
 ]
+libvirt = [
+    { name = "libvirt-python" },
+]
 
 [package.metadata]
 requires-dist = [
+    { name = "libvirt-python", marker = "extra == 'libvirt'", specifier = ">=10" },
     { name = "openstacksdk" },
     { name = "pydantic-settings", specifier = ">=2" },
     { name = "pytest", marker = "extra == 'dev'" },
@@ -306,7 +310,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15" },
     { name = "typer", specifier = ">=0.12" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["dev", "libvirt"]
 
 [[package]]
 name = "idna"
@@ -381,6 +385,12 @@ sdist = { url = "https://files.pythonhosted.org/packages/02/d9/a01a3898657626cbc
 wheels = [
     { url = "https://files.pythonhosted.org/packages/72/eb/698dc17e4beb315f83a47d47be128b8a63303dc8b7e7c31110410e10a68b/keystoneauth1-5.14.0-py3-none-any.whl", hash = "sha256:f8c503a95fdd83b5b72736657e4ffbb53d4b28b01763f23013f0294ed8a0e4b9", size = 343268, upload-time = "2026-05-13T09:09:24.573Z" },
 ]
+
+[[package]]
+name = "libvirt-python"
+version = "12.4.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/cc/d8/eae5574b40e437efa6d6f4f8e5042f4b8ddaf26db5d85305a0d85524e07c/libvirt_python-12.4.0.tar.gz", hash = "sha256:e24ade7e9b774b56ce3ea6c69ea06b99103391b09c8d9f77a308584b79c9a00d", size = 245162, upload-time = "2026-06-01T10:26:16.136Z" }
 
 [[package]]
 name = "markdown-it-py"
