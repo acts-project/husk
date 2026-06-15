@@ -8,3 +8,6 @@ dist/
 .pytest_cache/
 husk-test
 config.toml
+
+# Stage-2 libvirt CPU config (names the repo; keep local)
+config.libvirt.cpu.toml

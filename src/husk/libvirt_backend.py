@@ -138,7 +138,11 @@ class LibvirtBackend:
         pool = host.pool_dir()
         seed = f"{pool}/{name}-seed.iso"
         tmp = f"{pool}/.seed-{name}"
-        self._ssh(host, f"mkdir -p {shlex.quote(tmp)}")
+        # Remove any prior seed first (mirrors _make_overlay): on rebuild the file
+        # exists and libvirt has relabeled it to the qemu user while the slot ran,
+        # so xorriso/genisoimage can't reopen it for writing. rm works regardless
+        # (the SSH user owns the pool dir, so it can unlink files it no longer owns).
+        self._ssh(host, f"rm -f {shlex.quote(seed)}; mkdir -p {shlex.quote(tmp)}")
         self._ssh(
             host,
             f"cat > {shlex.quote(tmp)}/meta-data",
