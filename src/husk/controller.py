@@ -67,7 +67,19 @@ class Controller:
         self._surplus_ticks = 0
         self._generation = 0
         self._namer = itertools.count(1)
-        self.snapshot: ControllerState | None = None
+        # Seed an empty snapshot so the status endpoint serves a valid (empty) 200
+        # from startup instead of 503 until the first reconcile publishes. The
+        # epoch-0 timestamp keeps /healthz honestly "stale" until that happens.
+        self.snapshot: ControllerState | None = ControllerState(
+            generation=0,
+            last_reconcile_epoch=0.0,
+            backend=self.cfg.backend.name,
+            min_ready=self.cfg.backend.min_ready,
+            max_total=self.cfg.backend.max_total,
+            desired_total=self.cfg.backend.min_ready,
+            counts={st.value: 0 for st in SlotState},
+            slots=[],
+        )
 
     # ------------------------------------------------------------------ run
     def run(self) -> None:
