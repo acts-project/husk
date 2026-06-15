@@ -82,6 +82,37 @@ def test_rampdown_hysteresis(clock):
     assert ("delete_runner", 1) in github.calls
 
 
+def test_downscale_retires_powered_off_excess(clock):
+    # One IDLE slot + one SHUTOFF (excess) slot, desired=1. The powered-off excess
+    # slot must be held off (never rebuilt) and, once surplus is sustained, retired
+    # — so a downscale drains even when the pool is never fully idle. The working
+    # idle slot is the one that survives.
+    backend = FakeBackend(
+        slots=[
+            make_slot(id="vm-a", name="husk-a", status="ACTIVE", created_at=1.0),
+            make_slot(id="vm-b", name="husk-b", status="SHUTOFF", created_at=2.0),
+        ]
+    )
+    github = FakeGitHub(runners=[make_runner(id=1, name="husk-a-c0")])
+    ctrl = make_controller(
+        backend, github, make_config(min_ready=1, max_total=2, shrink_ticks=3), clock
+    )
+
+    for _ in range(2):
+        clock.advance(5)
+        ctrl.tick()
+    # excess slot held off — neither rebuilt nor (yet) destroyed (hysteresis unmet)
+    assert "rebuild" not in backend.ops()
+    assert "destroy" not in backend.ops()
+
+    clock.advance(5)
+    ctrl.tick()  # third surplus tick → retire the powered-off excess slot
+
+    destroys = [c for c in backend.calls if c[0] == "destroy"]
+    assert destroys == [("destroy", "vm-b", "decommission")]  # the off one, kept vm-a
+    assert "rebuild" not in backend.ops()  # excess slot was never rebuilt
+
+
 def test_rampdown_resets_on_balance(clock):
     backend = FakeBackend(
         slots=[

@@ -127,6 +127,36 @@ class Controller:
         busy = sum(1 for _, _, st in classified if st is SlotState.BUSY)
         self._track_runner_presence(classified, now)
 
+        # 3-prep. POOL SIZING — computed BEFORE remediation so an excess slot can
+        # be retired at its natural poweroff point (NEEDS_RECYCLE) instead of being
+        # rebuilt. Under constant job load slots rarely sit IDLE, so an idle-only
+        # ramp-down can never drain a downscale; retiring at poweroff can. Gated by
+        # the same hysteresis as the idle ramp-down (one retirement per sustained-
+        # surplus window) so it doesn't thrash when `desired` oscillates.
+        desired = min(self.cfg.backend.max_total, busy + self.cfg.backend.min_ready)
+        total = len(slots)
+        over = max(0, total - desired)
+        if over > 0:
+            self._surplus_ticks += 1
+        else:
+            self._surplus_ticks = 0
+        shrink_now = (
+            over > 0 and self._surplus_ticks >= self.cfg.controller.shrink_ticks
+        )
+        log.debug(
+            "pool: busy=%d total=%d desired=%d (min_ready=%d max_total=%d) "
+            "surplus_ticks=%d shrink_now=%s",
+            busy,
+            total,
+            desired,
+            self.cfg.backend.min_ready,
+            self.cfg.backend.max_total,
+            self._surplus_ticks,
+            shrink_now,
+        )
+        surplus_remaining = over  # how many powered-off excess slots to shed/hold
+        did_retire = False
+
         # 3. PER-SLOT REMEDIATION (one action max per slot)
         for s, runner, state in classified:
             if s.id in self.pending_start:
@@ -135,7 +165,20 @@ class Controller:
             if state is SlotState.ERROR:
                 self._destroy(s, "error")
             elif state is SlotState.NEEDS_RECYCLE:
-                self._rebuild_then_start(s, now)
+                if surplus_remaining > 0:
+                    # This powered-off slot is surplus. Don't rebuild it — either
+                    # retire it (sustained surplus) or hold it off so a returning
+                    # load can reclaim it via rebuild once we're no longer over.
+                    surplus_remaining -= 1
+                    if shrink_now and not did_retire:
+                        log.info(
+                            "retiring excess slot %s at poweroff (sustained surplus)",
+                            s.id,
+                        )
+                        self._destroy(s, "decommission")
+                        did_retire = True
+                else:
+                    self._rebuild_then_start(s, now)
             elif state is SlotState.BUSY:
                 if self._state_age(s.id, now) > self.cfg.timeouts.max_job_duration_sec:
                     log.warning("slot %s busy past max_job_duration; stopping", s.id)
@@ -158,27 +201,17 @@ class Controller:
                 self._rebuild_then_start(s, now)
             # STARTING: nothing — re-check next tick.
 
-        # 4/5. GROW or RAMP DOWN (mutually exclusive — never thrash within a tick)
-        desired = min(self.cfg.backend.max_total, busy + self.cfg.backend.min_ready)
-        total = len(slots)
-        log.debug(
-            "pool: busy=%d total=%d desired=%d (min_ready=%d max_total=%d) surplus_ticks=%d",
-            busy,
-            total,
-            desired,
-            self.cfg.backend.min_ready,
-            self.cfg.backend.max_total,
-            self._surplus_ticks,
-        )
+        # 4/5. GROW or RAMP DOWN (mutually exclusive — never thrash within a tick).
+        # Sizing + surplus hysteresis were computed in 3-prep above; an excess slot
+        # that was already off got retired in step 3.
         if desired - total > 0:
-            self._surplus_ticks = 0
             self._grow(desired - total, now)
-        elif total > desired:
-            self._surplus_ticks += 1
-            if self._surplus_ticks >= self.cfg.controller.shrink_ticks:
-                self._ramp_down(classified)
-                self._surplus_ticks = 0
-        else:
+        elif shrink_now and not did_retire:
+            # No excess slot was powered off to retire this tick → decommission an
+            # idle slot (the no-load downscale path; a no-op if none are idle).
+            self._ramp_down(classified)
+            did_retire = True
+        if did_retire:
             self._surplus_ticks = 0
 
         # 6. PUBLISH SNAPSHOT
