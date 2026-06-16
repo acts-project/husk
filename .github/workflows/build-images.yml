@@ -52,25 +52,8 @@ jobs:
         # gotcha left is the mode-0600 kernel libguestfs can't read.
         run: |
           sudo chmod 0644 /boot/vmlinuz-* || true
+          if [ -e /dev/kvm ]; then sudo chmod 0666 /dev/kvm; echo "KVM available"; else echo "no /dev/kvm -> TCG emulation (slow)"; fi
           echo "LIBGUESTFS_BACKEND=direct" >> "$GITHUB_ENV"
-
-      - name: Probe guest connectivity
-        # Verify the appliance has working network + DNS before the slow build.
-        # virt-customize discards run-command stdout, so capture to a file in the
-        # guest and read it back with virt-cat.
-        run: |
-          set +e
-          # shellcheck disable=SC1091
-          source images/versions.env
-          curl -fL "$BASE_IMAGE_URL" -o /tmp/probe.qcow2
-          virt-customize -a /tmp/probe.qcow2 --run-command '
-            {
-              echo "== addr/route =="; ip -br addr; ip route
-              echo "== DNS resolve =="; getent ahostsv4 mirrors.almalinux.org; echo "getent_rc=$?"
-            } > /probe-out.txt 2>&1 || true
-          '
-          echo "===== PROBE RESULTS ====="
-          virt-cat -a /tmp/probe.qcow2 /probe-out.txt
 
       - name: Build ${{ matrix.variant }} image
         run: |
