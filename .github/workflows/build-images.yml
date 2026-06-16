@@ -34,7 +34,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [base, gpu]
+        variant: [base]   # TEMP: narrowed to base while debugging appliance networking
 
     steps:
       - uses: actions/checkout@v5
@@ -93,6 +93,28 @@ jobs:
           printf '#!/bin/sh\nexec /usr/bin/passt.real -i %s "$@"\n' "$IFACE" | sudo tee /usr/bin/passt >/dev/null
           sudo chmod 0755 /usr/bin/passt
           cat /usr/bin/passt
+
+      - name: Probe guest connectivity through passt
+        # passt now starts (wrapper), but dnf still can't resolve. Decide whether
+        # it's DNS-only or no connectivity at all: reach 1.1.1.1 by IP (TCP via
+        # bash /dev/tcp, since the base image may lack curl), then resolve a name.
+        # Fast — one --run-command, no install.
+        run: |
+          set +e
+          # shellcheck disable=SC1091
+          source images/versions.env
+          curl -fL "$BASE_IMAGE_URL" -o /tmp/probe.qcow2
+          virt-customize --network -a /tmp/probe.qcow2 --run-command '
+            set -x
+            ls -l /etc/resolv.conf; cat /etc/resolv.conf 2>/dev/null
+            printf "nameserver 1.1.1.1\n" > /etc/resolv.conf
+            ip -br addr 2>/dev/null || true
+            ip route 2>/dev/null || true
+            echo "== TCP 1.1.1.1:443 by IP =="
+            timeout 8 bash -c "exec 3<>/dev/tcp/1.1.1.1/443 && echo TCP_OK"; echo "tcp_rc=$?"
+            echo "== DNS resolve =="
+            getent ahostsv4 mirrors.almalinux.org; echo "getent_rc=$?"
+          ' 2>&1 | tail -45
 
       - name: Build ${{ matrix.variant }} image
         run: |
