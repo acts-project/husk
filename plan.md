@@ -363,7 +363,7 @@ husk/
 │   ├── backends/
 │   │   ├── __init__.py      # Backend ABC
 │   │   ├── openstack.py     # OpenStackBackend (slot-based)
-│   │   └── libvirt.py       # future: LibvirtBackend for GPU
+│   │   └── libvirt.py       # BUILT: LibvirtBackend (GPU+CPU) — see libvirt_backend.py / libvirt_xml.py
 │   ├── slots.py             # slot state classification
 │   └── cli.py               # huskctl
 ├── provisioning/
@@ -1423,22 +1423,37 @@ Operational duties can be handed off.
 ## Future Extensions
 
 These are sketched here so the Phase 6 controller design leaves the right
-seams. **Do not implement these in the initial validation flow.**
+seams. **Do not implement these in the initial validation flow** — *except* the
+GPU/libvirt backend, which has since been built as a POC and is being validated
+live (see its subsection below); the macOS backend remains a sketch.
 
-### GPU bare-metal backend (`LibvirtBackend`)
+### GPU bare-metal backend (`LibvirtBackend`) — **BUILT + live-validated (POC)**
 
-- **Host setup** (one-time per bare-metal host):
-  - BIOS: VT-d / AMD-Vi enabled, "Above 4G decoding" and "Resizable BAR" on
-  - Kernel cmdline: `intel_iommu=on iommu=pt` (or `amd_iommu=on`)
-  - vfio-pci binds the GPU
-  - Verify IOMMU groups
-  - Install libvirt + qemu
-- **Image**: qcow2 with NVIDIA driver, Docker, nvidia-container-toolkit, same
-  runner systemd unit as OpenStack image
-- **Backend implementation**:
-  - Slot model maps poorly to bare metal — fewer slots, GPUs as inventory
-  - May want a different abstraction here: "ephemeral VM per job" via
-    qcow2 overlays, since libvirt doesn't have the Neutron-port-binding cost
+> No longer a sketch. Built on branch `libvirt-backend`; **Stage 0 + Stage 2
+> backend code validated live** on `lenovo-gpu-acts` (Fedora 42, RTX 500 Ada).
+> Full design + status: `~/.claude/plans/…twinkly-rabbit.md`. Modules:
+> `src/husk/libvirt_backend.py`, `src/husk/libvirt_xml.py`; host runbook:
+> `scripts/host-setup.md`; image recipe: `scripts/build-golden-image.sh`; live
+> smoke test: `scripts/smoke_libvirt.py`.
+
+- **The slot model maps *fine* — design question resolved.** Earlier doubt ("slot
+  model maps poorly to bare metal; maybe ephemeral-VM-per-job") is settled: bare
+  metal uses the **same slot abstraction** via **slot-units**. A host declares
+  capacity as either `gpu_pci_addresses` (GPU host: one slot per GPU, pinned via
+  `<hostdev>`) or `max_slots` (CPU host). qcow2 COW overlays make rebuild cheap, so
+  there's no Neutron-port cost to design around and no special-casing needed.
+- **One backend, host *pool* inside it.** `LibvirtBackend` fans `list_slots` /
+  placement across N `qemu+ssh://` host connections; the controller stays
+  single-backend and unaware of hosts. `Slot.id = host:uuid` self-routes mutations.
+- **Zero controller/classifier/cloud-init changes:** libvirt domain state is mapped
+  onto the Nova-style status strings the controller already reads.
+- **Host setup** (one-time per bare-metal host; manual now, Ansible later — see the
+  runbook): VT-d/AMD-Vi + `intel_iommu=on iommu=pt`, vfio-pci binds the GPU, verify
+  IOMMU groups, libvirt+qemu, **polkit rule** for headless RW over SSH, `husk`
+  storage pool (target dir chown'd to the SSH user), `default` NAT net.
+- **Image**: Alma10 qcow2 (matches the OpenStack guest) + NVIDIA driver,
+  nvidia-container-toolkit, rootless podman, **CDI generated at first boot**, same
+  runner systemd unit. Stage 1 (golden image) is the next live rung.
 - **Labels**: `linux-gpu-1x`, `linux-gpu-4x`, `linux-gpu-a100`, etc.
 
 ### macOS backend (deploy Cilicon, not a custom backend)

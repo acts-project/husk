@@ -63,3 +63,51 @@ def test_pat_path_file_fallback(tmp_path):
 def test_fail_closed_when_no_pat(tmp_path):
     with pytest.raises(RuntimeError, match="GitHub PAT not configured"):
         load_config(_write(tmp_path))
+
+
+# ------------------------------------------------------------------- libvirt
+def test_ssh_target_from_uri_preserves_case_and_strips_port():
+    from husk.config import _ssh_target_from_uri
+
+    assert _ssh_target_from_uri("qemu+ssh://paul@GpuBox/system") == "paul@GpuBox"
+    assert (
+        _ssh_target_from_uri("qemu+ssh://paul@host.cern.ch:2222/system")
+        == "paul@host.cern.ch"
+    )
+    assert _ssh_target_from_uri("qemu:///system") == ""
+
+
+_LIBVIRT_TOML = """
+[github]
+repo = "acts-project/husk-test"
+[runner]
+version = "2.334.0"
+labels = ["self-hosted", "gpu"]
+runner_group_id = 1
+[backend]
+name = "libvirt-gpu"
+type = "libvirt"
+image_name = "husk-gpu-golden.qcow2"
+min_ready = 1
+max_total = 1
+[[backend.hosts]]
+name = "fedora-gpu-01"
+libvirt_uri = "qemu+ssh://paul@GpuBox/system"
+memory_mb = 8192
+vcpus = 8
+gpu_pci_addresses = ["0000:01:00.0"]
+"""
+
+
+def test_libvirt_config_parses_host_pool(tmp_path, monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "ghp_x")
+    p = tmp_path / "lv.toml"
+    p.write_text(_LIBVIRT_TOML)
+    cfg = load_config(str(p))
+    assert cfg.backend.type == "libvirt"
+    assert len(cfg.backend.hosts) == 1
+    h = cfg.backend.hosts[0]
+    assert h.ssh_target == "paul@GpuBox"  # derived, case preserved
+    assert h.gpu_pci_addresses == ("0000:01:00.0",)
+    assert h.max_slots is None
+    assert h.pool == "husk" and h.network == "default"  # defaults applied

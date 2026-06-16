@@ -8,3 +8,8 @@ dist/
 .pytest_cache/
 husk-test
 config.toml
+
+# Local libvirt configs (name the repo; keep local). The committed example is
+# config.libvirt.example.toml, which the negation below keeps tracked.
+config.libvirt.*.toml
+!config.libvirt.example.toml

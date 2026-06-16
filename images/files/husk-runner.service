@@ -1,0 +1,26 @@
+[Unit]
+Description=Husk GitHub Actions ephemeral runner
+After=network-online.target
+Wants=network-online.target
+# JIT runner is single-use: when run.sh exits (job done) OR fails, recycle
+# the slot by powering off. ExecStopPost can't do it (the service is
+# unprivileged), so trigger a root oneshot. Both On*= so a failed boot
+# also recycles instead of wedging.
+OnSuccess=husk-poweroff.service
+OnFailure=husk-poweroff.service
+
+[Service]
+Type=simple
+User=runner
+Group=runner
+WorkingDirectory=/opt/actions-runner
+Environment="HOME=/home/runner"
+Environment="XDG_RUNTIME_DIR=/run/user/1000"
+Environment="DOCKER_HOST=unix:///run/user/1000/podman/podman.sock"
+# Wait for the rootless podman socket (brought up by user@1000 via linger +
+# the globally-enabled podman.socket). Poll the socket FILE — no user bus.
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do [ -S /run/user/1000/podman/podman.sock ] && exit 0; sleep 1; done; echo "podman socket never appeared" >&2; exit 1'
+ExecStart=/bin/bash -c '/opt/actions-runner/run.sh --jitconfig $(cat /var/lib/husk/jitconfig)'
+Restart=no
+# NB: no [Install] — the unit is NOT enabled for boot. cloud-init starts it via
+# `systemctl start` each cycle, after laying down the fresh JIT config.

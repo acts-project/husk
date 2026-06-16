@@ -15,9 +15,11 @@ aborts before any classification or mutation. A *raise* must never be read as
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import logging
 import time
+from typing import Callable
 
 from husk.backend import ListSlotsError
 from husk.cloudinit import render_cloud_init
@@ -27,6 +29,23 @@ from husk.snapshot import ControllerState, write_state
 from husk.timing import SlotTiming
 
 log = logging.getLogger("husk.controller")
+
+# Config knobs that are safe to change while the loop runs: the controller reads
+# each of these fresh from self.cfg on every tick, so swapping them between ticks
+# takes effect immediately with no rebuild. Everything else (backend type/hosts,
+# github creds, runner labels, lock/http/state paths) is captured at build time by
+# the backend/github/server objects and needs a restart — apply_reloaded_config
+# warns about and ignores changes to those rather than half-applying them.
+_HOT_RELOAD: dict[str, tuple[str, ...]] = {
+    "backend": ("min_ready", "max_total"),
+    "controller": ("shrink_ticks",),
+    "timeouts": (
+        "poll_interval_sec",
+        "idle_timeout_sec",
+        "startup_grace_sec",
+        "max_job_duration_sec",
+    ),
+}
 
 
 def vm_name(prefix: str, n: int) -> str:
@@ -47,12 +66,22 @@ def _fmt(v: float | None) -> str:
 
 class Controller:
     def __init__(
-        self, backend, github, config: Config, *, clock=time.monotonic
+        self,
+        backend,
+        github,
+        config: Config,
+        *,
+        clock=time.monotonic,
+        reload_config: Callable[[], Config | None] | None = None,
     ) -> None:
         self.backend = backend
         self.github = github
         self.cfg = config
         self._clock = clock
+        # Optional hot-reload hook: called once per tick from run(); returns a
+        # freshly loaded Config when the file changed (else None). cli.py wires an
+        # mtime-guarded loader; tests leave it None (tick() stays reload-free).
+        self._reload_config = reload_config
 
         self.first_seen_state: dict[str, tuple[SlotState, float]] = {}
         self.last_provision_action: dict[str, float] = {}
@@ -67,7 +96,19 @@ class Controller:
         self._surplus_ticks = 0
         self._generation = 0
         self._namer = itertools.count(1)
-        self.snapshot: ControllerState | None = None
+        # Seed an empty snapshot so the status endpoint serves a valid (empty) 200
+        # from startup instead of 503 until the first reconcile publishes. The
+        # epoch-0 timestamp keeps /healthz honestly "stale" until that happens.
+        self.snapshot: ControllerState | None = ControllerState(
+            generation=0,
+            last_reconcile_epoch=0.0,
+            backend=self.cfg.backend.name,
+            min_ready=self.cfg.backend.min_ready,
+            max_total=self.cfg.backend.max_total,
+            desired_total=self.cfg.backend.min_ready,
+            counts={st.value: 0 for st in SlotState},
+            slots=[],
+        )
 
     # ------------------------------------------------------------------ run
     def run(self) -> None:
@@ -80,11 +121,73 @@ class Controller:
             self.cfg.timeouts.poll_interval_sec,
         )
         while True:
+            self._maybe_reload()
             try:
                 self.tick()
             except Exception:  # never let a single tick kill the loop
                 log.exception("unhandled error in tick")
             time.sleep(self.cfg.timeouts.poll_interval_sec)
+
+    # -------------------------------------------------------------- hot reload
+    def _maybe_reload(self) -> None:
+        """Pick up an edited config file between ticks (no restart needed).
+
+        The loader is mtime-guarded and swallows its own parse errors, so a bad
+        edit leaves the running config in place rather than killing the loop."""
+        if self._reload_config is None:
+            return
+        try:
+            new = self._reload_config()
+        except Exception:
+            log.warning("config reload failed; keeping current config", exc_info=True)
+            return
+        if new is not None:
+            self.apply_reloaded_config(new)
+
+    def apply_reloaded_config(self, new: Config) -> None:
+        """Adopt the hot-reloadable knobs from a freshly loaded config; warn about
+        (and ignore) any structural change that needs a restart to take effect."""
+        cur = self.cfg
+        changes: list[str] = []
+        replacements: dict[str, object] = {}
+        for section, fields in _HOT_RELOAD.items():
+            cur_sec, new_sec = getattr(cur, section), getattr(new, section)
+            updates = {
+                f: getattr(new_sec, f)
+                for f in fields
+                if getattr(cur_sec, f) != getattr(new_sec, f)
+            }
+            if updates:
+                changes += [
+                    f"{section}.{f}: {getattr(cur_sec, f)} -> {v}"
+                    for f, v in updates.items()
+                ]
+                replacements[section] = dataclasses.replace(cur_sec, **updates)
+
+        # Structural diff: normalize `new` by forcing the hot fields back to their
+        # current values, then compare whole-config. Any remaining difference is a
+        # field we can't safely swap live (backend/hosts, github, runner, paths).
+        normalized = new
+        for section, fields in _HOT_RELOAD.items():
+            cur_sec = getattr(cur, section)
+            normalized = dataclasses.replace(
+                normalized,
+                **{
+                    section: dataclasses.replace(
+                        getattr(normalized, section),
+                        **{f: getattr(cur_sec, f) for f in fields},
+                    )
+                },
+            )
+        if normalized != cur:
+            log.warning(
+                "config reload: structural changes ignored (restart huskd to apply: "
+                "backend/hosts, github, runner, or controller paths/ports)"
+            )
+
+        if replacements:
+            self.cfg = dataclasses.replace(self.cfg, **replacements)
+            log.info("config reload applied: %s", "; ".join(changes))
 
     # ----------------------------------------------------------------- tick
     def tick(self) -> ControllerState | None:
@@ -127,6 +230,36 @@ class Controller:
         busy = sum(1 for _, _, st in classified if st is SlotState.BUSY)
         self._track_runner_presence(classified, now)
 
+        # 3-prep. POOL SIZING — computed BEFORE remediation so an excess slot can
+        # be retired at its natural poweroff point (NEEDS_RECYCLE) instead of being
+        # rebuilt. Under constant job load slots rarely sit IDLE, so an idle-only
+        # ramp-down can never drain a downscale; retiring at poweroff can. Gated by
+        # the same hysteresis as the idle ramp-down (one retirement per sustained-
+        # surplus window) so it doesn't thrash when `desired` oscillates.
+        desired = min(self.cfg.backend.max_total, busy + self.cfg.backend.min_ready)
+        total = len(slots)
+        over = max(0, total - desired)
+        if over > 0:
+            self._surplus_ticks += 1
+        else:
+            self._surplus_ticks = 0
+        shrink_now = (
+            over > 0 and self._surplus_ticks >= self.cfg.controller.shrink_ticks
+        )
+        log.debug(
+            "pool: busy=%d total=%d desired=%d (min_ready=%d max_total=%d) "
+            "surplus_ticks=%d shrink_now=%s",
+            busy,
+            total,
+            desired,
+            self.cfg.backend.min_ready,
+            self.cfg.backend.max_total,
+            self._surplus_ticks,
+            shrink_now,
+        )
+        surplus_remaining = over  # how many powered-off excess slots to shed/hold
+        did_retire = False
+
         # 3. PER-SLOT REMEDIATION (one action max per slot)
         for s, runner, state in classified:
             if s.id in self.pending_start:
@@ -135,7 +268,20 @@ class Controller:
             if state is SlotState.ERROR:
                 self._destroy(s, "error")
             elif state is SlotState.NEEDS_RECYCLE:
-                self._rebuild_then_start(s, now)
+                if surplus_remaining > 0:
+                    # This powered-off slot is surplus. Don't rebuild it — either
+                    # retire it (sustained surplus) or hold it off so a returning
+                    # load can reclaim it via rebuild once we're no longer over.
+                    surplus_remaining -= 1
+                    if shrink_now and not did_retire:
+                        log.info(
+                            "retiring excess slot %s at poweroff (sustained surplus)",
+                            s.id,
+                        )
+                        self._destroy(s, "decommission")
+                        did_retire = True
+                else:
+                    self._rebuild_then_start(s, now)
             elif state is SlotState.BUSY:
                 if self._state_age(s.id, now) > self.cfg.timeouts.max_job_duration_sec:
                     log.warning("slot %s busy past max_job_duration; stopping", s.id)
@@ -158,27 +304,17 @@ class Controller:
                 self._rebuild_then_start(s, now)
             # STARTING: nothing — re-check next tick.
 
-        # 4/5. GROW or RAMP DOWN (mutually exclusive — never thrash within a tick)
-        desired = min(self.cfg.backend.max_total, busy + self.cfg.backend.min_ready)
-        total = len(slots)
-        log.debug(
-            "pool: busy=%d total=%d desired=%d (min_ready=%d max_total=%d) surplus_ticks=%d",
-            busy,
-            total,
-            desired,
-            self.cfg.backend.min_ready,
-            self.cfg.backend.max_total,
-            self._surplus_ticks,
-        )
+        # 4/5. GROW or RAMP DOWN (mutually exclusive — never thrash within a tick).
+        # Sizing + surplus hysteresis were computed in 3-prep above; an excess slot
+        # that was already off got retired in step 3.
         if desired - total > 0:
-            self._surplus_ticks = 0
             self._grow(desired - total, now)
-        elif total > desired:
-            self._surplus_ticks += 1
-            if self._surplus_ticks >= self.cfg.controller.shrink_ticks:
-                self._ramp_down(classified)
-                self._surplus_ticks = 0
-        else:
+        elif shrink_now and not did_retire:
+            # No excess slot was powered off to retire this tick → decommission an
+            # idle slot (the no-load downscale path; a no-op if none are idle).
+            self._ramp_down(classified)
+            did_retire = True
+        if did_retire:
             self._surplus_ticks = 0
 
         # 6. PUBLISH SNAPSHOT
@@ -269,7 +405,9 @@ class Controller:
         name = runner_name(slot.name, cycle)
         try:
             jit = self.github.generate_jitconfig(name)
-            user_data = render_cloud_init(jit, self.cfg.runner.url)
+            user_data = render_cloud_init(
+                jit, self.cfg.runner.url, gpu=self.cfg.runner.gpu
+            )
             self.backend.rebuild_slot(slot, user_data=user_data, cycle=cycle)
         except Exception:
             log.exception("rebuild of slot %s failed", slot.id)
@@ -321,7 +459,9 @@ class Controller:
         log.debug("creating slot %s (runner %s)", vm, name)
         try:
             jit = self.github.generate_jitconfig(name)
-            user_data = render_cloud_init(jit, self.cfg.runner.url)
+            user_data = render_cloud_init(
+                jit, self.cfg.runner.url, gpu=self.cfg.runner.gpu
+            )
             slot = self.backend.create_slot(user_data=user_data, name=vm, cycle=0)
         except Exception:
             log.exception("create of slot %s failed", vm)

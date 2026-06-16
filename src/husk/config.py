@@ -9,6 +9,21 @@ loading boundary only (see `load_config`), never to the hot-path value objects.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
+
+
+def _ssh_target_from_uri(uri: str) -> str:
+    """Derive the `user@host` SSH target from a `qemu+ssh://user@host/system` URI
+    (used for host-side qemu-img/genisoimage when `ssh_target` isn't set
+    explicitly). Preserves host case (SSH `Host` aliases are case-sensitive) and
+    strips any port. Returns "" for a local/transportless URI."""
+    netloc = urlparse(uri).netloc  # e.g. "user@host:22"; preserves original case
+    if not netloc:
+        return ""
+    hostpart = netloc.rsplit("@", 1)
+    host = hostpart[-1].rsplit(":", 1)[0]  # drop :port
+    user = f"{hostpart[0]}@" if len(hostpart) == 2 and hostpart[0] else ""
+    return f"{user}{host}"
 
 
 @dataclass(frozen=True)
@@ -22,6 +37,7 @@ class RunnerConfig:
     version: str
     labels: list[str]
     runner_group_id: int
+    gpu: bool = False  # GPU pools: cloud-init installs the NVIDIA driver + CDI
 
     @property
     def url(self) -> str:
@@ -32,17 +48,41 @@ class RunnerConfig:
 
 
 @dataclass(frozen=True)
+class HostConfig:
+    """One libvirt VM-host in the backend's pool (libvirt backend only).
+
+    Capacity is declared as slot-units: a GPU host sets `gpu_pci_addresses` (one
+    slot per address, passed through via `<hostdev>`); a CPU host sets `max_slots`
+    (default 1). Setting both is rejected by the backend constructor.
+    """
+
+    name: str
+    libvirt_uri: str  # e.g. qemu+ssh://user@host/system
+    ssh_target: str  # user@host for host-side qemu-img/genisoimage (derived if unset)
+    pool: str = "husk"
+    network: str = "default"
+    memory_mb: int = 4096
+    vcpus: int = 4
+    gpu_pci_addresses: tuple[str, ...] = ()
+    max_slots: int | None = None  # CPU host capacity; None → 1 (and GPU forbids it)
+    image_name: str | None = None  # per-host override of the backend golden image
+
+
+@dataclass(frozen=True)
 class BackendConfig:
     name: str
     type: str
-    cloud: str
-    image_name: str
-    flavor_name: str
-    network_name: str
-    keypair: str
-    rebuild_microversion: str
+    image_name: str  # OpenStack image name OR libvirt golden qcow2 (shared field)
     min_ready: int
     max_total: int
+    # OpenStack-only (optional / unused for the libvirt backend)
+    cloud: str = ""
+    flavor_name: str = ""
+    network_name: str = ""
+    keypair: str = ""
+    rebuild_microversion: str = "2.79"
+    # libvirt-only (optional / unused for the OpenStack backend)
+    hosts: tuple[HostConfig, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -100,18 +140,34 @@ def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
         version: str
         labels: list[str]
         runner_group_id: int = 1
+        gpu: bool = False
+
+    class _Host(BaseModel):
+        name: str
+        libvirt_uri: str
+        ssh_target: str | None = None  # derived from the URI when omitted
+        pool: str = "husk"
+        network: str = "default"
+        memory_mb: int = 4096
+        vcpus: int = 4
+        gpu_pci_addresses: list[str] = []
+        max_slots: int | None = None
+        image_name: str | None = None
 
     class _Backend(BaseModel):
         name: str
         type: str = "openstack"
-        cloud: str
         image_name: str
-        flavor_name: str
-        network_name: str
-        keypair: str
-        rebuild_microversion: str = "2.79"
         min_ready: int = 1
         max_total: int = 2
+        # OpenStack-only (optional for the libvirt backend)
+        cloud: str = ""
+        flavor_name: str = ""
+        network_name: str = ""
+        keypair: str = ""
+        rebuild_microversion: str = "2.79"
+        # libvirt-only (optional for the OpenStack backend)
+        hosts: list[_Host] = []
 
     class _Timeouts(BaseModel):
         poll_interval_sec: float = 30
@@ -181,6 +237,7 @@ def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
             version=s.runner.version,
             labels=list(s.runner.labels),
             runner_group_id=s.runner.runner_group_id,
+            gpu=s.runner.gpu,
         ),
         backend=BackendConfig(
             name=s.backend.name,
@@ -193,6 +250,21 @@ def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
             rebuild_microversion=s.backend.rebuild_microversion,
             min_ready=s.backend.min_ready,
             max_total=s.backend.max_total,
+            hosts=tuple(
+                HostConfig(
+                    name=h.name,
+                    libvirt_uri=h.libvirt_uri,
+                    ssh_target=h.ssh_target or _ssh_target_from_uri(h.libvirt_uri),
+                    pool=h.pool,
+                    network=h.network,
+                    memory_mb=h.memory_mb,
+                    vcpus=h.vcpus,
+                    gpu_pci_addresses=tuple(h.gpu_pci_addresses),
+                    max_slots=h.max_slots,
+                    image_name=h.image_name,
+                )
+                for h in s.backend.hosts
+            ),
         ),
         timeouts=TimeoutsConfig(
             poll_interval_sec=s.timeouts.poll_interval_sec,

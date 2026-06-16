@@ -209,13 +209,61 @@ runcmd:
 """
 
 
-def render_cloud_init(jit_blob: str, runner_url: str) -> bytes:
-    """Substitute the JIT config and runner download URL into the template."""
+# GPU enablement, injected into runcmd only for GPU pools (runner.gpu = true).
+# Kept OUT of the `packages:` block on purpose: nvidia-open-kmod lives in the repo
+# that `almalinux-release-nvidia-driver` *enables*, so it needs a second dnf pass
+# the single packages transaction can't express. Runs here with full network
+# (the egress firewall is applied right after this), against the running kernel.
+#
+# Native AlmaLinux packaging ships a *precompiled* open kmod — no DKMS, which was
+# the GPU POC's one open blocker. modprobe loads it live (don't update the
+# kernel). CDI then lets the rootless runner inject the GPU into job containers
+# via `docker run --gpus all` (through the podman-docker shim) or
+# `--device nvidia.com/gpu=all`. Failures are left LOUD (no `|| true`) so a broken
+# driver surfaces as a failed nvidia-smi in the job rather than a silent no-GPU.
+_GPU_RUNCMD = r"""  # --- GPU enablement (GPU pools only; full network here, before the firewall).
+  - dnf -y install almalinux-release-nvidia-driver
+  # nvidia-driver-cuda ships nvidia-smi AND the CUDA driver libs (libcuda) the CDI
+  # hook injects into job containers — without it nvidia-smi is "command not found"
+  # on the host and absent from the container.
+  - dnf -y install nvidia-open-kmod nvidia-driver nvidia-driver-cuda
+  - |
+    cat >/etc/yum.repos.d/nvidia-container-toolkit.repo <<'REPO'
+    [nvidia-container-toolkit]
+    name=nvidia-container-toolkit
+    baseurl=https://nvidia.github.io/libnvidia-container/stable/rpm/$basearch
+    enabled=1
+    gpgcheck=1
+    gpgkey=https://nvidia.github.io/libnvidia-container/gpgkey
+    REPO
+  - dnf -y install nvidia-container-toolkit
+  - modprobe nvidia
+  - nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+
+"""
+
+# Anchor: the GPU block is spliced in immediately before the egress-firewall
+# lockdown, so the driver install runs with the network still fully open.
+_FIREWALL_ANCHOR = (
+    "  # Lock down egress just before the (untrusted) runner starts. Everything"
+)
+
+
+def render_cloud_init(jit_blob: str, runner_url: str, *, gpu: bool = False) -> bytes:
+    """Substitute the JIT config and runner download URL into the template.
+
+    With `gpu=False` (the default, and every OpenStack/CPU slot) the output is
+    byte-for-byte the validated template — the OpenStack backend is untouched.
+    With `gpu=True` a GPU provisioning block is spliced into runcmd just before
+    the egress firewall (see `_GPU_RUNCMD`)."""
+    template = RUNNER_CLOUD_INIT
+    if gpu:
+        template = template.replace(_FIREWALL_ANCHOR, _GPU_RUNCMD + _FIREWALL_ANCHOR, 1)
     return (
-        RUNNER_CLOUD_INIT.replace("@@JIT@@", jit_blob).replace(
-            "@@RUNNER_URL@@", runner_url
-        )
-    ).encode()
+        template.replace("@@JIT@@", jit_blob)
+        .replace("@@RUNNER_URL@@", runner_url)
+        .encode()
+    )
 
 
 def b64(data: bytes) -> str:

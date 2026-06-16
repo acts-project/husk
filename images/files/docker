@@ -1,0 +1,21 @@
+#!/bin/bash
+# Docker->Podman compatibility shim. REPLACES /usr/bin/docker (ahead of it in
+# PATH). Closes the Phase 2 gaps: (a) auto-create missing -v bind SOURCE dirs
+# (podman won't; docker does); (b) sanitize $HOME for podman (container actions
+# set HOME=/github/home, which breaks rootless podman storage/config resolution).
+# Valid shebang on line 1 — the runner execs it via raw execve.
+REAL_HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+[ -n "$REAL_HOME" ] || REAL_HOME="$HOME"
+out=(); prev=""
+for a in "$@"; do
+  if [ "$prev" = "-v" ] || [ "$prev" = "--volume" ]; then
+    src="${a%%:*}"; case "$src" in /*) [ -e "$src" ] || mkdir -p "$src" ;; esac
+  fi
+  if { [ "$prev" = "-e" ] || [ "$prev" = "--env" ]; } && [ "$a" = "HOME" ]; then
+    out+=("HOME=$HOME")
+  else
+    out+=("$a")
+  fi
+  prev="$a"
+done
+exec env HOME="$REAL_HOME" /usr/bin/podman "${out[@]}"
