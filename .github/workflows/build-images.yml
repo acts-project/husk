@@ -49,20 +49,28 @@ jobs:
         #  * libguestfs can't read Ubuntu's mode-0600 kernel -> make it readable.
         #  * /dev/kvm may be absent or unreadable; LIBGUESTFS_BACKEND=direct lets
         #    libguestfs fall back to TCG software emulation (slower but works).
-        #  * libguestfs 1.52 prefers `passt` for the appliance network, but passt
-        #    is broken in the GHA sandbox ("passt exited with status 1"). Hide it
-        #    so libguestfs falls back to qemu SLIRP user-networking (libslirp is
-        #    present). Confirmed: it's not the AppArmor userns restriction.
+        #  * libguestfs 1.52 uses `passt` for the appliance network (no working
+        #    SLIRP fallback), and passt exits 1 in the GHA sandbox. Diagnosed in
+        #    the next step.
         run: |
           sudo chmod 0644 /boot/vmlinuz-* || true
           if [ -e /dev/kvm ]; then sudo chmod 0666 /dev/kvm; echo "KVM available"; else echo "no /dev/kvm -> TCG emulation"; fi
-          if p="$(command -v passt)"; then sudo mv "$p" "${p}.disabled"; echo "disabled $p -> SLIRP fallback"; fi
-          # The runner's /etc/resolv.conf is the systemd-resolved stub
-          # (127.0.0.53), unreachable from the appliance under SLIRP. Give it a
-          # real resolver (build.sh also sets one inside the guest, belt+braces).
           sudo rm -f /etc/resolv.conf
           printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee /etc/resolv.conf >/dev/null
           echo "LIBGUESTFS_BACKEND=direct" >> "$GITHUB_ENV"
+
+      - name: Diagnose appliance networking (passt)
+        # libguestfs swallows passt's stderr. Launch the appliance WITH network
+        # under full debug to capture the exact passt command + why it exits 1.
+        run: |
+          set +e
+          echo "passt: $(command -v passt)"; passt --version 2>&1 | head -2
+          img=/tmp/diag.qcow2; qemu-img create -f qcow2 "$img" 1G >/dev/null
+          export LIBGUESTFS_BACKEND=direct LIBGUESTFS_DEBUG=1 LIBGUESTFS_TRACE=1
+          guestfish --network -a "$img" run 2>&1 | tee /tmp/gf.log
+          echo "::group::passt / network trace"
+          grep -iE "passt|netdev|-net|status 1|forward|qemu-system" /tmp/gf.log | tail -80
+          echo "::endgroup::"
 
       - name: Build ${{ matrix.variant }} image
         run: |
