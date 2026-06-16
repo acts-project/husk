@@ -29,12 +29,12 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        variant: [base]   # TEMP: narrowed to base while debugging appliance networking
+        variant: [base]   # TEMP: base only until CI is green; gpu re-added after
 
     steps:
       - uses: actions/checkout@v5
@@ -45,74 +45,27 @@ jobs:
           sudo apt-get install -y guestfs-tools qemu-utils
 
       - name: Prepare libguestfs backend
-        # Well-known gotchas on GitHub's ubuntu-24.04 runners:
-        #  * libguestfs can't read Ubuntu's mode-0600 kernel -> make it readable.
-        #  * /dev/kvm may be absent or unreadable; LIBGUESTFS_BACKEND=direct lets
-        #    libguestfs fall back to TCG software emulation (slower but works).
-        #  * libguestfs 1.52 uses `passt` for the appliance network (no working
-        #    SLIRP fallback), and passt exits 1 in the GHA sandbox. Diagnosed in
-        #    the next step.
+        # ubuntu-22.04 ships libguestfs 1.46, whose appliance uses qemu SLIRP
+        # user-networking (not passt) — virt-customize --install works out of the
+        # box. (24.04 + libguestfs 1.52 + passt never gets a working appliance
+        # NIC in the GHA sandbox: eth0 stays DOWN. Hence the 22.04 pin.) The only
+        # gotcha left is the mode-0600 kernel libguestfs can't read.
         run: |
           sudo chmod 0644 /boot/vmlinuz-* || true
-          if [ -e /dev/kvm ]; then sudo chmod 0666 /dev/kvm; echo "KVM available"; else echo "no /dev/kvm -> TCG emulation"; fi
-          sudo rm -f /etc/resolv.conf
-          printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee /etc/resolv.conf >/dev/null
           echo "LIBGUESTFS_BACKEND=direct" >> "$GITHUB_ENV"
 
-      - name: Diagnose passt standalone
-        # libguestfs swallows passt's stderr. Run passt with the EXACT args
-        # libguestfs uses (from the debug trace), in foreground, to surface its
-        # real error — and try interface variants to find a working invocation.
-        run: |
-          set +e
-          passt --version 2>&1 | head -2
-          ip -br addr; ip route show default
-          IFACE=$(ip route show default | awk '/default/ {print $5; exit}')
-          echo "default iface: $IFACE"
-          base="--socket /tmp/pt/passt.sock --pid /tmp/pt/passt.pid --netmask 16 --address 169.254.2.15 --mac-addr 52:56:00:00:00:02 --gateway 169.254.2.2"
-          run_try() {
-            rm -rf /tmp/pt; mkdir -p /tmp/pt
-            echo "::group::passt extra-args=[$1]"
-            timeout 4 passt --foreground --debug $1 $base 2>&1 | tail -25
-            echo "rc=${PIPESTATUS[0]} (124=ran-until-timeout=OK)"
-            echo "::endgroup::"
-          }
-          run_try ""
-          run_try "-i $IFACE"
-          run_try "-4 -i $IFACE"
-          run_try "--no-map-gw -i $IFACE"
-
-      - name: Wrap passt (inject external interface)
-        # libguestfs invokes passt without --interface; in the GHA sandbox passt
-        # can't auto-pick the host's external interface and exits 1. Wrap passt
-        # to inject `-i <iface>`. (The diagnostic above confirms the exact flag.)
-        run: |
-          IFACE=$(ip route show default | awk '/default/{print $5; exit}')
-          echo "wrapping passt with -i $IFACE"
-          sudo mv /usr/bin/passt /usr/bin/passt.real
-          printf '#!/bin/sh\nexec /usr/bin/passt.real -i %s "$@"\n' "$IFACE" | sudo tee /usr/bin/passt >/dev/null
-          sudo chmod 0755 /usr/bin/passt
-          cat /usr/bin/passt
-
-      - name: Probe guest connectivity through passt
-        # passt now starts (wrapper), but dnf still can't resolve. Decide whether
-        # it's DNS-only or no connectivity at all: reach 1.1.1.1 by IP (TCP via
-        # bash /dev/tcp, since the base image may lack curl), then resolve a name.
-        # Fast — one --run-command, no install.
+      - name: Probe guest connectivity
+        # Verify the appliance has working network + DNS before the slow build.
+        # virt-customize discards run-command stdout, so capture to a file in the
+        # guest and read it back with virt-cat.
         run: |
           set +e
           # shellcheck disable=SC1091
           source images/versions.env
           curl -fL "$BASE_IMAGE_URL" -o /tmp/probe.qcow2
-          # virt-customize discards run-command stdout, so capture to a file in
-          # the guest and read it back with virt-cat.
-          virt-customize --network -a /tmp/probe.qcow2 --run-command '
+          virt-customize -a /tmp/probe.qcow2 --run-command '
             {
-              echo "== orig resolv.conf =="; ls -l /etc/resolv.conf; cat /etc/resolv.conf 2>/dev/null
-              printf "nameserver 1.1.1.1\n" > /etc/resolv.conf
               echo "== addr/route =="; ip -br addr; ip route
-              echo "== TCP 1.1.1.1:443 by IP =="; timeout 8 bash -c "exec 3<>/dev/tcp/1.1.1.1/443 && echo TCP_OK"; echo "tcp_rc=$?"
-              echo "== UDP 1.1.1.1:53 =="; timeout 8 bash -c "echo > /dev/udp/1.1.1.1/53 && echo UDP_SENT"; echo "udp_rc=$?"
               echo "== DNS resolve =="; getent ahostsv4 mirrors.almalinux.org; echo "getent_rc=$?"
             } > /probe-out.txt 2>&1 || true
           '
@@ -120,7 +73,6 @@ jobs:
           virt-cat -a /tmp/probe.qcow2 /probe-out.txt
 
       - name: Build ${{ matrix.variant }} image
-        if: false   # TEMP: skipped while debugging appliance networking via the probe
         run: |
           ./images/build.sh --variant "${{ matrix.variant }}" --out "husk-${{ matrix.variant }}.qcow2"
 
