@@ -37,7 +37,7 @@ jobs:
         variant: [base, gpu]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install build tooling
         run: |
@@ -49,13 +49,14 @@ jobs:
         #  * libguestfs can't read Ubuntu's mode-0600 kernel -> make it readable.
         #  * /dev/kvm may be absent or unreadable; LIBGUESTFS_BACKEND=direct lets
         #    libguestfs fall back to TCG software emulation (slower but works).
-        #  * passt (the appliance's user-mode network) self-isolates into an
-        #    unprivileged user namespace, which 24.04's AppArmor blocks by
-        #    default -> "passt exited with status 1". Lift that restriction.
+        #  * libguestfs 1.52 prefers `passt` for the appliance network, but passt
+        #    is broken in the GHA sandbox ("passt exited with status 1"). Hide it
+        #    so libguestfs falls back to qemu SLIRP user-networking (libslirp is
+        #    present). Confirmed: it's not the AppArmor userns restriction.
         run: |
           sudo chmod 0644 /boot/vmlinuz-* || true
           if [ -e /dev/kvm ]; then sudo chmod 0666 /dev/kvm; echo "KVM available"; else echo "no /dev/kvm -> TCG emulation"; fi
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+          if p="$(command -v passt)"; then sudo mv "$p" "${p}.disabled"; echo "disabled $p -> SLIRP fallback"; fi
           echo "LIBGUESTFS_BACKEND=direct" >> "$GITHUB_ENV"
 
       - name: Build ${{ matrix.variant }} image
@@ -91,7 +92,7 @@ jobs:
 
       - name: Set up ORAS
         if: github.event_name == 'workflow_dispatch'
-        uses: oras-project/setup-oras@v1
+        uses: oras-project/setup-oras@v2
 
       - name: Publish to ghcr.io
         if: github.event_name == 'workflow_dispatch'
