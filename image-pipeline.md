@@ -1,0 +1,175 @@
+# Husk VM Image Pipeline
+
+How husk builds, distributes, and rolls out the golden VM images that back its
+runner slots. Companion to `plan.md` (which deliberately deferred custom images
+in "Phase 4"); this document un-defers that work with a concrete design.
+
+> **Status (2026-06-16):** design agreed, not yet built. The runner/podman stack
+> is currently installed at *cloud-init time* as a spike (`src/husk/cloudinit.py`)
+> and the only image-build artifact today is the manual, single-host
+> `scripts/build-golden-image.sh`. This document describes the target system.
+
+-----
+
+## Goals
+
+1. **Pre-bake the slow, static layers** into a VM image so slot recycle drops
+   from ~65s (current, cloud-init reinstalls everything) toward the ~5s
+   rebuild+start floor. Recycle latency was the measured trigger for this work
+   (`plan.md` Phase 3/4).
+2. **One declarative source of truth** for image contents, producing **two
+   variants**: `husk-base` (CPU) and `husk-gpu` (CPU + NVIDIA driver/toolkit).
+3. **Build in GitHub CI**, publish the qcow2 artifacts to **public `ghcr.io`**
+   via **ORAS** (OCI artifacts), versioned by tag + digest.
+4. **husk orchestrates delivery**: the controller pulls a config-pinned image
+   ref and delivers it to every libvirt host *and* uploads the base variant to
+   OpenStack Glance — the **same qcow2 serves both backends**.
+
+## Decisions (locked)
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Image substrate | **qcow2** | Backing file for libvirt COW overlays *and* uploadable to Glance — one artifact, both backends. |
+| Registry / transport | **public ghcr.io via ORAS** | OCI artifacts give us tags + content-addressed digests for free; public ⇒ no pull creds. |
+| Pull location | **ORAS on the controller** | huskd pulls once, fans out over its existing SSH channel + the OpenStack SDK. Hosts need no oras/creds. |
+| Rollout trigger | **config-pinned tag/digest** | Rides the existing config hot-reload (`controller: hot-reload config knobs on-tick`). Explicit, auditable. |
+| OpenStack scope | **base (non-GPU) variant only** | OpenStack is the CPU-runner path; GPU is libvirt/bare-metal. The GPU image ships only to libvirt hosts. |
+| Image vs cloud-init | **image = slow/static capability; cloud-init = dynamic/tunable policy** | See boundary below. |
+| Firewall | **capability baked, policy in cloud-init** | The ruleset is the one security knob meant to change without an image rebuild. |
+
+-----
+
+## Image vs cloud-init boundary
+
+The image carries everything slow and static; cloud-init carries everything
+per-slot, per-job, or meant to change without a rebuild.
+
+**Baked into the image (both variants unless noted):**
+
+- Runner binary (pinned version) + `installdependencies.sh` native deps
+  (`libicu`, `krb5`, `openssl`, …) already installed.
+- `podman` + rootless stack (`fuse-overlayfs`, `slirp4netns`, `netavark`,
+  `aardvark-dns`), `podman-docker`.
+- The Docker→Podman compatibility artifacts (all static): the `/usr/local/bin/docker`
+  shim, `containers.conf` (`label = false`), per-user `storage.conf`,
+  `/etc/containers/nodocker`, the `husk-docker-sock` tmpfiles rule.
+- The `runner` user (uid 1000) + `husk-runner.service` / `husk-poweroff.service`
+  unit files (static; **not** enabled for boot — cloud-init still starts them).
+- `nftables` package + service (the firewall *engine*, not the ruleset).
+- **GPU variant only:** NVIDIA driver + `nvidia-container-toolkit`, plus the
+  CDI-on-first-boot oneshot (`husk-cdi.service`). CDI generation stays first-boot
+  — it needs the driver loaded against a present GPU, which an offline build
+  can't provide.
+
+**Delivered by cloud-init each create/recycle (dynamic):**
+
+- The JIT config blob (`/var/lib/husk/jitconfig`) — fresh per cycle.
+- The **firewall ruleset** (`husk-egress.nft`) + `nft -f` apply — the tunable
+  policy. Same conceptual rule across backends; rendered from `husk-policy`
+  later (`plan.md` "Network policy rollout").
+- The NoCloud seed / instance-id (rotates so cloud-init re-runs).
+- Start orchestration: `systemctl start husk-runner.service` (sole boot
+  orchestrator, as today).
+- Wall-clock backstop (`shutdown -h +N`).
+
+> **Side effect of baking the packages:** the reason the firewall is applied at
+> the very end of `runcmd` today — keep CERN mirrors reachable during package
+> install — largely goes away (no runtime install). The default-allow-public
+> ruleset still lets runner/action downloads through even if applied earlier.
+
+**cloud-init multi-datasource requirement:** the image must enable both
+`NoCloud` (libvirt seed ISO) and `OpenStack` (Glance metadata / ConfigDrive) in
+`datasource_list`, so one artifact boots on both backends.
+
+-----
+
+## Build (GitHub CI → ghcr.io)
+
+- **Single spec, two variants.** A declarative package/setup list drives a
+  `virt-customize` build parameterized by `--variant {base,gpu}`. This replaces
+  the manual, GPU-only `scripts/build-golden-image.sh`.
+- **Pinned inputs** (recorded in a manifest annotation on the artifact):
+  base-image URL (a specific dated qcow2, **not** `-latest`), runner version
+  (shared with `[runner] version` in huskd config), driver + toolkit package
+  versions.
+- **Publish via ORAS** to `ghcr.io/<org>/husk-{base,gpu}`, tagged with a
+  release version + the git SHA, and referenced elsewhere by immutable digest.
+  Artifact type e.g. `application/vnd.husk.vmimage`, layer mediaType
+  `application/vnd.husk.qcow2`.
+- **CI gotchas to handle** (see implementation plan below): `/dev/kvm` may be
+  absent on the runner (libguestfs falls back to TCG emulation, slower);
+  libguestfs needs a world-readable kernel on Ubuntu runners
+  (`chmod 0644 /boot/vmlinuz-*`).
+
+## Delivery & sync (huskd, control machine)
+
+Driven by a **config-pinned image ref per backend** (replacing the fixed
+`image_name` filename). On config change (hot-reload):
+
+1. `oras pull` the ref once to a controller-local cache.
+2. **libvirt:** push the qcow2 to each host's pool dir over the existing SSH
+   channel, named by **digest** (`husk-gpu-<digest>.qcow2`). Idempotent: skip
+   hosts already holding that digest. Never overwrite an in-use backing file.
+3. **OpenStack:** upload the base qcow2 to Glance (`--disk-format qcow2
+   --container-format bare`) with the right image properties; the new Glance
+   image ID becomes "current." Idempotent on digest; retain N, GC older
+   (CERN image quota is tight, `plan.md` Phase 0).
+
+## Versioning, rollout, drain
+
+The one genuinely new mechanism. A golden qcow2 is the **backing file** of every
+live per-slot overlay — overwriting it in place corrupts running slots. So:
+
+- Images are **content-addressed / version-tagged**, never overwritten. The
+  configured `image_name` filename becomes a *derived* on-disk name; the config
+  holds an image **ref**.
+- **Stamp the image digest into slot metadata** (libvirt domain metadata already
+  carries `cycle`/`unit`; add `image_digest`). OpenStack slots already record an
+  image id.
+- **Drain on digest change:** new creates/rebuilds use the new ref; slots whose
+  `image_digest != current` are classified as needing recycle and drain through
+  the existing recycle loop; the old backing file / Glance image is GC'd once
+  nothing references it.
+
+## Code changes (delivery side — separate phase)
+
+- `config.py`: `image_name` → image **ref** (tag or digest) per backend/host;
+  filename / Glance ID become derived.
+- New `image_sync.py`: `resolve(ref) → ensure present on every target →
+  concrete local id` (qcow2 path per host; Glance image-id). Holds oras pull +
+  scp + Glance upload + GC.
+- `libvirt_backend.py`: `_make_overlay` builds off the *resolved* golden path;
+  stamp `image_digest` into domain metadata.
+- `openstack_backend.py`: stop caching one `image_id` at init
+  (`openstack_backend.py:58-67`); let it rotate from the sync result.
+- `controller.py`: each tick ensure the desired image is delivered before
+  create/rebuild; classify stale-digest slots as needs-recycle (drain); GC.
+
+-----
+
+## Phasing
+
+- **Phase A — CI image build (this is next; see implementation plan).** Single
+  spec, two variants, built in GitHub CI, pushed to ghcr via ORAS. Output:
+  pullable `husk-base` + `husk-gpu` artifacts. *Does not touch huskd.*
+- **Phase B — delivery & sync.** `image_sync.py`, config ref change, oras pull
+  on the controller, libvirt scp + Glance upload.
+- **Phase C — versioned rollout / drain.** Digest stamping + drain-on-change +
+  GC.
+
+Each phase is independently useful: A produces artifacts you can place by hand
+(exactly the manual step today, just reproducible); B automates delivery against
+a static ref; C makes updates safe while slots run.
+
+## Validation / open questions
+
+- **One artifact, two targets:** confirm a hand-built qcow2 with
+  `datasource_list: [NoCloud, OpenStack]` boots cleanly on *both* a libvirt slot
+  and a CERN Glance upload (login user, network config, ConfigDrive). The whole
+  "same qcow2 both backends" idea rests on this.
+- **GPU driver kept out of cloud-init:** retire the runtime `_GPU_RUNCMD` path
+  once the driver is baked; keep only CDI-on-first-boot.
+- **Glance image properties:** match what CERN's stock image sets (cloud-init
+  datasource, `hw_*` props, login user) so a custom image boots under Nova.
+- **ghcr artifact size:** multi-GB qcow2 over ORAS — fine for ghcr, but confirm
+  push/pull throughput in CI is acceptable; consider compression.
