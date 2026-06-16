@@ -45,13 +45,17 @@ jobs:
           sudo apt-get install -y guestfs-tools qemu-utils
 
       - name: Prepare libguestfs backend
-        # Two well-known gotchas on GitHub runners:
+        # Well-known gotchas on GitHub's ubuntu-24.04 runners:
         #  * libguestfs can't read Ubuntu's mode-0600 kernel -> make it readable.
         #  * /dev/kvm may be absent or unreadable; LIBGUESTFS_BACKEND=direct lets
         #    libguestfs fall back to TCG software emulation (slower but works).
+        #  * passt (the appliance's user-mode network) self-isolates into an
+        #    unprivileged user namespace, which 24.04's AppArmor blocks by
+        #    default -> "passt exited with status 1". Lift that restriction.
         run: |
           sudo chmod 0644 /boot/vmlinuz-* || true
           if [ -e /dev/kvm ]; then sudo chmod 0666 /dev/kvm; echo "KVM available"; else echo "no /dev/kvm -> TCG emulation"; fi
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
           echo "LIBGUESTFS_BACKEND=direct" >> "$GITHUB_ENV"
 
       - name: Build ${{ matrix.variant }} image
