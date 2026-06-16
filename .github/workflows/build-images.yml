@@ -34,7 +34,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [base]   # TEMP: base only until CI is green; gpu re-added after
+        variant: [base, gpu]
 
     steps:
       - uses: actions/checkout@v5
