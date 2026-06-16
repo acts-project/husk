@@ -7,7 +7,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Callable, Optional
 
 import typer
 
@@ -68,6 +68,43 @@ def _load(config: Path, secrets_dir: Optional[Path]) -> Config:
     except Exception as e:
         typer.echo(f"config error: {e}", err=True)
         raise typer.Exit(code=2)
+
+
+def _config_reloader(
+    config: Path, secrets_dir: Optional[Path]
+) -> "Callable[[], Optional[Config]]":
+    """An mtime-guarded config loader for huskd's per-tick hot reload.
+
+    Returns a freshly loaded Config only when the file's mtime changed since the
+    last call (else None). A parse/IO error is swallowed (logged once) so a bad
+    mid-flight edit never kills the loop — the running config simply stays put."""
+    path = str(config)
+    last: dict[str, float | None] = {"mtime": None}
+
+    def reload() -> Optional[Config]:
+        try:
+            mtime = os.stat(path).st_mtime
+        except OSError:
+            return None
+        if last["mtime"] is None:  # first call establishes the baseline, no reload
+            last["mtime"] = mtime
+            return None
+        if mtime == last["mtime"]:
+            return None
+        last["mtime"] = mtime
+        try:
+            cfg = load_config(
+                path, secrets_dir=str(secrets_dir) if secrets_dir else None
+            )
+            logging.getLogger("husk.controller").info("config file changed; reloading")
+            return cfg
+        except Exception:
+            logging.getLogger("husk.controller").warning(
+                "config reload skipped: %s could not be loaded", path, exc_info=True
+            )
+            return None
+
+    return reload
 
 
 def _build(cfg: Config):
@@ -306,11 +343,17 @@ def run(
     server = None
     try:
         backend, github = _build(cfg)
-        ctrl = Controller(backend, github, cfg)
         if once:
+            ctrl = Controller(backend, github, cfg)
             ctrl.tick()
             _print_status(ctrl.snapshot)
         else:
+            ctrl = Controller(
+                backend,
+                github,
+                cfg,
+                reload_config=_config_reloader(config, secrets_dir),
+            )
             if cfg.controller.http_addr:
                 from husk.http_server import StatusServer, parse_addr
 
