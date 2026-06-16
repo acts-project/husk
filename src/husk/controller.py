@@ -37,7 +37,10 @@ log = logging.getLogger("husk.controller")
 # the backend/github/server objects and needs a restart — apply_reloaded_config
 # warns about and ignores changes to those rather than half-applying them.
 _HOT_RELOAD: dict[str, tuple[str, ...]] = {
-    "backend": ("min_ready", "max_total"),
+    # image_ref is hot: a new ref is picked up by sync_images on the next tick,
+    # which stages the new golden and drains slots onto it (see image-pipeline.md
+    # Phase C). Per-host image_ref overrides are still restart-only.
+    "backend": ("min_ready", "max_total", "image_ref"),
     "controller": ("shrink_ticks",),
     "timeouts": (
         "poll_interval_sec",
@@ -189,9 +192,30 @@ class Controller:
             self.cfg = dataclasses.replace(self.cfg, **replacements)
             log.info("config reload applied: %s", "; ".join(changes))
 
+    def _sync_images(self) -> None:
+        """Hand the backend the current image config so it can stage the golden
+        image to every host (and GC orphans). Optional: backends with no image
+        delivery (OpenStack/fake) don't implement it. A failure here must not kill
+        the tick — we log and proceed with whatever image the hosts already hold."""
+        fn = getattr(self.backend, "sync_images", None)
+        if fn is None:
+            return
+        try:
+            fn(self.cfg.backend)
+        except Exception:
+            log.warning(
+                "image sync failed; continuing with current host image",
+                exc_info=True,
+            )
+
     # ----------------------------------------------------------------- tick
     def tick(self) -> ControllerState | None:
         now = self._clock()
+
+        # 0. IMAGE SYNC — ensure each host holds the configured golden image
+        #    before any create/rebuild this tick (a no-op once synced; on a ref
+        #    change it stages the new image and slots drain onto it below).
+        self._sync_images()
 
         # 1. FAIL-SAFE SNAPSHOT — a raise aborts the whole tick (no mutations).
         try:
@@ -287,12 +311,20 @@ class Controller:
                     log.warning("slot %s busy past max_job_duration; stopping", s.id)
                     self._safe(lambda: self.backend.stop_slot(s), f"stop {s.id}")
             elif state is SlotState.IDLE:
-                if (
-                    runner
-                    and self._state_age(s.id, now) > self.cfg.timeouts.idle_timeout_sec
-                ):
+                stale = s.image_stale
+                idle_timed_out = (
+                    self._state_age(s.id, now) > self.cfg.timeouts.idle_timeout_sec
+                )
+                if runner and (stale or idle_timed_out):
+                    # Deregister the (idle, no-job) runner so GitHub stops
+                    # dispatching to it; the slot then recycles — rebuilding onto
+                    # the current golden, which clears a stale image. Same drain
+                    # path as the idle-timeout reap, just also triggered by a
+                    # config image_ref change.
                     log.info(
-                        "slot %s idle past idle_timeout; deregistering runner", s.id
+                        "slot %s idle; deregistering runner (%s)",
+                        s.id,
+                        "stale image" if stale else "idle_timeout",
                     )
                     self._safe(
                         lambda: self.github.delete_runner(runner.id), "delete_runner"

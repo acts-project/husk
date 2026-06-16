@@ -16,6 +16,7 @@ is no Nova-style async task to wait out (`task_state` is always None).
 from __future__ import annotations
 
 import logging
+import os
 import shlex
 import subprocess
 import threading
@@ -26,6 +27,7 @@ import xml.etree.ElementTree as ET
 from husk import libvirt_xml as lx
 from husk.backend import BackendError, ListSlotsError
 from husk.config import BackendConfig, HostConfig
+from husk.image_sync import ImageSync
 from husk.slot import Capacity, Slot
 
 log = logging.getLogger("husk.libvirt")
@@ -33,6 +35,7 @@ log = logging.getLogger("husk.libvirt")
 # Timeouts — a control plane must never be wedged by one unresponsive host.
 _SSH_TIMEOUT_S = 60  # cap each host-side qemu-img/genisoimage/rm command
 _SSH_CONNECT_TIMEOUT_S = 15  # cap the ssh TCP/auth handshake
+_PUSH_TIMEOUT_S = 3600  # a golden qcow2 is multi-GB; scp to a host can be slow
 # libvirt RPC keepalive: probe every N seconds, drop the connection after C
 # misses (~N*C s). This is what stops an in-flight call to a frozen host from
 # blocking the reconcile loop forever; it needs the event loop (below) running.
@@ -71,7 +74,12 @@ class _HostConn:
 
     def __init__(self, cfg: HostConfig, golden_image: str) -> None:
         self.cfg = cfg
+        # On-disk golden filename in the host pool. In OCI mode this is overwritten
+        # by sync_images with a digest-named file; in the manual path it's the
+        # literal image_name. image_digest is the content digest once synced (None
+        # in the manual path → no drain/GC for this host).
         self.image = cfg.image_name or golden_image
+        self.image_digest: str | None = None
         self.units = lx.host_units(list(cfg.gpu_pci_addresses), cfg.max_slots or 1)
         self._conn = None
         self._pool_dir: str | None = None
@@ -116,6 +124,11 @@ class LibvirtBackend:
                 "libvirt backend requires at least one [[backend.hosts]]"
             )
         self.cfg = cfg
+        self._sync = ImageSync(cfg.image_cache_dir or None)
+        self._backend_ref = cfg.image_ref or ""
+        # Per-host ref last successfully synced, so sync_images is a cheap no-op
+        # each tick until the configured ref actually changes.
+        self._synced_ref: dict[str, str] = {}
         self._hosts: dict[str, _HostConn] = {}
         for h in cfg.hosts:
             if h.gpu_pci_addresses and h.max_slots is not None:
@@ -125,6 +138,13 @@ class LibvirtBackend:
                 )
             if h.name in self._hosts:
                 raise RuntimeError(f"duplicate host name {h.name!r}")
+            # Fail closed: every host needs an image source — an OCI ref (synced by
+            # the controller) or a literal qcow2 filename already in its pool.
+            if not (h.image_ref or self._backend_ref or h.image_name or cfg.image_name):
+                raise RuntimeError(
+                    f"host {h.name!r}: no image source — set [backend].image_ref "
+                    "(OCI) or image_name (a qcow2 already in the host pool)"
+                )
             self._hosts[h.name] = _HostConn(h, cfg.image_name)
 
     # --------------------------------------------------------------- internals
@@ -219,10 +239,21 @@ class LibvirtBackend:
         return lx.parse_metadata(xml)
 
     def _write_meta(
-        self, dom, *, cycle: int, provisioned_at: float, created_at: float, unit: str
+        self,
+        dom,
+        *,
+        cycle: int,
+        provisioned_at: float,
+        created_at: float,
+        unit: str,
+        image_digest: str | None = None,
     ) -> None:
         meta = lx.metadata_xml(
-            cycle=cycle, provisioned_at=provisioned_at, created_at=created_at, unit=unit
+            cycle=cycle,
+            provisioned_at=provisioned_at,
+            created_at=created_at,
+            unit=unit,
+            image_digest=image_digest,
         )
         dom.setMetadata(
             libvirt.VIR_DOMAIN_METADATA_ELEMENT, meta, "husk", lx.HUSK_NS, 0
@@ -242,6 +273,14 @@ class LibvirtBackend:
     def _slot(self, host_name: str, dom, meta: dict) -> Slot:
         state, _reason = dom.state()
         status, task = lx.domain_status(state)
+        host = self._hosts[host_name]
+        slot_digest = meta.get("image_digest")
+        # Stale only when both digests are known and differ — i.e. the host has
+        # synced a current image (OCI mode) and this slot was built from an older
+        # one. In the manual/local path host.image_digest is None → never stale.
+        stale = bool(
+            host.image_digest and slot_digest and slot_digest != host.image_digest
+        )
         return Slot(
             id=f"{host_name}:{dom.UUIDString()}",
             name=dom.name(),
@@ -249,10 +288,11 @@ class LibvirtBackend:
             task_state=task,
             created_at=meta.get("created_at") or 0.0,
             flavor_id=host_name,
-            image_id=self._hosts[host_name].image,
+            image_id=host.image,
             cycle=meta.get("cycle") or 0,
             provisioned_at=meta.get("provisioned_at"),
             fault=None,
+            image_stale=stale,
         )
 
     def _resolve(self, slot: Slot):
@@ -271,6 +311,121 @@ class LibvirtBackend:
 
     def _host_units(self) -> list[lx.HostUnits]:
         return [lx.HostUnits(name, h.units) for name, h in self._hosts.items()]
+
+    # ----------------------------------------------------------- image sync
+    def sync_images(self, cfg: BackendConfig | None = None) -> None:
+        """Ensure each host holds the configured golden image, then GC orphans.
+
+        Called once at startup and once per tick (the controller's only coupling
+        to image delivery). Cheap when nothing changed: it short-circuits a host
+        whose effective ref is already synced. When the ref changes (config
+        hot-reload) it `oras pull`s the new image to the controller cache and
+        scp's it to each host — that one tick may block for the transfer, which is
+        why the new digest is logged loudly.
+
+        Hosts on the manual/local-file path (no ref) are skipped entirely. The
+        backend-level ref can be hot-reloaded; per-host `image_ref` overrides are
+        read once at construction (changing one needs a restart)."""
+        if cfg is not None and (cfg.image_ref or "") != self._backend_ref:
+            log.info(
+                "image ref changed: %r -> %r (syncing; this tick may take a while)",
+                self._backend_ref,
+                cfg.image_ref,
+            )
+            self._backend_ref = cfg.image_ref or ""
+        for name, host in self._hosts.items():
+            ref = host.cfg.image_ref or self._backend_ref
+            if not ref:
+                continue  # manual/local-file host — nothing to pull
+            if self._synced_ref.get(name) == ref and host.image_digest:
+                continue  # already current
+            resolved = self._sync.resolve(ref)
+            golden = f"husk-golden-{resolved.short}.qcow2"
+            self._ensure_on_host(host, resolved.local_path, golden)
+            host.image = golden
+            host.image_digest = resolved.digest
+            self._synced_ref[name] = ref
+            log.info("host %s now serving %s (%s)", name, ref, resolved.short)
+        self._gc_goldens()
+
+    def _ensure_on_host(self, host: _HostConn, local_path: str, golden: str) -> None:
+        """Place `local_path` into the host pool as `golden`, if not already there.
+
+        Idempotent (skip a present, non-empty file) and atomic (push to a temp
+        name then `mv`) so a partial transfer is never seen as a usable backing
+        file, and an in-use golden of the same digest is never re-pushed."""
+        pool = host.pool_dir()
+        remote = f"{pool}/{golden}"
+        present = self._ssh(
+            host, f"test -s {shlex.quote(remote)} && echo y || echo n"
+        ).strip()
+        if present == b"y":
+            log.debug("host %s already has %s", host.cfg.name, golden)
+            return
+        tmp = f"{remote}.tmp.{os.getpid()}"
+        log.info("pushing %s to host %s", golden, host.cfg.name)
+        if host.cfg.ssh_target:
+            self._push_file(host, local_path, tmp)
+        else:  # local host: a plain copy within the same filesystem
+            self._ssh(host, f"cp {shlex.quote(local_path)} {shlex.quote(tmp)}")
+        self._ssh(host, f"mv {shlex.quote(tmp)} {shlex.quote(remote)}")
+
+    def _push_file(self, host: _HostConn, local_path: str, remote_path: str) -> None:
+        argv = [
+            "scp",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            f"ConnectTimeout={_SSH_CONNECT_TIMEOUT_S}",
+            local_path,
+            f"{host.cfg.ssh_target}:{remote_path}",
+        ]
+        try:
+            r = subprocess.run(argv, capture_output=True, timeout=_PUSH_TIMEOUT_S)
+        except subprocess.TimeoutExpired as e:
+            raise BackendError(
+                f"scp to host {host.cfg.name} timed out after {_PUSH_TIMEOUT_S}s"
+            ) from e
+        if r.returncode != 0:
+            raise BackendError(
+                f"scp to host {host.cfg.name} failed ({r.returncode}): "
+                f"{r.stderr.decode(errors='replace')[:300]}"
+            )
+
+    def _gc_goldens(self) -> None:
+        """Remove golden images on each host that no live slot (and not the host's
+        current image) references — the tail of a drain-on-ref-change. Best-effort
+        and conservative: it only deletes `husk-golden-<digest>.qcow2` files whose
+        digest is neither current nor stamped on any live slot, so a backing file
+        of a running overlay is never touched. A GC failure disturbs nothing."""
+        try:
+            raw = self._list_raw()
+        except Exception:
+            return
+        live: dict[str, set[str]] = {}
+        for host_name, _dom, meta in raw:
+            d = meta.get("image_digest")
+            if d:
+                live.setdefault(host_name, set()).add(d.split(":", 1)[-1][:12])
+        for name, host in self._hosts.items():
+            keep = set(live.get(name, set()))
+            if host.image_digest:
+                keep.add(host.image_digest.split(":", 1)[-1][:12])
+            if not keep:
+                continue  # don't GC a host we know nothing current about
+            try:
+                out = self._ssh(
+                    host,
+                    f"ls {shlex.quote(host.pool_dir())}/husk-golden-*.qcow2 "
+                    "2>/dev/null || true",
+                )
+            except Exception:
+                continue
+            for path in out.decode(errors="replace").split():
+                short = path.rsplit("husk-golden-", 1)[-1].removesuffix(".qcow2")
+                if short and short not in keep:
+                    log.info("GC stale golden %s on host %s", short, name)
+                    self._ssh(host, f"rm -f {shlex.quote(path)}")
 
     # --------------------------------------------------------------- backend
     def list_slots(self) -> list[Slot]:
@@ -297,7 +452,11 @@ class LibvirtBackend:
         now = time.time()
         dom_uuid = str(uuid.uuid4())
         meta = lx.metadata_xml(
-            cycle=cycle, provisioned_at=now, created_at=now, unit=unit
+            cycle=cycle,
+            provisioned_at=now,
+            created_at=now,
+            unit=unit,
+            image_digest=host.image_digest,
         )
         xml = lx.domain_xml(
             name=name,
@@ -337,8 +496,16 @@ class LibvirtBackend:
 
         self._make_overlay(host, name)  # wipe: fresh COW overlay off the golden image
         self._make_seed(host, name, cycle, user_data)  # NEW instance-id → re-runs
+        # Rebuild adopts the host's CURRENT golden (sync_images may have advanced
+        # it), so stamp the current digest — this is what clears a slot's stale
+        # flag once it has drained onto the new image.
         self._write_meta(
-            dom, cycle=cycle, provisioned_at=time.time(), created_at=created, unit=unit
+            dom,
+            cycle=cycle,
+            provisioned_at=time.time(),
+            created_at=created,
+            unit=unit,
+            image_digest=host.image_digest,
         )
         log.info(
             "rebuilt slot %s as cycle %d (left SHUTOFF for drain→start)", slot.id, cycle
@@ -363,6 +530,7 @@ class LibvirtBackend:
             provisioned_at=time.time(),
             created_at=meta.get("created_at") or time.time(),
             unit=meta.get("unit") or "cpu0",
+            image_digest=meta.get("image_digest"),  # preserve; don't re-stamp here
         )
 
     def destroy_slot(self, slot: Slot, *, reason: str) -> None:

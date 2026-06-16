@@ -17,9 +17,21 @@ shrink_ticks = 3
 [backend]
 name = "libvirt-gpu"
 type = "libvirt"
-image_name = "husk-gpu-golden.qcow2"   # golden qcow2 filename in each host's pool dir
 min_ready = 2                          # global warm-pool size across all hosts
 max_total = 2                          # one GPU host, one GPU → 1 (raise as the pool grows)
+
+# Image source — pick ONE:
+#  (a) image_ref: an OCI artifact built by build-images.yml and published to
+#      ghcr. The controller `oras pull`s it once to a local cache and scp's it to
+#      every host pool (named by content digest). Pin a tag or a digest. Editing
+#      this while huskd runs hot-reloads: the new image is staged and idle slots
+#      drain onto it (running jobs finish first), old goldens are GC'd.
+image_ref = "ghcr.io/acts-project/husk-gpu:v1"
+# image_cache_dir = "/var/cache/husk/images"   # optional; default ~/.cache/husk/images
+#
+#  (b) image_name: a qcow2 filename you placed in each host's pool dir yourself
+#      (the manual path — no registry, no auto-sync/drain).
+# image_name = "husk-gpu-golden.qcow2"
 
 # One entry per VM-host. GPU host: list gpu_pci_addresses (one slot per GPU).
 # CPU host: omit them and set max_slots (default 1). Setting both is rejected.

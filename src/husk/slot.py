@@ -41,6 +41,11 @@ class Slot:
     cycle: int = 0  # from durable metadata husk-cycle (see controller restart)
     provisioned_at: float | None = None  # durable metadata husk-provisioned-at (epoch)
     fault: str | None = None
+    # True when the slot was built from an image whose digest no longer matches
+    # the backend's current image (a config image_ref change). The controller
+    # drains such a slot onto the new image. Always False for backends with no
+    # image-versioning concept (OpenStack/fake), so the drain rule is inert there.
+    image_stale: bool = False
 
 
 @dataclass(frozen=True)

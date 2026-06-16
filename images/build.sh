@@ -110,6 +110,17 @@ ARGS=(
   # enabled — cloud-init starts it each cycle after laying the JIT config.
   --run-command 'systemctl --global enable podman.socket'
   --run-command 'mkdir -p /var/lib/systemd/linger && touch /var/lib/systemd/linger/runner'
+
+  # SELinux: the CI build host is non-SELinux Ubuntu, which can't reliably relabel
+  # an EL guest offline — virt-customize's --selinux-relabel (below) only defers by
+  # touching /.autorelabel, and a first boot under *enforcing* then deadlocks:
+  # nothing is labeled, so nothing — including the autorelabel service itself —
+  # can exec, and every unit dies with status=127 (a wedged VM, no serial output).
+  # Boot permissive so exec is never blocked; the deferred autorelabel still runs
+  # and completes. Safe for husk: runners are ephemeral + firewall-isolated, and
+  # cloud-init already sets containers.conf label=false, so guest SELinux is not
+  # load-bearing here.
+  --run-command "sed -i 's/^SELINUX=.*/SELINUX=permissive/' /etc/selinux/config"
 )
 
 # --------------------------------------------------------------- gpu additions

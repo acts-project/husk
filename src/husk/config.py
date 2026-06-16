@@ -66,15 +66,22 @@ class HostConfig:
     gpu_pci_addresses: tuple[str, ...] = ()
     max_slots: int | None = None  # CPU host capacity; None → 1 (and GPU forbids it)
     image_name: str | None = None  # per-host override of the backend golden image
+    image_ref: str | None = None  # per-host override of the backend OCI image ref
 
 
 @dataclass(frozen=True)
 class BackendConfig:
     name: str
     type: str
-    image_name: str  # OpenStack image name OR libvirt golden qcow2 (shared field)
     min_ready: int
     max_total: int
+    # Image source. OpenStack uses `image_name` (a Glance image name). libvirt
+    # uses `image_ref` (an OCI artifact ref, e.g. ghcr.io/org/husk-gpu:v1 — synced
+    # to each host by the controller) when set, else `image_name` as a literal
+    # qcow2 filename already present in the host pool (the manual/local path).
+    image_name: str = ""
+    image_ref: str = ""  # libvirt: OCI ref pulled+staged by the controller
+    image_cache_dir: str = ""  # controller-local oras pull cache ("" → default)
     # OpenStack-only (optional / unused for the libvirt backend)
     cloud: str = ""
     flavor_name: str = ""
@@ -153,11 +160,14 @@ def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
         gpu_pci_addresses: list[str] = []
         max_slots: int | None = None
         image_name: str | None = None
+        image_ref: str | None = None
 
     class _Backend(BaseModel):
         name: str
         type: str = "openstack"
-        image_name: str
+        image_name: str = ""
+        image_ref: str = ""
+        image_cache_dir: str = ""
         min_ready: int = 1
         max_total: int = 2
         # OpenStack-only (optional for the libvirt backend)
@@ -244,6 +254,8 @@ def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
             type=s.backend.type,
             cloud=s.backend.cloud,
             image_name=s.backend.image_name,
+            image_ref=s.backend.image_ref,
+            image_cache_dir=s.backend.image_cache_dir,
             flavor_name=s.backend.flavor_name,
             network_name=s.backend.network_name,
             keypair=s.backend.keypair,
@@ -262,6 +274,7 @@ def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
                     gpu_pci_addresses=tuple(h.gpu_pci_addresses),
                     max_slots=h.max_slots,
                     image_name=h.image_name,
+                    image_ref=h.image_ref,
                 )
                 for h in s.backend.hosts
             ),

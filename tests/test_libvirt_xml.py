@@ -108,6 +108,7 @@ def test_metadata_roundtrip():
         provisioned_at=1700000000.0,
         created_at=1699999000.0,
         unit="0000:01:00.0",
+        image_digest="sha256:abc123",
     )
     got = lx.parse_metadata(xml)
     assert got == {
@@ -116,7 +117,16 @@ def test_metadata_roundtrip():
         "cycle": 3,
         "provisioned_at": 1700000000.0,
         "created_at": 1699999000.0,
+        "image_digest": "sha256:abc123",
     }
+
+
+def test_metadata_omits_image_digest_when_absent():
+    # Manual/local-file path: no digest stamped, so no <image-digest> element and
+    # the parsed digest reads None (→ slot never classified stale).
+    xml = lx.metadata_xml(cycle=0, provisioned_at=1.0, created_at=1.0, unit="cpu0")
+    assert "image-digest" not in xml
+    assert lx.parse_metadata(xml)["image_digest"] is None
 
 
 def test_parse_metadata_handles_libvirt_denamespaced_form():
@@ -134,6 +144,7 @@ def test_parse_metadata_handles_libvirt_denamespaced_form():
         "cycle": 3,
         "provisioned_at": 1700000000.0,
         "created_at": 1699999000.0,
+        "image_digest": None,  # pre-pipeline domains carry no digest
     }
 
 
