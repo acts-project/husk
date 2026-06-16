@@ -104,7 +104,7 @@ jobs:
           # shellcheck disable=SC1091
           source images/versions.env
           curl -fL "$BASE_IMAGE_URL" -o /tmp/probe.qcow2
-          virt-customize --network -a /tmp/probe.qcow2 --run-command '
+          virt-customize -v --network -a /tmp/probe.qcow2 --run-command '
             set -x
             ls -l /etc/resolv.conf; cat /etc/resolv.conf 2>/dev/null
             printf "nameserver 1.1.1.1\n" > /etc/resolv.conf
@@ -117,6 +117,7 @@ jobs:
           ' 2>&1 | tail -45
 
       - name: Build ${{ matrix.variant }} image
+        if: false   # TEMP: skipped while debugging appliance networking via the probe
         run: |
           ./images/build.sh --variant "${{ matrix.variant }}" --out "husk-${{ matrix.variant }}.qcow2"
 
