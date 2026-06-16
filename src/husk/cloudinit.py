@@ -223,7 +223,10 @@ runcmd:
 # driver surfaces as a failed nvidia-smi in the job rather than a silent no-GPU.
 _GPU_RUNCMD = r"""  # --- GPU enablement (GPU pools only; full network here, before the firewall).
   - dnf -y install almalinux-release-nvidia-driver
-  - dnf -y install nvidia-open-kmod nvidia-driver
+  # nvidia-driver-cuda ships nvidia-smi AND the CUDA driver libs (libcuda) the CDI
+  # hook injects into job containers — without it nvidia-smi is "command not found"
+  # on the host and absent from the container.
+  - dnf -y install nvidia-open-kmod nvidia-driver nvidia-driver-cuda
   - |
     cat >/etc/yum.repos.d/nvidia-container-toolkit.repo <<'REPO'
     [nvidia-container-toolkit]

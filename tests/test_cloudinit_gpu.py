@@ -29,6 +29,7 @@ def test_gpu_on_installs_native_driver_and_cdi():
     assert "almalinux-release-nvidia-driver" in out  # repo-enabling release pkg
     assert "nvidia-open-kmod" in out  # precompiled open kmod — no DKMS
     assert "nvidia-driver" in out
+    assert "nvidia-driver-cuda" in out  # provides nvidia-smi + libcuda for the CDI hook
     assert "nvidia-container-toolkit" in out
     assert "modprobe nvidia" in out
     assert "nvidia-ctk cdi generate" in out
