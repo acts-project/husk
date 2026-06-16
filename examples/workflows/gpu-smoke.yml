@@ -21,6 +21,38 @@ jobs:
     timeout-minutes: 20
 
     steps:
+      # 0) Diagnostics FIRST — never aborts (set +e). The job runs inside the
+      #    runner VM, so this surfaces why nvidia-smi might be missing without
+      #    ever SSHing the guest. Read top-to-bottom:
+      #      * lspci nvidia EMPTY  -> the GPU was NOT passed through (no <hostdev>;
+      #        likely an adopted CPU domain — the pool-isolation problem). Driver
+      #        install can't help; fix the slot, not the image.
+      #      * lspci shows the GPU but no nvidia rpms / dnf errors in the
+      #        cloud-init log -> the driver install itself failed (repo/kernel).
+      - name: diagnostics (never fails)
+        if: always()
+        run: |
+          set +e
+          echo "::group::GPU visible to the VM? (lspci)"
+          lspci -nn | grep -i 'nvidia\|3d\|vga' || echo "NO NVIDIA PCI DEVICE — not passed through"
+          echo "::endgroup::"
+          echo "::group::installed nvidia packages (rpm)"
+          rpm -qa | grep -i nvidia || echo "no nvidia rpms installed"
+          echo "::endgroup::"
+          echo "::group::kernel module + /dev nodes"
+          lsmod | grep -i nvidia || echo "nvidia module NOT loaded"
+          ls -l /dev/nvidia* 2>/dev/null || echo "no /dev/nvidia* nodes"
+          echo "::endgroup::"
+          echo "::group::CDI spec"
+          ls -l /etc/cdi/ 2>/dev/null; head -20 /etc/cdi/nvidia.yaml 2>/dev/null || echo "no CDI spec"
+          echo "::endgroup::"
+          echo "::group::enabled dnf repos"
+          ls -l /etc/yum.repos.d/ 2>/dev/null
+          echo "::endgroup::"
+          echo "::group::cloud-init runcmd output (the GPU install ran here)"
+          cat /var/log/cloud-init-output.log 2>/dev/null || echo "cannot read cloud-init-output.log"
+          echo "::endgroup::"
+
       # 1) Host-level driver: did cloud-init's modprobe + driver install take?
       #    Runs directly on the runner VM (not in a container).
       - name: nvidia-smi on the host
