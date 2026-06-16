@@ -82,6 +82,18 @@ jobs:
           run_try "-4 -i $IFACE"
           run_try "--no-map-gw -i $IFACE"
 
+      - name: Wrap passt (inject external interface)
+        # libguestfs invokes passt without --interface; in the GHA sandbox passt
+        # can't auto-pick the host's external interface and exits 1. Wrap passt
+        # to inject `-i <iface>`. (The diagnostic above confirms the exact flag.)
+        run: |
+          IFACE=$(ip route show default | awk '/default/{print $5; exit}')
+          echo "wrapping passt with -i $IFACE"
+          sudo mv /usr/bin/passt /usr/bin/passt.real
+          printf '#!/bin/sh\nexec /usr/bin/passt.real -i %s "$@"\n' "$IFACE" | sudo tee /usr/bin/passt >/dev/null
+          sudo chmod 0755 /usr/bin/passt
+          cat /usr/bin/passt
+
       - name: Build ${{ matrix.variant }} image
         run: |
           ./images/build.sh --variant "${{ matrix.variant }}" --out "husk-${{ matrix.variant }}.qcow2"
