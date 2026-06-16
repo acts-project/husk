@@ -1,0 +1,6 @@
+[Unit]
+Description=Power off the Husk slot after the runner exits (recycle trigger)
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/poweroff

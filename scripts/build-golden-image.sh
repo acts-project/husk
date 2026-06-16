@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# DEPRECATED: superseded by `images/build.sh --variant gpu` (single source of
+# truth for both base+gpu variants, CI-buildable; see image-pipeline.md). Kept
+# until the new gpu path is validated on a real GPU host. Prefer images/build.sh.
+#
 # Build the husk golden GPU guest image: AlmaLinux 10 + NVIDIA driver +
 # nvidia-container-toolkit + podman, with a boot-time CDI generation oneshot.
 #

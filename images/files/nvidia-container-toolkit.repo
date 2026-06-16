@@ -1,0 +1,6 @@
+[nvidia-container-toolkit]
+name=nvidia-container-toolkit
+baseurl=https://nvidia.github.io/libnvidia-container/stable/rpm/$basearch
+enabled=1
+gpgcheck=1
+gpgkey=https://nvidia.github.io/libnvidia-container/gpgkey
