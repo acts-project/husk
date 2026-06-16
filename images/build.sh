@@ -25,6 +25,7 @@ source "$HERE/versions.env"
 
 VARIANT=base
 OUT=""
+DISK_SIZE=""  # empty → resolved from the per-variant default below; --disk-size wins
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --variant)        VARIANT="$2"; shift 2 ;;
@@ -37,6 +38,13 @@ while [[ $# -gt 0 ]]; do
 done
 case "$VARIANT" in base|gpu) ;; *) echo "--variant must be base|gpu" >&2; exit 2 ;; esac
 OUT="${OUT:-husk-${VARIANT}.qcow2}"
+# Per-variant disk size (versions.env), unless --disk-size overrode it explicitly.
+if [[ -z "$DISK_SIZE" ]]; then
+  case "$VARIANT" in
+    base) DISK_SIZE="$BASE_DISK_SIZE" ;;
+    gpu)  DISK_SIZE="$GPU_DISK_SIZE" ;;
+  esac
+fi
 
 RUNNER_URL="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
 
