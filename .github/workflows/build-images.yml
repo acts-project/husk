@@ -57,6 +57,11 @@ jobs:
           sudo chmod 0644 /boot/vmlinuz-* || true
           if [ -e /dev/kvm ]; then sudo chmod 0666 /dev/kvm; echo "KVM available"; else echo "no /dev/kvm -> TCG emulation"; fi
           if p="$(command -v passt)"; then sudo mv "$p" "${p}.disabled"; echo "disabled $p -> SLIRP fallback"; fi
+          # The runner's /etc/resolv.conf is the systemd-resolved stub
+          # (127.0.0.53), unreachable from the appliance under SLIRP. Give it a
+          # real resolver (build.sh also sets one inside the guest, belt+braces).
+          sudo rm -f /etc/resolv.conf
+          printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee /etc/resolv.conf >/dev/null
           echo "LIBGUESTFS_BACKEND=direct" >> "$GITHUB_ENV"
 
       - name: Build ${{ matrix.variant }} image

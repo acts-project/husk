@@ -67,6 +67,14 @@ qemu-img resize "$OUT" "$DISK_SIZE"
 ARGS=(
   -a "$OUT"
 
+  # Give the guest a real resolver for the duration of the build. The base
+  # image ships a stub/empty resolv.conf, and build hosts vary (CI uses qemu
+  # SLIRP user-net; a libvirt host uses NAT) — 1.1.1.1/8.8.8.8 are reachable
+  # through any outbound NAT, so dnf can resolve mirrors regardless. The booted
+  # slot manages its own resolv.conf (NetworkManager/cloud-init), so this is
+  # build-time only in practice.
+  --run-command 'printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf'
+
   # Container stack + runner native deps + firewall ENGINE (ruleset is runtime).
   --install "podman,podman-docker,fuse-overlayfs,slirp4netns,netavark,aardvark-dns,libicu,sudo,curl,jq,git,nftables,tar"
 
