@@ -209,19 +209,23 @@ runcmd:
 """
 
 
-# GPU enablement, injected into runcmd only for GPU pools (runner.gpu = true).
-# Kept OUT of the `packages:` block on purpose: nvidia-open-kmod lives in the repo
-# that `almalinux-release-nvidia-driver` *enables*, so it needs a second dnf pass
-# the single packages transaction can't express. Runs here with full network
-# (the egress firewall is applied right after this), against the running kernel.
+# GPU enablement splits into two halves that gate differently:
 #
-# Native AlmaLinux packaging ships a *precompiled* open kmod — no DKMS, which was
-# the GPU POC's one open blocker. modprobe loads it live (don't update the
-# kernel). CDI then lets the rootless runner inject the GPU into job containers
-# via `docker run --gpus all` (through the podman-docker shim) or
-# `--device nvidia.com/gpu=all`. Failures are left LOUD (no `|| true`) so a broken
-# driver surfaces as a failed nvidia-smi in the job rather than a silent no-GPU.
-_GPU_RUNCMD = r"""  # --- GPU enablement (GPU pools only; full network here, before the firewall).
+#  * _GPU_INSTALL (static) — the driver + container-toolkit packages. On a stock
+#    image these must be installed at boot; on a prebaked golden they are already
+#    in the image, so this half is SKIPPED. Kept OUT of the `packages:` block on
+#    purpose: nvidia-open-kmod lives in the repo that
+#    `almalinux-release-nvidia-driver` *enables*, so it needs a second dnf pass
+#    the single packages transaction can't express. Runs with the network still
+#    fully open (the egress firewall is applied right after).
+#
+#  * _GPU_RUNTIME (dynamic) — load the precompiled open kmod against the
+#    passed-through GPU and (re)generate the CDI spec the rootless runner uses to
+#    inject the GPU into job containers. Hardware-dependent (no GPU exists at image
+#    build time), so this ALWAYS runs for a GPU pool, prebaked or not. Failures are
+#    left LOUD (no `|| true`) so a broken driver surfaces as a failed nvidia-smi in
+#    the job rather than a silent no-GPU.
+_GPU_INSTALL = r"""  # --- GPU install (stock-image GPU pools; full network here, before the firewall).
   - dnf -y install almalinux-release-nvidia-driver
   # nvidia-driver-cuda ships nvidia-smi AND the CUDA driver libs (libcuda) the CDI
   # hook injects into job containers — without it nvidia-smi is "command not found"
@@ -237,28 +241,116 @@ _GPU_RUNCMD = r"""  # --- GPU enablement (GPU pools only; full network here, bef
     gpgkey=https://nvidia.github.io/libnvidia-container/gpgkey
     REPO
   - dnf -y install nvidia-container-toolkit
-  - modprobe nvidia
-  - nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
-
 """
 
-# Anchor: the GPU block is spliced in immediately before the egress-firewall
-# lockdown, so the driver install runs with the network still fully open.
+_GPU_RUNTIME = r"""  # GPU runtime activation (every boot — the kmod load + CDI spec are
+  # hardware-dependent and cannot be baked into the image).
+  - modprobe nvidia
+  - nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+"""
+
+# Anchor: GPU blocks are spliced in immediately before the egress-firewall
+# lockdown, so the install/activation run with the network still fully open.
 _FIREWALL_ANCHOR = (
     "  # Lock down egress just before the (untrusted) runner starts. Everything"
 )
 
 
-def render_cloud_init(jit_blob: str, runner_url: str, *, gpu: bool = False) -> bytes:
-    """Substitute the JIT config and runner download URL into the template.
+# Prebaked variant: a golden image (images/build.sh) already carries podman, the
+# runner binary + units, the docker shim, and (GPU) the NVIDIA driver + toolkit.
+# cloud-init then does ONLY the per-cycle/dynamic work — the JIT config, the
+# egress firewall (the one tunable security policy, deliberately not baked), GPU
+# runtime activation, and starting the runner. Composes across CPU/GPU/OpenStack:
+# the same baked image boots anywhere, with `gpu` toggling runtime activation.
+PREBAKED_RUNNER_CLOUD_INIT = r"""#cloud-config
+# Prebaked golden image: everything slow/static is in the image already, so this
+# is intentionally minimal. See render_cloud_init(prebaked=True).
 
-    With `gpu=False` (the default, and every OpenStack/CPU slot) the output is
-    byte-for-byte the validated template — the OpenStack backend is untouched.
-    With `gpu=True` a GPU provisioning block is spliced into runcmd just before
-    the egress firewall (see `_GPU_RUNCMD`)."""
-    template = RUNNER_CLOUD_INIT
-    if gpu:
-        template = template.replace(_FIREWALL_ANCHOR, _GPU_RUNCMD + _FIREWALL_ANCHOR, 1)
+write_files:
+  - path: /var/lib/husk/jitconfig
+    permissions: '0600'
+    content: "@@JIT@@"
+
+  # Coarse egress firewall ruleset — the tunable security policy, kept in
+  # cloud-init (NOT baked). MUST stay byte-identical to the full template's copy;
+  # guarded by tests/test_cloudinit_prebaked.py::test_prebaked_firewall_matches_full.
+  - path: /etc/nftables/husk-egress.nft
+    content: |
+      #!/usr/sbin/nft -f
+      table inet husk {}
+      delete table inet husk
+
+      table inet husk {
+        chain output {
+          type filter hook output priority 0; policy accept;
+
+          oif "lo" accept
+          ct state established,related accept
+
+          # Keep name resolution + time sync working: CERN's own resolvers/NTP
+          # live inside the blocked ranges, so allow 53/123 to anywhere first.
+          udp dport { 53, 123 } accept
+          tcp dport 53 accept
+
+          # Deny all other egress to CERN-internal networks. Public internet
+          # falls through to `policy accept`. Extend these sets as needed.
+          ip daddr { 128.141.0.0/16, 128.142.0.0/16, 137.138.0.0/16, 188.184.0.0/15 } drop
+          ip6 daddr { 2001:1458::/32, 2001:1459::/32 } drop
+        }
+      }
+
+runcmd:
+  # jitconfig is written root-owned above; the runner service runs as `runner`.
+  - mkdir -p /var/lib/husk
+  - chown -R runner:runner /var/lib/husk
+  # GPU runtime activation is spliced here for GPU pools (before the firewall).
+  # Lock down egress just before the (untrusted) runner starts.
+  - /usr/sbin/nft -f /etc/nftables/husk-egress.nft
+  # The runner unit is baked but NOT enabled for boot; cloud-init starts it each
+  # cycle once the fresh JIT config is in place (Type=simple returns immediately).
+  - systemctl daemon-reload
+  - systemctl start husk-runner.service
+  # Belt-and-suspenders wall-clock cap (runner is unprivileged -> real net).
+  - shutdown -h +360
+"""
+
+# Splice point for the GPU runtime block in the prebaked template (the line right
+# after it is the firewall apply, so activation runs with the network still open).
+_PREBAKED_GPU_ANCHOR = (
+    "  # Lock down egress just before the (untrusted) runner starts.\n"
+)
+
+
+def render_cloud_init(
+    jit_blob: str, runner_url: str, *, gpu: bool = False, prebaked: bool = False
+) -> bytes:
+    """Render the cloud-init user-data for one slot.
+
+    Two orthogonal flags:
+
+    * `prebaked=False` (default) boots a *stock* image: cloud-init installs
+      podman + the runner + (if `gpu`) the NVIDIA driver/toolkit. With
+      `gpu=False` the output is byte-for-byte the validated template — the
+      OpenStack/CPU backend is untouched.
+    * `prebaked=True` boots a *golden* image (images/build.sh) where all of that
+      is baked: cloud-init does only the dynamic work (JIT config, egress
+      firewall, GPU runtime activation, start).
+
+    `gpu=True` adds GPU support in either mode: the install half only on a stock
+    image, the runtime half (`modprobe` + `nvidia-ctk cdi generate`) always — the
+    kmod load and CDI spec are hardware-dependent and can't be baked."""
+    if prebaked:
+        template = PREBAKED_RUNNER_CLOUD_INIT
+        if gpu:
+            template = template.replace(
+                _PREBAKED_GPU_ANCHOR, _GPU_RUNTIME + _PREBAKED_GPU_ANCHOR, 1
+            )
+    else:
+        template = RUNNER_CLOUD_INIT
+        if gpu:
+            template = template.replace(
+                _FIREWALL_ANCHOR, _GPU_INSTALL + _GPU_RUNTIME + _FIREWALL_ANCHOR, 1
+            )
     return (
         template.replace("@@JIT@@", jit_blob)
         .replace("@@RUNNER_URL@@", runner_url)

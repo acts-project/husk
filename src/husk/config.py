@@ -37,7 +37,8 @@ class RunnerConfig:
     version: str
     labels: list[str]
     runner_group_id: int
-    gpu: bool = False  # GPU pools: cloud-init installs the NVIDIA driver + CDI
+    gpu: bool = False  # GPU pools: cloud-init activates the NVIDIA driver + CDI
+    prebaked: bool = False  # golden-image pools: skip the install steps (baked in)
 
     @property
     def url(self) -> str:
@@ -148,6 +149,7 @@ def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
         labels: list[str]
         runner_group_id: int = 1
         gpu: bool = False
+        prebaked: bool = False
 
     class _Host(BaseModel):
         name: str
@@ -248,6 +250,7 @@ def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
             labels=list(s.runner.labels),
             runner_group_id=s.runner.runner_group_id,
             gpu=s.runner.gpu,
+            prebaked=s.runner.prebaked,
         ),
         backend=BackendConfig(
             name=s.backend.name,
