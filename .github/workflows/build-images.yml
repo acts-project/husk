@@ -1,0 +1,130 @@
+name: build-images
+
+# Build the husk golden VM images (base + gpu) with virt-customize and publish
+# the qcow2 artifacts to ghcr.io via ORAS. See image-pipeline.md (Phase A).
+#
+# Build + static smoke run on every relevant push (CI signal). Publishing to
+# ghcr only happens on a manual run (workflow_dispatch) — so feature branches
+# don't push images by accident. Pin a release tag via the `version` input.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Image tag to publish (e.g. v1). Blank -> 0.0.0-<date>."
+        required: false
+        default: ""
+  push:
+    paths:
+      - "images/**"
+      - ".github/workflows/build-images.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-images-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [base, gpu]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y guestfs-tools qemu-utils
+
+      - name: Prepare libguestfs backend
+        # Two well-known gotchas on GitHub runners:
+        #  * libguestfs can't read Ubuntu's mode-0600 kernel -> make it readable.
+        #  * /dev/kvm may be absent or unreadable; LIBGUESTFS_BACKEND=direct lets
+        #    libguestfs fall back to TCG software emulation (slower but works).
+        run: |
+          sudo chmod 0644 /boot/vmlinuz-* || true
+          if [ -e /dev/kvm ]; then sudo chmod 0666 /dev/kvm; echo "KVM available"; else echo "no /dev/kvm -> TCG emulation"; fi
+          echo "LIBGUESTFS_BACKEND=direct" >> "$GITHUB_ENV"
+
+      - name: Build ${{ matrix.variant }} image
+        run: |
+          ./images/build.sh --variant "${{ matrix.variant }}" --out "husk-${{ matrix.variant }}.qcow2"
+
+      - name: Smoke (static assertions)
+        # Assert the build didn't silently drop a step (virt-customize aborts a
+        # later op without failing the whole run in some cases). Read-only.
+        run: |
+          img="husk-${{ matrix.variant }}.qcow2"
+          fail=0
+          for p in \
+            /opt/actions-runner/run.sh \
+            /usr/local/bin/docker \
+            /etc/systemd/system/husk-runner.service \
+            /etc/systemd/system/husk-poweroff.service \
+            /etc/containers/containers.conf \
+            /etc/cloud/cloud.cfg.d/90-husk-datasource.cfg \
+            /var/lib/systemd/linger/runner ; do
+            if [ "$(guestfish --ro -a "$img" -i exists "$p")" != "true" ]; then
+              echo "MISSING: $p"; fail=1
+            fi
+          done
+          echo "==> baked packages"
+          guestfish --ro -a "$img" -i command "rpm -q podman nftables podman-docker libicu"
+          if [ "${{ matrix.variant }}" = "gpu" ]; then
+            echo "==> gpu packages + CDI oneshot"
+            guestfish --ro -a "$img" -i command "rpm -q nvidia-driver nvidia-container-toolkit"
+            [ "$(guestfish --ro -a "$img" -i exists /etc/systemd/system/husk-cdi.service)" = "true" ] || { echo "MISSING: husk-cdi.service"; fail=1; }
+          fi
+          exit $fail
+
+      - name: Set up ORAS
+        if: github.event_name == 'workflow_dispatch'
+        uses: oras-project/setup-oras@v1
+
+      - name: Publish to ghcr.io
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source images/versions.env
+
+          version="${{ github.event.inputs.version }}"
+          [ -n "$version" ] || version="0.0.0-$(date +%Y%m%d)"
+          sha="${GITHUB_SHA::7}"
+          repo="ghcr.io/${{ github.repository_owner }}/husk-${{ matrix.variant }}"
+          img="husk-${{ matrix.variant }}.qcow2"
+
+          echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+          oras push "${repo}:${version},${sha}" \
+            --artifact-type application/vnd.husk.vmimage \
+            --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --annotation "org.opencontainers.image.revision=${{ github.sha }}" \
+            --annotation "husk.variant=${{ matrix.variant }}" \
+            --annotation "husk.runner.version=${RUNNER_VERSION}" \
+            --annotation "husk.base.url=${BASE_IMAGE_URL}" \
+            "${img}:application/vnd.husk.qcow2" | tee push.log
+
+          digest="$(grep -iE '^Digest:' push.log | awk '{print $2}')"
+          {
+            echo "### husk-${{ matrix.variant }} published"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| repo | \`${repo}\` |"
+            echo "| tags | \`${version}\`, \`${sha}\` |"
+            echo "| digest | \`${digest}\` |"
+            echo "| runner | \`${RUNNER_VERSION}\` |"
+            echo ""
+            echo "Pin downstream by digest: \`${repo}@${digest}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
