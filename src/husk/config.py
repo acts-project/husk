@@ -37,6 +37,7 @@ class RunnerConfig:
     version: str
     labels: list[str]
     runner_group_id: int
+    gpu: bool = False  # GPU pools: cloud-init installs the NVIDIA driver + CDI
 
     @property
     def url(self) -> str:
@@ -139,6 +140,7 @@ def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
         version: str
         labels: list[str]
         runner_group_id: int = 1
+        gpu: bool = False
 
     class _Host(BaseModel):
         name: str
@@ -235,6 +237,7 @@ def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
             version=s.runner.version,
             labels=list(s.runner.labels),
             runner_group_id=s.runner.runner_group_id,
+            gpu=s.runner.gpu,
         ),
         backend=BackendConfig(
             name=s.backend.name,

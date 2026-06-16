@@ -405,7 +405,9 @@ class Controller:
         name = runner_name(slot.name, cycle)
         try:
             jit = self.github.generate_jitconfig(name)
-            user_data = render_cloud_init(jit, self.cfg.runner.url)
+            user_data = render_cloud_init(
+                jit, self.cfg.runner.url, gpu=self.cfg.runner.gpu
+            )
             self.backend.rebuild_slot(slot, user_data=user_data, cycle=cycle)
         except Exception:
             log.exception("rebuild of slot %s failed", slot.id)
@@ -457,7 +459,9 @@ class Controller:
         log.debug("creating slot %s (runner %s)", vm, name)
         try:
             jit = self.github.generate_jitconfig(name)
-            user_data = render_cloud_init(jit, self.cfg.runner.url)
+            user_data = render_cloud_init(
+                jit, self.cfg.runner.url, gpu=self.cfg.runner.gpu
+            )
             slot = self.backend.create_slot(user_data=user_data, name=vm, cycle=0)
         except Exception:
             log.exception("create of slot %s failed", vm)
