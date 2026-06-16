@@ -1,0 +1,72 @@
+# Stage 4 GPU end-to-end validation — drop into acts-project/husk-test as
+# .github/workflows/gpu-smoke.yml and trigger from the Actions tab.
+#
+# Targets the husk libvirt GPU pool by its distinct label (set in the runner
+# config: labels = ["self-hosted","linux","x64","husk-libvirt-gpu"]) so the job
+# can ONLY land on a passed-through-GPU slot, never the OpenStack/CPU pool.
+#
+# Proves the full chain: husk schedules a VM → cloud-init installs the native
+# AlmaLinux driver + CDI (runner.gpu = true) → the rootless runner injects the
+# GPU into a job container via the podman-docker shim → CUDA computes on it.
+name: gpu-smoke
+
+on:
+  workflow_dispatch: {}        # manual: Actions tab → Run workflow
+
+jobs:
+  gpu-smoke:
+    runs-on: [self-hosted, linux, x64, husk-libvirt-gpu]
+    # Belt-and-suspenders: husk's own wall-clock cap powers the slot off, but a
+    # job timeout keeps a wedged driver install from hanging the runner.
+    timeout-minutes: 20
+
+    steps:
+      # 1) Host-level driver: did cloud-init's modprobe + driver install take?
+      #    Runs directly on the runner VM (not in a container).
+      - name: nvidia-smi on the host
+        run: nvidia-smi
+
+      # 2) CDI is generated at boot (/etc/cdi/nvidia.yaml). Show it exists so a
+      #    container-GPU failure below is easy to localize (driver vs CDI vs shim).
+      - name: CDI spec present
+        run: |
+          ls -l /etc/cdi/nvidia.yaml
+          test -s /etc/cdi/nvidia.yaml
+
+      # 3) The real test: GPU visible INSIDE a container. `docker run --gpus all`
+      #    goes through husk's docker→podman shim; podman maps --gpus to the CDI
+      #    device. If this prints the GPU, the passthrough → driver → CDI →
+      #    rootless-podman chain all works.
+      - name: nvidia-smi inside a container (--gpus all)
+        run: docker run --rm --gpus all docker.io/nvidia/cuda:12.6.2-base-ubi9 nvidia-smi
+
+      # 3b) Same thing via explicit CDI syntax — useful fallback if `--gpus all`
+      #     isn't honored by the installed podman. One of 3/3b must pass.
+      - name: nvidia-smi inside a container (CDI device)
+        if: always()
+        run: docker run --rm --device nvidia.com/gpu=all docker.io/nvidia/cuda:12.6.2-base-ubi9 nvidia-smi
+
+      # 4) Actual compute, not just enumeration: compile + run a tiny vectorAdd in
+      #    the CUDA devel image and assert the result. Proves the GPU computes,
+      #    which `nvidia-smi` alone does not.
+      - name: vectorAdd compute check
+        run: |
+          cat > /tmp/vadd.cu <<'CU'
+          #include <cstdio>
+          __global__ void add(const float* a, const float* b, float* c, int n){
+            int i = blockIdx.x*blockDim.x + threadIdx.x;
+            if (i < n) c[i] = a[i] + b[i];
+          }
+          int main(){
+            const int n = 1<<20; size_t sz = n*sizeof(float);
+            float *a,*b,*c; cudaMallocManaged(&a,sz); cudaMallocManaged(&b,sz); cudaMallocManaged(&c,sz);
+            for(int i=0;i<n;i++){a[i]=1.0f;b[i]=2.0f;}
+            add<<<(n+255)/256,256>>>(a,b,c,n); cudaDeviceSynchronize();
+            double err=0; for(int i=0;i<n;i++) err+=(c[i]-3.0f)*(c[i]-3.0f);
+            printf("vectorAdd L2 error = %f\n", err);
+            return err==0.0 ? 0 : 1;
+          }
+          CU
+          docker run --rm --gpus all -v /tmp:/work -w /work \
+            docker.io/nvidia/cuda:12.6.2-devel-ubi9 \
+            bash -c 'nvcc vadd.cu -o vadd && ./vadd'

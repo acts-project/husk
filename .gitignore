@@ -9,5 +9,7 @@ dist/
 husk-test
 config.toml
 
-# Stage-2 libvirt CPU config (names the repo; keep local)
-config.libvirt.cpu.toml
+# Local libvirt configs (name the repo; keep local). The committed example is
+# config.libvirt.example.toml, which the negation below keeps tracked.
+config.libvirt.*.toml
+!config.libvirt.example.toml
