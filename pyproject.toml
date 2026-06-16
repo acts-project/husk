@@ -14,7 +14,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest", "ruff>=0.15"]
 # libvirt backend — kept optional so the OpenStack/CI path needs no libvirt headers.
-libvirt = ["libvirt-python>=10"]
+# `oras` is the pure-Python OCI client used to pull golden images (no oras CLI dep).
+libvirt = ["libvirt-python>=10", "oras>=0.2"]
 
 [project.scripts]
 huskd = "husk.cli:huskd"

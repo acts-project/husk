@@ -73,6 +73,7 @@ def make_slot(
     created_at: float = 0.0,
     cycle: int = 0,
     provisioned_at: float | None = None,
+    image_stale: bool = False,
 ) -> Slot:
     return Slot(
         id=id,
@@ -84,6 +85,7 @@ def make_slot(
         image_id="image-current",
         cycle=cycle,
         provisioned_at=provisioned_at,
+        image_stale=image_stale,
     )
 
 

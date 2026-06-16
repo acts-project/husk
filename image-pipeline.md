@@ -4,10 +4,16 @@ How husk builds, distributes, and rolls out the golden VM images that back its
 runner slots. Companion to `plan.md` (which deliberately deferred custom images
 in "Phase 4"); this document un-defers that work with a concrete design.
 
-> **Status (2026-06-16):** design agreed, not yet built. The runner/podman stack
-> is currently installed at *cloud-init time* as a spike (`src/husk/cloudinit.py`)
-> and the only image-build artifact today is the manual, single-host
-> `scripts/build-golden-image.sh`. This document describes the target system.
+> **Status (2026-06-16):** Phase A (CI build → ghcr via ORAS) merged. **Phases B
+> + C are now built for the libvirt backend** (`src/husk/image_sync.py` +
+> `LibvirtBackend.sync_images`): the controller pulls the config-pinned
+> `image_ref` (via the pure-Python `oras` client — no CLI dep) to a local cache,
+> scp's it to each host pool by digest, stamps the
+> digest into slot metadata, and drains slots onto a new ref on config
+> hot-reload, GC'ing orphaned goldens. **OpenStack/Glance delivery is still
+> deferred** (OpenStack remains the CPU path; the GPU image ships only to libvirt
+> hosts). The runner/podman stack is still installed at cloud-init time for slots
+> that boot a stock base; a baked golden is the boot-speed optimization.
 
 -----
 
@@ -149,13 +155,18 @@ live per-slot overlay — overwriting it in place corrupts running slots. So:
 
 ## Phasing
 
-- **Phase A — CI image build (this is next; see implementation plan).** Single
-  spec, two variants, built in GitHub CI, pushed to ghcr via ORAS. Output:
-  pullable `husk-base` + `husk-gpu` artifacts. *Does not touch huskd.*
-- **Phase B — delivery & sync.** `image_sync.py`, config ref change, oras pull
-  on the controller, libvirt scp + Glance upload.
-- **Phase C — versioned rollout / drain.** Digest stamping + drain-on-change +
-  GC.
+- **Phase A — CI image build. ✅ DONE.** Single spec, two variants, built in
+  GitHub CI, pushed to ghcr via ORAS. Output: pullable `husk-base` + `husk-gpu`
+  artifacts (`build-images.yml`). *Does not touch huskd.*
+- **Phase B — delivery & sync (libvirt). ✅ DONE.** `image_sync.py` (`oras
+  resolve`+`pull` to a controller cache, content-addressed), `LibvirtBackend.
+  sync_images` scp's the golden to each host pool by digest (idempotent, atomic),
+  driven by the config `image_ref`. *Glance upload still deferred.*
+- **Phase C — versioned rollout / drain (libvirt). ✅ DONE.** Digest stamped into
+  domain metadata; `Slot.image_stale` set when it diverges from the host's current
+  image; the controller drains stale idle slots (rebuild adopts the new golden)
+  and `_gc_goldens` removes unreferenced backing files. `image_ref` is
+  hot-reloadable (per-host overrides remain restart-only).
 
 Each phase is independently useful: A produces artifacts you can place by hand
 (exactly the manual step today, just reproducible); B automates delivery against

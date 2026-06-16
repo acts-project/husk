@@ -111,11 +111,23 @@ def meta_data(name: str, cycle: int) -> str:
 
 # ------------------------------------------------------------------- metadata
 def metadata_xml(
-    *, cycle: int, provisioned_at: float, created_at: float, unit: str
+    *,
+    cycle: int,
+    provisioned_at: float,
+    created_at: float,
+    unit: str,
+    image_digest: str | None = None,
 ) -> str:
     """The `<husk:slot>` element stored under the domain `<metadata>` (durable
     state: the libvirt analog of Nova metadata). `unit` is the assigned slot-unit
-    (a GPU PCI address, or `cpuN`)."""
+    (a GPU PCI address, or `cpuN`); `image_digest` is the content digest of the
+    golden image this slot was (re)built from — the controller drains a slot whose
+    stamped digest no longer matches the host's current image (`image-pipeline.md`
+    Phase C). Omitted (empty) in the manual/local-file path, where there is no
+    digest to track."""
+    digest_el = (
+        f"<image-digest>{escape(image_digest)}</image-digest>" if image_digest else ""
+    )
     return (
         f'<slot xmlns="{HUSK_NS}">'
         f"<managed-by>{MANAGED_BY}</managed-by>"
@@ -123,6 +135,7 @@ def metadata_xml(
         f"<provisioned-at>{provisioned_at:.0f}</provisioned-at>"
         f"<created-at>{created_at:.0f}</created-at>"
         f"<unit>{escape(unit)}</unit>"
+        f"{digest_el}"
         f"</slot>"
     )
 
@@ -152,7 +165,11 @@ def parse_metadata(xml: str | None) -> dict | None:
 
     if _text("managed-by") != MANAGED_BY:
         return None
-    out: dict = {"managed_by": MANAGED_BY, "unit": _text("unit")}
+    out: dict = {
+        "managed_by": MANAGED_BY,
+        "unit": _text("unit"),
+        "image_digest": _text("image-digest"),
+    }
     for key, tag, cast in (
         ("cycle", "cycle", int),
         ("provisioned_at", "provisioned-at", float),
