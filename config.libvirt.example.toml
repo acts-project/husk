@@ -9,6 +9,11 @@ pat_env = "GH_TOKEN"          # secret from env; never written to this file
 version = "2.334.0"
 labels = ["self-hosted", "linux", "x64", "gpu"]   # jobs target the GPU pool via `gpu`
 runner_group_id = 1
+# gpu = true       # activate the NVIDIA driver (modprobe + CDI) each boot
+# prebaked = true  # set when image_ref points at a golden image: cloud-init skips
+#                  # the install steps (podman, runner, driver — all baked). In
+#                  # prebaked mode the baked runner version is authoritative, so
+#                  # `version` above must match the image's husk.runner.version.
 
 [controller]
 lock_path = "/tmp/huskd.lock"

@@ -438,7 +438,10 @@ class Controller:
         try:
             jit = self.github.generate_jitconfig(name)
             user_data = render_cloud_init(
-                jit, self.cfg.runner.url, gpu=self.cfg.runner.gpu
+                jit,
+                self.cfg.runner.url,
+                gpu=self.cfg.runner.gpu,
+                prebaked=self.cfg.runner.prebaked,
             )
             self.backend.rebuild_slot(slot, user_data=user_data, cycle=cycle)
         except Exception:
@@ -492,7 +495,10 @@ class Controller:
         try:
             jit = self.github.generate_jitconfig(name)
             user_data = render_cloud_init(
-                jit, self.cfg.runner.url, gpu=self.cfg.runner.gpu
+                jit,
+                self.cfg.runner.url,
+                gpu=self.cfg.runner.gpu,
+                prebaked=self.cfg.runner.prebaked,
             )
             slot = self.backend.create_slot(user_data=user_data, name=vm, cycle=0)
         except Exception:
