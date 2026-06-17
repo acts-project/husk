@@ -67,6 +67,8 @@ def test_sync_pulls_pushes_and_stamps_digest():
     assert host.image_digest == CURR
     assert pushed and pushed[0][0] == "/cache/img.qcow2"
     assert any(c.startswith("mv ") for c in ssh)  # atomic temp→final swap
+    # current-golden marker written at stage time (cross-pool GC protection)
+    assert any(c.startswith("printf ") and ".husk-current-" in c for c in ssh)
 
 
 def test_sync_is_noop_once_synced():
@@ -131,6 +133,37 @@ def test_gc_removes_only_unreferenced_goldens():
 
     assert len(removed) == 1
     assert "eeeeeeeeeeee" in removed[0]
+
+
+def test_gc_keeps_marker_protected_golden():
+    # A golden that's another pool's CURRENT image (protected by its on-host
+    # marker) is kept even with no live slot of ours referencing it — so two
+    # libvirt pools sharing a host's pool dir never GC each other's backing files.
+    b = _backend()
+    b._hosts["h1"].image_digest = CURR  # our current → cccccccccccc
+    b._list_raw = lambda: []  # no live slots at all
+
+    listing = (
+        "/pool/husk-golden-cccccccccccc.qcow2\n"  # our current      → keep
+        "/pool/husk-golden-ffffffffffff.qcow2\n"  # other pool marker → keep
+        "/pool/husk-golden-eeeeeeeeeeee.qcow2\n"  # orphan            → rm
+    )
+    removed = []
+
+    def fake_ssh(host, cmd, data=None):
+        if cmd.startswith("cat "):  # the .husk-current-* markers
+            return b"husk-golden-ffffffffffff.qcow2\n"
+        if cmd.startswith("ls "):
+            return listing.encode()
+        if cmd.startswith("rm -f"):
+            removed.append(cmd)
+        return b""
+
+    b._ssh = fake_ssh
+    b._gc_goldens()
+
+    assert len(removed) == 1 and "eeeeeeeeeeee" in removed[0]
+    assert "ffffffffffff" not in removed[0]  # marker-protected, survived
     assert "cccccccccccc" not in removed[0]
 
 

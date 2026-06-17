@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shlex
 import subprocess
 import threading
@@ -376,6 +377,10 @@ class LibvirtBackend:
         for host in self._hosts.values():
             if (host.cfg.image_ref or self._backend_ref) == ref:
                 self._ensure_on_host(host, resolved.local_path, golden)
+                # Mark this pool's current golden the moment it lands, BEFORE the
+                # tick adopts it — so another pool sharing this host's pool dir
+                # can't GC a freshly-staged golden in the pre-adopt window.
+                self._mark_current(host, golden)
         return _GoldenPrepared(digest=resolved.digest, golden=golden)
 
     def _ensure_on_host(self, host: _HostConn, local_path: str, golden: str) -> None:
@@ -422,12 +427,43 @@ class LibvirtBackend:
                 f"{r.stderr.decode(errors='replace')[:300]}"
             )
 
+    def _marker_path(self, host: _HostConn) -> str:
+        """On-host file recording THIS pool's current golden, so a pool sharing the
+        host's pool dir never GCs another pool's current image (`.husk-current-<pool>`)."""
+        tag = re.sub(r"[^A-Za-z0-9_.-]", "_", self._pool)
+        return f"{host.pool_dir()}/.husk-current-{tag}"
+
+    def _mark_current(self, host: _HostConn, golden: str) -> None:
+        try:
+            self._ssh(
+                host,
+                f"printf '%s\\n' {shlex.quote(golden)} > {shlex.quote(self._marker_path(host))}",
+            )
+        except Exception:
+            log.debug(
+                "could not write golden marker on %s", host.cfg.name, exc_info=True
+            )
+
+    def _marked_goldens(self, host: _HostConn) -> set[str]:
+        """Golden filenames every pool on this host has marked current (the union
+        of all `.husk-current-*` markers in the shared pool dir)."""
+        try:
+            out = self._ssh(
+                host,
+                f"cat {shlex.quote(host.pool_dir())}/.husk-current-* 2>/dev/null || true",
+            )
+        except Exception:
+            return set()
+        return set(out.decode(errors="replace").split())
+
     def _gc_goldens(self) -> None:
-        """Remove golden images on each host that no live slot (and not the host's
-        current image) references — the tail of a drain-on-ref-change. Best-effort
-        and conservative: it only deletes `husk-golden-<digest>.qcow2` files whose
-        digest is neither current nor stamped on any live slot, so a backing file
-        of a running overlay is never touched. A GC failure disturbs nothing."""
+        """Remove golden images on each host that no live slot references and that
+        no pool has marked current. Best-effort and conservative: it only deletes
+        `husk-golden-<digest>.qcow2` files, and keeps any that (a) back a live
+        overlay (across ALL pools on the host), (b) are this pool's current image,
+        or (c) are marked current by ANY pool sharing the host's pool dir — so two
+        libvirt pools on one host never GC each other's backing files. A GC failure
+        disturbs nothing."""
         try:
             raw = self._list_raw()
         except Exception:
@@ -436,11 +472,15 @@ class LibvirtBackend:
         for host_name, _dom, meta in raw:
             d = meta.get("image_digest")
             if d:
-                live.setdefault(host_name, set()).add(d.split(":", 1)[-1][:12])
+                fn = f"husk-golden-{d.split(':', 1)[-1][:12]}.qcow2"
+                live.setdefault(host_name, set()).add(fn)
         for name, host in self._hosts.items():
             keep = set(live.get(name, set()))
             if host.image_digest:
-                keep.add(host.image_digest.split(":", 1)[-1][:12])
+                keep.add(
+                    f"husk-golden-{host.image_digest.split(':', 1)[-1][:12]}.qcow2"
+                )
+            keep |= self._marked_goldens(host)  # every pool's current, durably
             if not keep:
                 continue  # don't GC a host we know nothing current about
             try:
@@ -452,9 +492,9 @@ class LibvirtBackend:
             except Exception:
                 continue
             for path in out.decode(errors="replace").split():
-                short = path.rsplit("husk-golden-", 1)[-1].removesuffix(".qcow2")
-                if short and short not in keep:
-                    log.info("GC stale golden %s on host %s", short, name)
+                base = path.rsplit("/", 1)[-1]
+                if base and base not in keep:
+                    log.info("GC stale golden %s on host %s", base, name)
                     self._ssh(host, f"rm -f {shlex.quote(path)}")
 
     # --------------------------------------------------------------- backend
