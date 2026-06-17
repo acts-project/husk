@@ -5,15 +5,24 @@ runner slots. Companion to `plan.md` (which deliberately deferred custom images
 in "Phase 4"); this document un-defers that work with a concrete design.
 
 > **Status (2026-06-16):** Phase A (CI build → ghcr via ORAS) merged. **Phases B
-> + C are now built for the libvirt backend** (`src/husk/image_sync.py` +
-> `LibvirtBackend.sync_images`): the controller pulls the config-pinned
-> `image_ref` (via the pure-Python `oras` client — no CLI dep) to a local cache,
-> scp's it to each host pool by digest, stamps the
-> digest into slot metadata, and drains slots onto a new ref on config
-> hot-reload, GC'ing orphaned goldens. **OpenStack/Glance delivery is still
-> deferred** (OpenStack remains the CPU path; the GPU image ships only to libvirt
-> hosts). The runner/podman stack is still installed at cloud-init time for slots
-> that boot a stock base; a baked golden is the boot-speed optimization.
+> + C are built for BOTH backends.** The shared registry half
+> (`src/husk/image_sync.py`, now a base dep — no longer libvirt-only) pulls the
+> config-pinned `image_ref` via the pure-Python `oras` client to a controller
+> cache, content-addressed by qcow2 digest. From there:
+> - **libvirt** (`LibvirtBackend.sync_images`): scp's the golden to each host pool
+>   by digest; stamps the digest into domain metadata; drains slots onto a new ref
+>   on hot-reload; GC's orphaned goldens.
+> - **OpenStack** (`OpenStackBackend.sync_images`): uploads the qcow2 to Glance as
+>   `husk-golden-<digest>` (idempotent on digest), rotates the current image id,
+>   drains stale slots through the recycle loop on a ref change, and GC's
+>   superseded Glance goldens. The **same qcow2 serves both backends** — the goal
+>   in Goal 4. `image_ref` is hot-reloadable on both.
+>
+> The runner/podman stack is still installed at cloud-init time when a slot boots a
+> *stock* base (`prebaked = false`); pointing `image_ref` at a golden + setting
+> `[runner] prebaked = true` is the boot-speed optimization. **Open:** live-confirm
+> one qcow2 boots cleanly on a CERN Glance upload (datasource/login/ConfigDrive)
+> as it already does on libvirt.
 
 -----
 
@@ -158,15 +167,19 @@ live per-slot overlay — overwriting it in place corrupts running slots. So:
 - **Phase A — CI image build. ✅ DONE.** Single spec, two variants, built in
   GitHub CI, pushed to ghcr via ORAS. Output: pullable `husk-base` + `husk-gpu`
   artifacts (`build-images.yml`). *Does not touch huskd.*
-- **Phase B — delivery & sync (libvirt). ✅ DONE.** `image_sync.py` (`oras
-  resolve`+`pull` to a controller cache, content-addressed), `LibvirtBackend.
-  sync_images` scp's the golden to each host pool by digest (idempotent, atomic),
-  driven by the config `image_ref`. *Glance upload still deferred.*
-- **Phase C — versioned rollout / drain (libvirt). ✅ DONE.** Digest stamped into
-  domain metadata; `Slot.image_stale` set when it diverges from the host's current
-  image; the controller drains stale idle slots (rebuild adopts the new golden)
-  and `_gc_goldens` removes unreferenced backing files. `image_ref` is
-  hot-reloadable (per-host overrides remain restart-only).
+- **Phase B — delivery & sync. ✅ DONE (both backends).** `image_sync.py` (`oras
+  resolve`+`pull` to a controller cache, content-addressed) is the shared registry
+  half. `LibvirtBackend.sync_images` scp's the golden to each host pool by digest
+  (idempotent, atomic); `OpenStackBackend.sync_images` uploads the qcow2 to Glance
+  as `husk-golden-<digest>` (idempotent on digest, rotates the current image id).
+  Both driven by the config `image_ref`.
+- **Phase C — versioned rollout / drain. ✅ DONE (both backends).** libvirt stamps
+  the digest into domain metadata; OpenStack compares each slot's Glance image id
+  to the current. `Slot.image_stale` is set when they diverge, and the controller
+  drains stale idle slots (rebuild adopts the new golden) — same drain path on both
+  backends. libvirt `_gc_goldens` removes unreferenced backing files; OpenStack
+  `_gc_glance` deletes superseded `husk-golden-*` Glance images. `image_ref` is
+  hot-reloadable (per-host libvirt overrides remain restart-only).
 
 Each phase is independently useful: A produces artifacts you can place by hand
 (exactly the manual step today, just reproducible); B automates delivery against

@@ -293,6 +293,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "openstacksdk" },
+    { name = "oras" },
     { name = "pydantic-settings" },
     { name = "requests" },
     { name = "rich" },
@@ -306,14 +307,13 @@ dev = [
 ]
 libvirt = [
     { name = "libvirt-python" },
-    { name = "oras" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "libvirt-python", marker = "extra == 'libvirt'", specifier = ">=10" },
     { name = "openstacksdk" },
-    { name = "oras", marker = "extra == 'libvirt'", specifier = ">=0.2" },
+    { name = "oras", specifier = ">=0.2" },
     { name = "pydantic-settings", specifier = ">=2" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "requests" },

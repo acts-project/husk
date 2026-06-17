@@ -13,3 +13,7 @@ config.toml
 # config.libvirt.example.toml, which the negation below keeps tracked.
 config.libvirt.*.toml
 !config.libvirt.example.toml
+
+# Local OpenStack variants (e.g. the OCI/prebaked soak config). The committed
+# template stays config.example.toml.
+config.openstack.*.toml
