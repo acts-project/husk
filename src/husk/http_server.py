@@ -1,12 +1,12 @@
-"""Read-only HTTP surface exposing huskd's published snapshot.
+"""Read-only HTTP surface exposing huskd's published per-pool snapshots.
 
 This is the single source of truth served three ways:
-  GET /status   — ControllerState as JSON (huskctl status, dashboards)
-  GET /metrics  — Prometheus text exposition (gauges derived from the snapshot)
-  GET /healthz  — 200 if a recent reconcile is published, else 503
+  GET /status   — JSON list of ControllerState, one per pool (huskctl, dashboards)
+  GET /metrics  — Prometheus text exposition (per-pool gauges, backend="..." label)
+  GET /healthz  — 200 if every pool has a recent reconcile, else 503
 
-Runs in a daemon thread alongside the reconcile loop, reading the controller's
-latest `snapshot` (an immutable dataclass swapped atomically each tick, so a
+Runs in a daemon thread alongside the reconcile loop, reading the latest per-pool
+snapshots (each an immutable dataclass swapped atomically each tick, so a
 cross-thread read is safe). No auth: it exposes slot ids / runner names (not
 secrets) — bind to localhost unless it sits behind network controls.
 """
@@ -98,24 +98,22 @@ class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:
-        snap: ControllerState | None = self.server.snapshot_provider()  # type: ignore[attr-defined]
+        # The provider yields one ControllerState per pool (a list; one element for
+        # a single-pool daemon). Every endpoint is pool-aware.
+        snaps: list[ControllerState] = self.server.snapshot_provider() or []  # type: ignore[attr-defined]
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if path in ("/", "/status", "/state.json"):
-            if snap is None:
-                self._send(503, "application/json", b'{"error":"no snapshot yet"}\n')
-            else:
-                self._send(
-                    200,
-                    "application/json",
-                    (json.dumps(snap.to_dict()) + "\n").encode(),
-                )
+            body = (json.dumps([s.to_dict() for s in snaps]) + "\n").encode()
+            self._send(200, "application/json", body)
         elif path == "/metrics":
-            body = b"" if snap is None else render_prometheus(snap).encode()
+            # Per-pool series are distinguished by the backend="..." label already
+            # on every metric, so concatenation is a valid exposition.
+            body = "".join(render_prometheus(s) for s in snaps).encode()
             self._send(200, "text/plain; version=0.0.4; charset=utf-8", body)
         elif path == "/healthz":
-            ok = (
-                snap is not None
-                and (time.time() - snap.last_reconcile_epoch) <= STALE_AFTER_SEC
+            # Healthy only when every pool has published a recent reconcile.
+            ok = bool(snaps) and all(
+                (time.time() - s.last_reconcile_epoch) <= STALE_AFTER_SEC for s in snaps
             )
             self._send(200 if ok else 503, "text/plain", b"ok\n" if ok else b"stale\n")
         else:

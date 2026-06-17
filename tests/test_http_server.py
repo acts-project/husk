@@ -69,13 +69,15 @@ def _get(url):
 
 
 def test_http_status_metrics_healthz():
-    snap = _snap()
-    server, base = _serve(lambda: snap)
+    # Multi-pool: the provider yields a list of per-pool snapshots.
+    snaps = [_snap()]
+    server, base = _serve(lambda: snaps)
     try:
         code, body = _get(base + "/status")
         assert code == 200
-        back = ControllerState.from_dict(json.loads(body))
-        assert back.to_dict() == snap.to_dict()
+        listed = json.loads(body)
+        assert isinstance(listed, list) and len(listed) == 1
+        assert ControllerState.from_dict(listed[0]).to_dict() == snaps[0].to_dict()
 
         code, body = _get(base + "/metrics")
         assert code == 200 and b"husk_slots{" in body
@@ -86,33 +88,60 @@ def test_http_status_metrics_healthz():
         server.stop()
 
 
-def test_http_healthz_503_when_no_snapshot():
-    server, base = _serve(lambda: None)
+def test_http_metrics_concats_pools():
+    a = ControllerState.from_classified(
+        generation=1,
+        backend="pool-a",
+        min_ready=1,
+        max_total=2,
+        desired_total=1,
+        classified=[],
+    )
+    b = ControllerState.from_classified(
+        generation=1,
+        backend="pool-b",
+        min_ready=1,
+        max_total=2,
+        desired_total=1,
+        classified=[],
+    )
+    server, base = _serve(lambda: [a, b])
+    try:
+        _, body = _get(base + "/metrics")
+        assert b'husk_slots_desired{backend="pool-a"}' in body
+        assert b'husk_slots_desired{backend="pool-b"}' in body
+    finally:
+        server.stop()
+
+
+def test_http_healthz_503_when_no_pools():
+    server, base = _serve(lambda: [])
     try:
         with pytest.raises(urllib.error.HTTPError) as ei:
             _get(base + "/healthz")
         assert ei.value.code == 503
-        with pytest.raises(urllib.error.HTTPError) as ei:
-            _get(base + "/status")
-        assert ei.value.code == 503
+        code, body = _get(base + "/status")  # empty list, but a valid 200
+        assert code == 200 and json.loads(body) == []
     finally:
         server.stop()
 
 
 def test_cli_http_getter_reads_server():
-    # The huskctl status HTTP getter fetches and parses huskd's served snapshot.
+    # The huskctl status HTTP getter fetches and parses huskd's served snapshot
+    # list (one entry per pool).
     from dataclasses import replace
 
     from conftest import make_config
     from husk.cli import _snapshot_getter
 
-    snap = _snap()
-    server, base = _serve(lambda: snap)
+    snaps = [_snap()]
+    server, base = _serve(lambda: snaps)
     try:
         cfg = make_config()
         host_port = base.removeprefix("http://")
         cfg = replace(cfg, controller=replace(cfg.controller, http_addr=host_port))
-        getter = _snapshot_getter(cfg, live=False)
-        assert getter().to_dict() == snap.to_dict()
+        getter = _snapshot_getter([cfg], live=False)
+        got = getter()
+        assert [s.to_dict() for s in got] == [s.to_dict() for s in snaps]
     finally:
         server.stop()
