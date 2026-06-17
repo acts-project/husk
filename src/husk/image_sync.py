@@ -34,6 +34,9 @@ log = logging.getLogger("husk.image")
 # this backoff — so a registry/Glance outage doesn't spin a tight retry loop.
 _PREPARE_RETRY_BACKOFF_S = 30.0
 
+# How often to log registry-pull progress (MiB pulled so far) during a slow pull.
+_PULL_PROGRESS_INTERVAL_S = 30.0
+
 # The layer mediaType the build pipeline stamps on the qcow2 (build-images.yml).
 _QCOW2_MEDIA_TYPE = "application/vnd.husk.qcow2"
 
@@ -122,6 +125,13 @@ class ImageSync:
         # Pull into a temp dir then atomically swap into place, so an interrupted
         # pull never leaves a half-written qcow2 that a later run treats as cached.
         tmp = tempfile.mkdtemp(prefix=".pull-", dir=self.cache_dir)
+        stop = threading.Event()
+        threading.Thread(
+            target=self._log_pull_progress,
+            args=(ref, tmp, stop),
+            name="husk-pull-progress",
+            daemon=True,
+        ).start()
         try:
             log.info("pulling image %s (%s) to controller cache", ref, digest[:19])
             # NB: don't pass allowed_media_type here — in oras-py that filters the
@@ -138,12 +148,30 @@ class ImageSync:
             os.replace(tmp, dest)
             tmp = None  # consumed by the rename; don't clean it up below
         finally:
+            stop.set()
             if tmp is not None:
                 shutil.rmtree(tmp, ignore_errors=True)
         local = self._qcow2_in(dest)
         assert local is not None  # we just placed it
         log.info("image %s ready at %s", ref, local)
         return ResolvedImage(ref=ref, digest=digest, local_path=local)
+
+    def _log_pull_progress(self, ref: str, tmp: str, stop) -> None:
+        """Log how many MiB have been pulled into the temp dir every
+        `_PULL_PROGRESS_INTERVAL_S`, so a slow multi-GB registry pull isn't a silent
+        gap. Best-effort: the total isn't known up front, so it reports bytes so far
+        and stops the moment the pull completes."""
+        while not stop.wait(_PULL_PROGRESS_INTERVAL_S):
+            try:
+                got = sum(
+                    os.path.getsize(os.path.join(dp, f))
+                    for dp, _dirs, files in os.walk(tmp)
+                    for f in files
+                )
+            except OSError:
+                continue
+            if got > 0:
+                log.info("pulling %s: %d MiB so far", ref, got >> 20)
 
     def _qcow2_digest(self, ref: str) -> str:
         """The digest of the artifact's qcow2 layer (its content hash)."""

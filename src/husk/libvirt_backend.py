@@ -48,6 +48,7 @@ log = logging.getLogger("husk.libvirt")
 _SSH_TIMEOUT_S = 60  # cap each host-side qemu-img/genisoimage/rm command
 _SSH_CONNECT_TIMEOUT_S = 15  # cap the ssh TCP/auth handshake
 _PUSH_TIMEOUT_S = 3600  # a golden qcow2 is multi-GB; scp to a host can be slow
+_PROGRESS_INTERVAL_S = 30  # how often to log golden-transfer progress (MiB/%)
 # libvirt RPC keepalive: probe every N seconds, drop the connection after C
 # misses (~N*C s). This is what stops an in-flight call to a frozen host from
 # blocking the reconcile loop forever; it needs the event loop (below) running.
@@ -459,17 +460,59 @@ class LibvirtBackend:
             local_path,
             f"{host.cfg.ssh_target}:{remote_path}",
         ]
+        # Log transfer progress so a multi-GB push isn't a silent multi-minute gap:
+        # a daemon thread polls the growing destination size against the source.
+        try:
+            total = os.path.getsize(local_path)
+        except OSError:
+            total = 0
+        stop = threading.Event()
+        if total:
+            threading.Thread(
+                target=self._log_push_progress,
+                args=(host, remote_path, total, stop),
+                name="husk-stage-progress",
+                daemon=True,
+            ).start()
         try:
             r = subprocess.run(argv, capture_output=True, timeout=_PUSH_TIMEOUT_S)
         except subprocess.TimeoutExpired as e:
             raise BackendError(
                 f"scp to host {host.cfg.name} timed out after {_PUSH_TIMEOUT_S}s"
             ) from e
+        finally:
+            stop.set()
         if r.returncode != 0:
             raise BackendError(
                 f"scp to host {host.cfg.name} failed ({r.returncode}): "
                 f"{r.stderr.decode(errors='replace')[:300]}"
             )
+
+    def _log_push_progress(
+        self, host: _HostConn, remote_path: str, total: int, stop: threading.Event
+    ) -> None:
+        """Poll the destination size every `_PROGRESS_INTERVAL_S` and log MiB/% so a
+        slow golden transfer is visible in the log. Best-effort: a failed probe is
+        skipped, and it stops the moment the push finishes (or errors)."""
+        while not stop.wait(_PROGRESS_INTERVAL_S):
+            try:
+                got = int(
+                    self._ssh(
+                        host,
+                        f"stat -c%s {shlex.quote(remote_path)} 2>/dev/null || echo 0",
+                    ).strip()
+                    or b"0"
+                )
+            except Exception:
+                continue
+            if got > 0:
+                log.info(
+                    "staging to host %s: %d/%d MiB (%d%%)",
+                    host.cfg.name,
+                    got >> 20,
+                    total >> 20,
+                    100 * got // total,
+                )
 
     def _marker_path(self, host: _HostConn) -> str:
         """On-host file recording THIS pool's current golden, so a pool sharing the
