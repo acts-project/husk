@@ -367,6 +367,7 @@ def run(
         typer.echo(str(e), err=True)
         raise typer.Exit(code=1)
     server = None
+    web = None
     try:
         # One Controller per pool. The facade owns publish + HTTP + reload, so the
         # sub-controllers get blanked state_path/http_addr and no reload hook. A pool
@@ -405,17 +406,34 @@ def run(
             for snap in facade.snapshots():
                 _print_status(snap)
         else:
+            from husk.http_server import parse_addr
+
             if shared.http_addr:
-                from husk.http_server import StatusServer, parse_addr
+                from husk.http_server import StatusServer
 
                 host, port = parse_addr(shared.http_addr)
                 server = StatusServer(facade.snapshots, host, port)
                 server.start()
+            if shared.web_addr:
+                try:
+                    from husk.web import WebServer, make_app
+
+                    whost, wport = parse_addr(shared.web_addr)
+                    web = WebServer(make_app(facade.snapshots), whost, wport)
+                    web.start()
+                except ImportError:
+                    typer.echo(
+                        "web dashboard needs the 'web' extra "
+                        "(pip install 'husk[web]'); continuing without it",
+                        err=True,
+                    )
             try:
                 facade.run()
             except KeyboardInterrupt:
                 typer.echo("shutting down", err=True)
     finally:
+        if web is not None:
+            web.stop()
         if server is not None:
             server.stop()
         lock.release()

@@ -20,6 +20,7 @@ repo = "acts-project/husk-test"
 lock_path = "/tmp/huskd.lock"
 state_path = "/tmp/huskd-state.json"   # same-host fallback snapshot file (a JSON list, one entry per pool)
 http_addr = "127.0.0.1:9100"           # huskd serves /status /metrics /healthz; "0.0.0.0:9100" to expose; "" to disable
+# web_addr = "127.0.0.1:9180"          # optional live web dashboard (Quart+SSE); needs the 'web' extra: pip install 'husk[web]'
 shrink_ticks = 3                       # sustained-surplus ticks before ramp-down
 
 # ───────────────────────────── pool 1: OpenStack CPU ─────────────────────────

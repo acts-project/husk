@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block headerextra %}<span class="dim">live via SSE</span>{% endblock %}
+{% block body %}<div id="pools"></div>{% endblock %}
+{% block scripts %}
+<script>
+const STATES = ["idle","busy","starting","needs_recycle","unhealthy","error"];
+
+const ago = e => { const s = Math.max(0, Date.now()/1000 - e);
+  return s<90 ? Math.round(s)+"s ago" : s<5400 ? Math.round(s/60)+"m ago" : (s/3600).toFixed(1)+"h ago"; };
+const secs = v => v==null ? "-" : Math.round(v)+"s";
+const pct = v => v==null ? "-" : Math.round(v*100)+"%";
+const esc = s => (s==null ? "" : ""+s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+
+function poolHtml(p) {
+  const stale = (Date.now()/1000 - p.last_reconcile_epoch) > 60;
+  const counts = STATES.map(s => `<span class="s-${s}">${s}=${p.counts[s]||0}</span>`).join("");
+  let body;
+  if (!p.slots.length) {
+    body = `<div class="empty">(no managed slots)</div>`;
+  } else {
+    const rows = p.slots.slice()
+      .sort((a,b) => (a.name+a.id).localeCompare(b.name+b.id))
+      .map(v => `
+        <tr>
+          <td>${esc(v.id)}</td><td>${esc(v.name)}</td>
+          <td class="s-${v.state}">${esc(v.state)}</td>
+          <td>${esc(v.status)}</td><td>${esc(v.task_state||"-")}</td>
+          <td>${esc(v.runner||"-")}</td>
+          <td>${v.runner_status ? (v.runner_status==="online"
+                ? '<span class="s-idle">online</span>'
+                : '<span class="dim">'+esc(v.runner_status)+'</span>') : "-"}</td>
+          <td>${v.busy ? '<span class="s-busy">yes</span>' : "-"}</td>
+          <td class="num">${v.cycle}</td>
+          <td class="num">${secs(v.cloudinit_seconds)}</td>
+          <td class="num">${secs(v.recycle_seconds)}</td>
+          <td class="num">${pct(v.live_fraction)}</td>
+        </tr>`).join("");
+    body = `<table><thead><tr>
+        <th>ID</th><th>NAME</th><th>STATE</th><th>NOVA</th><th>TASK</th>
+        <th>RUNNER</th><th>RUNNER ST</th><th>BUSY</th>
+        <th class="num">CYCLE</th><th class="num">CLOUD_INIT</th>
+        <th class="num">RECYCLE</th><th class="num">LIVE%</th>
+      </tr></thead><tbody>${rows}</tbody></table>`;
+  }
+  return `<section class="pool"><div class="head">
+      <span class="name">${esc(p.backend)}</span>
+      <span class="meta">desired=${p.desired_total} min_ready=${p.min_ready} max_total=${p.max_total}</span>
+      <span class="meta ${stale ? "stale" : ""}">updated ${ago(p.last_reconcile_epoch)}${stale ? " — stale?" : ""} · gen ${p.generation}</span>
+      <span class="counts">${counts}</span>
+    </div>${body}</section>`;
+}
+
+function render(pools) {
+  document.getElementById("pools").innerHTML =
+    pools.map(poolHtml).join("") || `<div class="empty" style="margin:16px">no pools</div>`;
+}
+
+const conn = document.getElementById("conn");
+const es = new EventSource("/events");
+es.onmessage = e => {
+  try { render(JSON.parse(e.data)); conn.innerHTML = '<span class="ok">●</span> live'; }
+  catch (err) { /* ignore a malformed frame; next push corrects it */ }
+};
+es.onerror = () => { conn.innerHTML = '<span class="bad">●</span> reconnecting…'; };
+</script>
+{% endblock %}
