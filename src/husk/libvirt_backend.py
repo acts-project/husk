@@ -23,12 +23,23 @@ import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 
 from husk import libvirt_xml as lx
 from husk.backend import BackendError, ListSlotsError
 from husk.config import BackendConfig, HostConfig
-from husk.image_sync import ImageSync
+from husk.image_sync import BackgroundImagePreparer, ImageSync
 from husk.slot import Capacity, Slot
+
+
+@dataclass(frozen=True)
+class _GoldenPrepared:
+    """An OCI golden pulled + pushed to every host that uses its ref, ready for
+    the tick thread to adopt (point each host's current image at it)."""
+
+    digest: str
+    golden: str  # the digest-named filename now present in each host pool
+
 
 log = logging.getLogger("husk.libvirt")
 
@@ -129,6 +140,10 @@ class LibvirtBackend:
         # Per-host ref last successfully synced, so sync_images is a cheap no-op
         # each tick until the configured ref actually changes.
         self._synced_ref: dict[str, str] = {}
+        # Heavy staging (oras pull + scp to each host) runs off the reconcile
+        # thread; the tick only adopts a ready result (points each host's current
+        # image at the staged golden).
+        self._preparer = BackgroundImagePreparer(self._prepare_image)
         self._hosts: dict[str, _HostConn] = {}
         for h in cfg.hosts:
             if h.gpu_pci_addresses and h.max_slots is not None:
@@ -314,21 +329,22 @@ class LibvirtBackend:
 
     # ----------------------------------------------------------- image sync
     def sync_images(self, cfg: BackendConfig | None = None) -> None:
-        """Ensure each host holds the configured golden image, then GC orphans.
+        """Adopt the configured golden on each host once it's staged, then GC
+        orphans.
 
-        Called once at startup and once per tick (the controller's only coupling
-        to image delivery). Cheap when nothing changed: it short-circuits a host
-        whose effective ref is already synced. When the ref changes (config
-        hot-reload) it `oras pull`s the new image to the controller cache and
-        scp's it to each host — that one tick may block for the transfer, which is
-        why the new digest is logged loudly.
+        Non-blocking: the controller's only coupling to image delivery, called
+        once per tick. The slow work (oras pull + scp to each host) runs on a
+        background thread (`_prepare_image`); a tick just adopts a ready result
+        and otherwise keeps serving the current golden, so a multi-GB transfer
+        never stalls the reconcile loop. Cheap when nothing changed: it
+        short-circuits a host whose effective ref is already adopted.
 
         Hosts on the manual/local-file path (no ref) are skipped entirely. The
         backend-level ref can be hot-reloaded; per-host `image_ref` overrides are
         read once at construction (changing one needs a restart)."""
         if cfg is not None and (cfg.image_ref or "") != self._backend_ref:
             log.info(
-                "image ref changed: %r -> %r (syncing; this tick may take a while)",
+                "image ref changed: %r -> %r (staging in the background)",
                 self._backend_ref,
                 cfg.image_ref,
             )
@@ -339,14 +355,26 @@ class LibvirtBackend:
                 continue  # manual/local-file host — nothing to pull
             if self._synced_ref.get(name) == ref and host.image_digest:
                 continue  # already current
-            resolved = self._sync.resolve(ref)
-            golden = f"husk-golden-{resolved.short}.qcow2"
-            self._ensure_on_host(host, resolved.local_path, golden)
-            host.image = golden
-            host.image_digest = resolved.digest
+            prepared = self._preparer.ready(ref)
+            if prepared is None:
+                continue  # still staging in the background — keep current golden
+            host.image = prepared.golden
+            host.image_digest = prepared.digest
             self._synced_ref[name] = ref
-            log.info("host %s now serving %s (%s)", name, ref, resolved.short)
+            log.info("host %s now serving %s (%s)", name, ref, prepared.golden)
         self._gc_goldens()
+
+    def _prepare_image(self, ref: str) -> _GoldenPrepared:
+        """Heavy staging (background thread): pull the OCI golden to the controller
+        cache and scp it into the pool of every host that uses this ref. Returns
+        what the tick adopts; it does NOT touch live host fields (only the tick
+        thread does, in sync_images)."""
+        resolved = self._sync.resolve(ref)
+        golden = f"husk-golden-{resolved.short}.qcow2"
+        for host in self._hosts.values():
+            if (host.cfg.image_ref or self._backend_ref) == ref:
+                self._ensure_on_host(host, resolved.local_path, golden)
+        return _GoldenPrepared(digest=resolved.digest, golden=golden)
 
     def _ensure_on_host(self, host: _HostConn, local_path: str, golden: str) -> None:
         """Place `local_path` into the host pool as `golden`, if not already there.
@@ -445,6 +473,11 @@ class LibvirtBackend:
             raise BackendError("no free slot-units across host pool")
         host_name, unit = placed
         host = self._hosts[host_name]
+        # In OCI mode the golden is staged asynchronously; until it lands the host
+        # has no current image to back an overlay. Fail clean (the controller logs
+        # and retries next tick) rather than building off a missing/old golden.
+        if (host.cfg.image_ref or self._backend_ref) and host.image_digest is None:
+            raise BackendError(f"host {host_name} image not staged yet; deferring")
         conn = host.conn()
 
         overlay = self._make_overlay(host, name)

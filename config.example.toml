@@ -24,18 +24,34 @@ shrink_ticks = 3                       # sustained-surplus ticks before ramp-dow
 version = "2.334.0"
 labels = ["self-hosted", "linux", "x64", "husk-phase3"]
 runner_group_id = 1
+# prebaked = true  # set ONLY when image_ref (below) points at a husk golden image:
+#                  # cloud-init then skips the runner/podman install (all baked) and
+#                  # `version` above must match the image's husk.runner.version.
 
 [backend]
 name = "openstack-cern"
 type = "openstack"
 cloud = "cern"                         # clouds.yaml profile (app credential)
-image_name = "ALMA10 - x86_64"
 flavor_name = "m2.small"
 network_name = "CERN_NETWORK"
 keypair = "acts-gha"
 rebuild_microversion = "2.79"
 min_ready = 1
 max_total = 2
+
+# Image source — pick ONE:
+#  (a) image_name: an existing Glance image, resolved by name (the classic path —
+#      stock ALMA10 + cloud-init installs the runner/podman stack each boot).
+image_name = "ALMA10 - x86_64"
+#
+#  (b) image_ref: an OCI golden built by build-images.yml on ghcr — the SAME
+#      artifact the libvirt hosts use. huskd `oras pull`s it once to a local cache
+#      and uploads the qcow2 to Glance as `husk-golden-<digest>` (idempotent on
+#      digest). Editing this while huskd runs hot-reloads: the new image is
+#      uploaded and idle slots drain onto it (running jobs finish first), then the
+#      superseded Glance image is GC'd. Pair with [runner] prebaked = true.
+# image_ref = "ghcr.io/acts-project/husk-base:v1"
+# image_cache_dir = "/var/cache/husk/images"   # optional; default ~/.cache/husk/images
 
 [timeouts]
 poll_interval_sec = 30

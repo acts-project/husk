@@ -9,13 +9,16 @@ dependencies = [
     "typer>=0.12",
     "pydantic-settings>=2",
     "rich>=13",
+    # Pure-Python OCI client for pulling golden VM images (no oras CLI dep). Shared
+    # by BOTH backends now — the controller pulls one qcow2 and fans it to libvirt
+    # hosts *and* uploads it to Glance — so it lives in base deps, not an extra.
+    "oras>=0.2",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff>=0.15"]
 # libvirt backend — kept optional so the OpenStack/CI path needs no libvirt headers.
-# `oras` is the pure-Python OCI client used to pull golden images (no oras CLI dep).
-libvirt = ["libvirt-python>=10", "oras>=0.2"]
+libvirt = ["libvirt-python>=10"]
 
 [project.scripts]
 huskd = "husk.cli:huskd"
