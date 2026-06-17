@@ -369,10 +369,22 @@ def run(
     server = None
     try:
         # One Controller per pool. The facade owns publish + HTTP + reload, so the
-        # sub-controllers get blanked state_path/http_addr and no reload hook.
+        # sub-controllers get blanked state_path/http_addr and no reload hook. A pool
+        # that can't be built (bad backend config, unreachable cloud) is skipped with
+        # a loud error rather than taking the whole daemon down — the other pools run.
         controllers = []
         for cfg in cfgs:
-            backend, github = _build(cfg)
+            try:
+                backend, github = _build(cfg)
+            except Exception as e:
+                typer.echo(
+                    f"pool {cfg.backend.name!r} failed to start, skipping: {e}",
+                    err=True,
+                )
+                logging.getLogger("husk").error(
+                    "pool %s failed to build; skipping", cfg.backend.name, exc_info=True
+                )
+                continue
             sub = dataclasses.replace(
                 cfg,
                 controller=dataclasses.replace(
@@ -380,6 +392,9 @@ def run(
                 ),
             )
             controllers.append(Controller(backend, github, sub))
+        if not controllers:
+            typer.echo("no pools could be started", err=True)
+            raise typer.Exit(code=1)
         facade = MultiPoolController(
             controllers,
             state_path=shared.state_path,
