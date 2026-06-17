@@ -414,13 +414,40 @@ class LibvirtBackend:
         if present == b"y":
             log.debug("host %s already has %s", host.cfg.name, golden)
             return
+        # Stable tmp name within this process so a retried/resumed push reuses the
+        # same partial file rather than starting a fresh one each attempt.
         tmp = f"{remote}.tmp.{os.getpid()}"
-        log.info("pushing %s to host %s", golden, host.cfg.name)
+        try:
+            size: int | None = os.path.getsize(local_path)
+        except OSError:
+            size = None  # can't read the source → skip the size check below
+        log.info(
+            "staging %s%s to host %s",
+            golden,
+            f" ({size >> 20} MiB)" if size else "",
+            host.cfg.name,
+        )
         if host.cfg.ssh_target:
             self._push_file(host, local_path, tmp)
         else:  # local host: a plain copy within the same filesystem
             self._ssh(host, f"cp {shlex.quote(local_path)} {shlex.quote(tmp)}")
+        # Verify the whole file landed before publishing it — never `mv` a truncated
+        # transfer into place (an interrupted push retries/resumes next tick). A
+        # size mismatch raises, so the preparer records a failure and retries.
+        if size is not None:
+            got = int(
+                self._ssh(
+                    host, f"stat -c%s {shlex.quote(tmp)} 2>/dev/null || echo 0"
+                ).strip()
+                or b"0"
+            )
+            if got != size:
+                raise BackendError(
+                    f"golden {golden} transfer to {host.cfg.name} incomplete "
+                    f"({got}/{size} bytes); will resume"
+                )
         self._ssh(host, f"mv {shlex.quote(tmp)} {shlex.quote(remote)}")
+        log.info("staged %s on host %s", golden, host.cfg.name)
 
     def _push_file(self, host: _HostConn, local_path: str, remote_path: str) -> None:
         argv = [

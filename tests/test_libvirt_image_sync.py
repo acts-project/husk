@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from husk.backend import BackendError
 from husk.config import BackendConfig, HostConfig
 from husk.image_sync import ResolvedImage
 
@@ -190,6 +191,43 @@ def test_list_slots_filters_by_pool():
     ]
     slots = b.list_slots()
     assert [s.name for s in slots] == ["husk-lv-1"]  # only this pool's domain
+
+
+def test_push_rejects_truncated_transfer(tmp_path):
+    # A transfer whose landed size != the source size must NOT be published as a
+    # usable golden — it raises (the preparer retries/resumes), and a complete
+    # transfer proceeds to the atomic mv.
+    b = _backend()
+    host = b._hosts["h1"]
+    src = tmp_path / "img.qcow2"
+    src.write_bytes(b"x" * 2048)
+    b._push_file = lambda host, local, remote: None  # pretend the push happened
+
+    def ssh_truncated(host, cmd, data=None):
+        if cmd.startswith("test -s"):
+            return b"n\n"
+        if cmd.startswith("stat -c%s"):
+            return b"1024\n"  # only half arrived
+        return b""
+
+    b._ssh = ssh_truncated
+    with pytest.raises(BackendError, match="incomplete"):
+        b._ensure_on_host(host, str(src), "husk-golden-x.qcow2")
+
+    moved = []
+
+    def ssh_complete(host, cmd, data=None):
+        if cmd.startswith("test -s"):
+            return b"n\n"
+        if cmd.startswith("stat -c%s"):
+            return b"2048\n"  # full file landed
+        if cmd.startswith("mv "):
+            moved.append(cmd)
+        return b""
+
+    b._ssh = ssh_complete
+    b._ensure_on_host(host, str(src), "husk-golden-x.qcow2")
+    assert moved  # published only after the size check passed
 
 
 def test_capacity_is_zero_until_image_staged():
