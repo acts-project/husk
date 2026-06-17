@@ -236,6 +236,34 @@ def test_read_state_missing_returns_none(tmp_path):
     assert read_state(str(tmp_path / "nope.json")) is None
 
 
+def _named_snap(backend: str):
+    return ControllerState.from_classified(
+        generation=1,
+        backend=backend,
+        min_ready=1,
+        max_total=2,
+        desired_total=2,
+        classified=[(make_slot(name=f"{backend}-1"), make_runner(), SlotState.IDLE)],
+    )
+
+
+def test_write_then_read_states_roundtrip(tmp_path):
+    from husk.snapshot import read_states, write_states
+
+    snaps = [_named_snap("openstack-cpu"), _named_snap("libvirt-gpu")]
+    path = str(tmp_path / "state.json")
+    write_states(path, snaps)
+    loaded = read_states(path)
+    assert [s.backend for s in loaded] == ["openstack-cpu", "libvirt-gpu"]
+    assert [s.to_dict() for s in loaded] == [s.to_dict() for s in snaps]
+
+
+def test_read_states_missing_returns_empty(tmp_path):
+    from husk.snapshot import read_states
+
+    assert read_states(str(tmp_path / "nope.json")) == []
+
+
 def test_controller_publishes_state(tmp_path, clock):
     # huskd's tick writes the published snapshot that huskctl status reads.
     from dataclasses import replace
