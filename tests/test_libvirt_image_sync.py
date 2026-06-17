@@ -134,6 +134,31 @@ def test_gc_removes_only_unreferenced_goldens():
     assert "cccccccccccc" not in removed[0]
 
 
+class _FakeDom:
+    def __init__(self, uuid: str, name: str) -> None:
+        self._uuid, self._name = uuid, name
+
+    def state(self):
+        return (1, 0)  # VIR_DOMAIN_RUNNING → ACTIVE
+
+    def UUIDString(self):
+        return self._uuid
+
+    def name(self):
+        return self._name
+
+
+def test_list_slots_filters_by_pool():
+    b = _backend()  # backend name "lv" → self._pool == "lv"
+    b._list_raw = lambda: [
+        ("h1", _FakeDom("u1", "husk-lv-1"), {"pool": "lv", "unit": "cpu0"}),
+        ("h1", _FakeDom("u2", "other-1"), {"pool": "other-pool", "unit": "cpu1"}),
+        ("h1", _FakeDom("u3", "legacy"), {"pool": None, "unit": "cpu2"}),
+    ]
+    slots = b.list_slots()
+    assert [s.name for s in slots] == ["husk-lv-1"]  # only this pool's domain
+
+
 def test_no_image_source_is_rejected():
     cfg = BackendConfig(
         name="lv",

@@ -135,6 +135,7 @@ class LibvirtBackend:
                 "libvirt backend requires at least one [[backend.hosts]]"
             )
         self.cfg = cfg
+        self._pool = cfg.name  # stamped into domain metadata; scopes list_slots
         self._sync = ImageSync(cfg.image_cache_dir or None)
         self._backend_ref = cfg.image_ref or ""
         # Per-host ref last successfully synced, so sync_images is a cheap no-op
@@ -269,6 +270,7 @@ class LibvirtBackend:
             created_at=created_at,
             unit=unit,
             image_digest=image_digest,
+            pool=self._pool,
         )
         dom.setMetadata(
             libvirt.VIR_DOMAIN_METADATA_ELEMENT, meta, "husk", lx.HUSK_NS, 0
@@ -461,9 +463,19 @@ class LibvirtBackend:
             raw = self._list_raw()
         except Exception as e:  # libvirt/SSH/network — MUST raise, never []
             raise ListSlotsError(f"list domains failed: {e}") from e
-        slots = [self._slot(hn, dom, meta) for hn, dom, meta in raw]
+        # Only this pool's domains (two pools can share a host). Placement/capacity
+        # still consider ALL husk domains on the host (see _occupied) so a GPU unit
+        # is never double-assigned across pools.
+        slots = [
+            self._slot(hn, dom, meta)
+            for hn, dom, meta in raw
+            if meta.get("pool") == self._pool
+        ]
         log.debug(
-            "listed %d managed slot(s) across %d host(s)", len(slots), len(self._hosts)
+            "listed %d managed slot(s) for pool %s across %d host(s)",
+            len(slots),
+            self._pool,
+            len(self._hosts),
         )
         return slots
 
@@ -490,6 +502,7 @@ class LibvirtBackend:
             created_at=now,
             unit=unit,
             image_digest=host.image_digest,
+            pool=self._pool,
         )
         xml = lx.domain_xml(
             name=name,

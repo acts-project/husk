@@ -109,6 +109,7 @@ def test_metadata_roundtrip():
         created_at=1699999000.0,
         unit="0000:01:00.0",
         image_digest="sha256:abc123",
+        pool="libvirt-gpu",
     )
     got = lx.parse_metadata(xml)
     assert got == {
@@ -118,7 +119,16 @@ def test_metadata_roundtrip():
         "provisioned_at": 1700000000.0,
         "created_at": 1699999000.0,
         "image_digest": "sha256:abc123",
+        "pool": "libvirt-gpu",
     }
+
+
+def test_metadata_omits_pool_when_absent():
+    # A domain stamped before pool-scoping (or the manual path) carries no <pool>
+    # → parsed pool reads None.
+    xml = lx.metadata_xml(cycle=0, provisioned_at=1.0, created_at=1.0, unit="cpu0")
+    assert "<pool>" not in xml
+    assert lx.parse_metadata(xml)["pool"] is None
 
 
 def test_metadata_omits_image_digest_when_absent():
@@ -145,6 +155,7 @@ def test_parse_metadata_handles_libvirt_denamespaced_form():
         "provisioned_at": 1700000000.0,
         "created_at": 1699999000.0,
         "image_digest": None,  # pre-pipeline domains carry no digest
+        "pool": None,  # pre-scoping domains carry no pool
     }
 
 
