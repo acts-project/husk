@@ -1,21 +1,22 @@
-"""PAT resolution + env-override precedence in load_config."""
+"""PAT resolution + env-override precedence + the [[pool]] schema in load_config(s)."""
 
 from __future__ import annotations
 
 import pytest
 
-from husk.config import load_config
+from husk.config import load_config, load_configs
 
 _TOML = """
 [github]
 repo = "acts-project/husk-test"
 {extra}
-[runner]
+[[pool]]
+name = "openstack-cern"
+[pool.runner]
 version = "2.334.0"
 labels = ["self-hosted"]
 runner_group_id = 1
-[backend]
-name = "openstack-cern"
+[pool.backend]
 cloud = "cern"
 image_name = "ALMA10 - x86_64"
 flavor_name = "m2.small"
@@ -65,6 +66,94 @@ def test_fail_closed_when_no_pat(tmp_path):
         load_config(_write(tmp_path))
 
 
+def test_pool_name_drives_backend_name_and_vm_prefix(tmp_path, monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "ghp_x")
+    cfg = load_config(_write(tmp_path))
+    assert cfg.backend.name == "openstack-cern"  # from pool name
+    assert cfg.backend.vm_prefix == "husk-openstack-cern"  # derived default
+
+
+# ------------------------------------------------------------------- multi-pool
+_MULTI_TOML = """
+[github]
+repo = "acts-project/husk-test"
+[controller]
+http_addr = "127.0.0.1:9100"
+
+[[pool]]
+name = "openstack-cpu"
+[pool.runner]
+version = "2.334.0"
+labels = ["self-hosted", "husk-cpu"]
+[pool.backend]
+type = "openstack"
+cloud = "cern"
+image_name = "ALMA10 - x86_64"
+flavor_name = "m2.small"
+network_name = "CERN_NETWORK"
+min_ready = 2
+max_total = 4
+
+[[pool]]
+name = "libvirt-gpu"
+[pool.runner]
+version = "2.334.0"
+labels = ["self-hosted", "gpu"]
+gpu = true
+prebaked = true
+[pool.backend]
+type = "libvirt"
+image_ref = "ghcr.io/acts-project/husk-gpu:v1"
+min_ready = 1
+max_total = 1
+[[pool.backend.hosts]]
+name = "lenovo-gpu"
+libvirt_uri = "qemu+ssh://paul@GpuBox/system"
+gpu_pci_addresses = ["0000:01:00.0"]
+"""
+
+
+def test_load_configs_two_pools_share_github_and_controller(tmp_path, monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "ghp_x")
+    p = tmp_path / "multi.toml"
+    p.write_text(_MULTI_TOML)
+    cfgs = load_configs(str(p))
+
+    assert [c.backend.name for c in cfgs] == ["openstack-cpu", "libvirt-gpu"]
+    assert [c.backend.vm_prefix for c in cfgs] == [
+        "husk-openstack-cpu",
+        "husk-libvirt-gpu",
+    ]
+    # Shared sections are identical across pools.
+    assert cfgs[0].github == cfgs[1].github
+    assert cfgs[0].controller == cfgs[1].controller
+    # Per-pool knobs differ.
+    cpu, gpu = cfgs
+    assert cpu.backend.type == "openstack" and cpu.backend.min_ready == 2
+    assert gpu.backend.type == "libvirt" and gpu.runner.gpu and gpu.runner.prebaked
+    assert gpu.backend.hosts[0].gpu_pci_addresses == ("0000:01:00.0",)
+
+
+def test_no_pool_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "ghp_x")
+    p = tmp_path / "empty.toml"
+    p.write_text('[github]\nrepo = "acts-project/husk-test"\n')
+    with pytest.raises(RuntimeError, match="no \\[\\[pool\\]\\] defined"):
+        load_configs(str(p))
+
+
+def test_duplicate_pool_name_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "ghp_x")
+    p = tmp_path / "dup.toml"
+    p.write_text(
+        '[github]\nrepo = "r"\n'
+        '[[pool]]\nname = "dup"\n[pool.runner]\nversion="1"\nlabels=["a"]\n'
+        '[[pool]]\nname = "dup"\n[pool.runner]\nversion="1"\nlabels=["b"]\n'
+    )
+    with pytest.raises(RuntimeError, match="duplicate pool name"):
+        load_configs(str(p))
+
+
 # ------------------------------------------------------------------- libvirt
 def test_ssh_target_from_uri_preserves_case_and_strips_port():
     from husk.config import _ssh_target_from_uri
@@ -77,33 +166,11 @@ def test_ssh_target_from_uri_preserves_case_and_strips_port():
     assert _ssh_target_from_uri("qemu:///system") == ""
 
 
-_LIBVIRT_TOML = """
-[github]
-repo = "acts-project/husk-test"
-[runner]
-version = "2.334.0"
-labels = ["self-hosted", "gpu"]
-runner_group_id = 1
-[backend]
-name = "libvirt-gpu"
-type = "libvirt"
-image_name = "husk-gpu-golden.qcow2"
-min_ready = 1
-max_total = 1
-[[backend.hosts]]
-name = "fedora-gpu-01"
-libvirt_uri = "qemu+ssh://paul@GpuBox/system"
-memory_mb = 8192
-vcpus = 8
-gpu_pci_addresses = ["0000:01:00.0"]
-"""
-
-
 def test_libvirt_config_parses_host_pool(tmp_path, monkeypatch):
     monkeypatch.setenv("GH_TOKEN", "ghp_x")
-    p = tmp_path / "lv.toml"
-    p.write_text(_LIBVIRT_TOML)
-    cfg = load_config(str(p))
+    p = tmp_path / "multi.toml"
+    p.write_text(_MULTI_TOML)
+    cfg = load_configs(str(p))[1]  # the libvirt-gpu pool
     assert cfg.backend.type == "libvirt"
     assert len(cfg.backend.hosts) == 1
     h = cfg.backend.hosts[0]

@@ -1,35 +1,42 @@
-# Husk controller config. Precedence: env (HUSK_*) > this file > defaults.
-# Log verbosity: --log-level DEBUG (or -l), or $HUSK_LOG_LEVEL (default INFO) —
-# affects only the husk logger; third-party libs (keystoneauth, urllib3, ...)
-# stay at WARNING unless you raise $HUSK_ROOT_LOG_LEVEL.
-# Env override examples:
-#   HUSK_BACKEND__MIN_READY=2  HUSK_GITHUB__REPO=acts-project/foo
+# Husk controller config — ONE huskd driving N pools. Precedence for the shared
+# [github]/[controller] sections: env (HUSK_*) > this file > defaults. Per-pool
+# knobs ([[pool]]) are TOML-only.
+#
+# This example runs TWO pools at once: an OpenStack CPU pool and a libvirt GPU
+# pool. A single-backend setup is just one [[pool]] (see config.libvirt.example.toml).
+#
+# Log verbosity: --log-level DEBUG (or -l), or $HUSK_LOG_LEVEL (default INFO).
 # The GitHub PAT is NOT stored here. It is resolved in priority order:
 #   1. $HUSK_GITHUB__PAT            (explicit override)
 #   2. $GH_TOKEN                    (local dev — just `export GH_TOKEN=ghp_...`)
 #   3. [github].pat_path file       (k8s Secret mount, 0400)
 
-[github]
+[github]                               # shared: one repo + PAT for every pool
 repo = "acts-project/husk-test"
-# pat_env = "GH_TOKEN"              # env var name for local dev (this is the default)
-# pat_path = "/etc/husk/github-pat" # k8s Secret mount
+# pat_env = "GH_TOKEN"               # env var name for local dev (this is the default)
+# pat_path = "/etc/husk/github-pat"  # k8s Secret mount
 
-[controller]
+[controller]                           # shared: one lock / state / http per daemon
 lock_path = "/tmp/huskd.lock"
-state_path = "/tmp/huskd-state.json"   # same-host fallback snapshot file
+state_path = "/tmp/huskd-state.json"   # same-host fallback snapshot file (a JSON list, one entry per pool)
 http_addr = "127.0.0.1:9100"           # huskd serves /status /metrics /healthz; "0.0.0.0:9100" to expose; "" to disable
 shrink_ticks = 3                       # sustained-surplus ticks before ramp-down
 
-[runner]
-version = "2.334.0"
-labels = ["self-hosted", "linux", "x64", "husk-phase3"]
-runner_group_id = 1
-# prebaked = true  # set ONLY when image_ref (below) points at a husk golden image:
-#                  # cloud-init then skips the runner/podman install (all baked) and
-#                  # `version` above must match the image's husk.runner.version.
+# ───────────────────────────── pool 1: OpenStack CPU ─────────────────────────
+# `name` is the pool identity: it becomes the backend name AND the default
+# vm_prefix (husk-<slug(name)>). Pools MUST have distinct names — GitHub's runner
+# APIs are repo-wide, so isolation relies on pool-unique VM/runner names + labels.
+[[pool]]
+name = "openstack-cpu"
 
-[backend]
-name = "openstack-cern"
+[pool.runner]
+version = "2.334.0"
+labels = ["self-hosted", "linux", "x64", "husk-cpu"]   # jobs route here via these labels
+runner_group_id = 1
+# prebaked = true  # set ONLY when image_ref points at a husk golden: cloud-init then
+#                  # skips the runner/podman install and `version` must match the image.
+
+[pool.backend]
 type = "openstack"
 cloud = "cern"                         # clouds.yaml profile (app credential)
 flavor_name = "m2.small"
@@ -38,23 +45,53 @@ keypair = "acts-gha"
 rebuild_microversion = "2.79"
 min_ready = 1
 max_total = 2
-
 # Image source — pick ONE:
-#  (a) image_name: an existing Glance image, resolved by name (the classic path —
-#      stock ALMA10 + cloud-init installs the runner/podman stack each boot).
+#  (a) image_name: an existing Glance image (stock ALMA10 + cloud-init installs the stack).
 image_name = "ALMA10 - x86_64"
-#
-#  (b) image_ref: an OCI golden built by build-images.yml on ghcr — the SAME
-#      artifact the libvirt hosts use. huskd `oras pull`s it once to a local cache
-#      and uploads the qcow2 to Glance as `husk-golden-<digest>` (idempotent on
-#      digest). Editing this while huskd runs hot-reloads: the new image is
-#      uploaded and idle slots drain onto it (running jobs finish first), then the
-#      superseded Glance image is GC'd. Pair with [runner] prebaked = true.
+#  (b) image_ref: an OCI golden built by build-images.yml on ghcr — the SAME artifact the
+#      libvirt hosts use. huskd oras-pulls it and uploads it to Glance as
+#      husk-golden-<digest> (idempotent); hot-reloads + drains on a ref change. Pair with
+#      [pool.runner] prebaked = true.
 # image_ref = "ghcr.io/acts-project/husk-base:v1"
-# image_cache_dir = "/var/cache/husk/images"   # optional; default ~/.cache/husk/images
 
-[timeouts]
+[pool.timeouts]
 poll_interval_sec = 30
 idle_timeout_sec = 1800                # rebuild idle slots to refresh credentials
 startup_grace_sec = 300               # post-rebuild grace for the runner to register
 max_job_duration_sec = 21600          # 6h — stop (not destroy) busy slots beyond this
+
+# ───────────────────────────── pool 2: libvirt GPU ──────────────────────────
+[[pool]]
+name = "libvirt-gpu"
+
+[pool.runner]
+version = "2.334.0"
+labels = ["self-hosted", "linux", "x64", "gpu"]   # jobs route here via "gpu"
+runner_group_id = 1
+gpu = true                             # activate the NVIDIA driver (modprobe + CDI) each boot
+prebaked = true                        # husk-gpu golden: skip install (version must match the image)
+
+[pool.backend]
+type = "libvirt"
+min_ready = 1
+max_total = 1                          # one GPU host, one GPU → 1 (raise as the pool grows)
+image_ref = "ghcr.io/acts-project/husk-gpu:v1"   # oras-pulled + scp'd to each host by digest
+# image_cache_dir = "/var/cache/husk/images"     # optional; default ~/.cache/husk/images
+
+# One entry per VM-host. GPU host: list gpu_pci_addresses (one slot per GPU).
+# CPU host: omit them and set max_slots (default 1). Setting both is rejected.
+[[pool.backend.hosts]]
+name = "fedora-gpu-01"
+libvirt_uri = "qemu+ssh://USER@HOST/system"
+# ssh_target = "USER@HOST"             # optional; derived from libvirt_uri if omitted
+pool = "husk"
+network = "default"
+memory_mb = 8192
+vcpus = 8
+gpu_pci_addresses = ["0000:01:00.0"]   # → one slot, GPU passed through via <hostdev>
+
+[pool.timeouts]
+poll_interval_sec = 30
+idle_timeout_sec = 1800
+startup_grace_sec = 300
+max_job_duration_sec = 21600

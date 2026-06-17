@@ -8,8 +8,15 @@ loading boundary only (see `load_config`), never to the hot-path value objects.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
+
+
+def _slug(name: str) -> str:
+    """A short, name-safe pool tag for the default vm_prefix (`husk-<slug>`)."""
+    s = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return s or "pool"
 
 
 def _ssh_target_from_uri(uri: str) -> str:
@@ -126,16 +133,27 @@ class Config:
 
 
 def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
-    """Build `Config` from a TOML file, overlaid by env vars, with the PAT read
-    from a file (k8s Secret mount). Precedence: **env > TOML > defaults**.
+    """Convenience for the single-pool / one-shot CLI paths: the first pool's
+    `Config`. Most code should use `load_configs` (huskd drives every pool)."""
+    return load_configs(path, secrets_dir=secrets_dir)[0]
 
-    pydantic-settings is imported lazily here so the rest of the package (and the
-    unit tests) stay pydantic-free; pydantic is scoped to this loading boundary.
+
+def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
+    """Build one `Config` per `[[pool]]` from a TOML file, overlaid by env vars,
+    with the PAT read from a file (k8s Secret mount). Precedence for the shared
+    `[github]`/`[controller]` sections: **env > TOML > defaults**; per-pool knobs
+    are TOML-only.
+
+    Each pool yields a normal `Config` carrying the shared `github`+`controller`
+    (so the `Controller` is unaware of multi-pool) plus its own `runner`/`backend`/
+    `timeouts`. Pools must have unique names and `vm_prefix` (the cross-pool
+    isolation invariant). pydantic-settings is imported lazily here so the rest of
+    the package stays pydantic-free.
     """
     import os
     from pathlib import Path
 
-    from pydantic import BaseModel
+    from pydantic import BaseModel, Field
     from pydantic_settings import (
         BaseSettings,
         PydanticBaseSettingsSource,
@@ -170,9 +188,9 @@ def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
         image_ref: str | None = None
 
     class _Backend(BaseModel):
-        name: str
+        name: str = ""  # defaults to the pool name
         type: str = "openstack"
-        vm_prefix: str = "husk"
+        vm_prefix: str = ""  # defaults to husk-<slug(pool name)>
         image_name: str = ""
         image_ref: str = ""
         image_cache_dir: str = ""
@@ -193,6 +211,12 @@ def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
         startup_grace_sec: float = 300
         max_job_duration_sec: float = 21600
 
+    class _Pool(BaseModel):
+        name: str  # pool identity → backend.name + default vm_prefix
+        runner: _Runner
+        backend: _Backend = Field(default_factory=_Backend)
+        timeouts: _Timeouts = Field(default_factory=_Timeouts)
+
     class _Controller(BaseModel):
         lock_path: str = "/tmp/huskd.lock"
         state_path: str = "/tmp/huskd-state.json"
@@ -207,10 +231,8 @@ def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
             extra="ignore",
         )
         github: _Github
-        runner: _Runner
-        backend: _Backend
-        timeouts: _Timeouts = _Timeouts()
-        controller: _Controller = _Controller()
+        controller: _Controller = Field(default_factory=_Controller)
+        pool: list[_Pool] = []
 
         @classmethod
         def settings_customise_sources(
@@ -249,56 +271,84 @@ def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
             "or [github].pat_path (a file path, e.g. a mounted k8s Secret)"
         )
 
+    if not s.pool:
+        raise RuntimeError(
+            "no [[pool]] defined: huskd needs at least one pool (each with its own "
+            "[pool.runner] and [pool.backend])"
+        )
+
+    # Shared across every pool — one repo+PAT, one lock/state/http per daemon.
+    github = GithubConfig(repo=s.github.repo, token=token)
+    controller = ControllerConfig(
+        lock_path=s.controller.lock_path,
+        state_path=s.controller.state_path,
+        http_addr=s.controller.http_addr,
+        shrink_ticks=s.controller.shrink_ticks,
+    )
+
+    configs = [_pool_config(p, github, controller) for p in s.pool]
+
+    names = [c.backend.name for c in configs]
+    if len(set(names)) != len(names):
+        raise RuntimeError(f"duplicate pool name across [[pool]] entries: {names}")
+    prefixes = [c.backend.vm_prefix for c in configs]
+    if len(set(prefixes)) != len(prefixes):
+        raise RuntimeError(
+            f"duplicate vm_prefix across pools: {prefixes} — pools must mint "
+            "distinct VM/runner names (GitHub runner APIs are repo-wide)"
+        )
+    return configs
+
+
+def _pool_config(p, github: GithubConfig, controller: ControllerConfig) -> Config:
+    """Assemble one pool's runtime `Config` from its parsed pydantic model `p`."""
+    b = p.backend
+    backend = BackendConfig(
+        name=b.name or p.name,
+        type=b.type,
+        vm_prefix=b.vm_prefix or f"husk-{_slug(p.name)}",
+        cloud=b.cloud,
+        image_name=b.image_name,
+        image_ref=b.image_ref,
+        image_cache_dir=b.image_cache_dir,
+        flavor_name=b.flavor_name,
+        network_name=b.network_name,
+        keypair=b.keypair,
+        rebuild_microversion=b.rebuild_microversion,
+        min_ready=b.min_ready,
+        max_total=b.max_total,
+        hosts=tuple(
+            HostConfig(
+                name=h.name,
+                libvirt_uri=h.libvirt_uri,
+                ssh_target=h.ssh_target or _ssh_target_from_uri(h.libvirt_uri),
+                pool=h.pool,
+                network=h.network,
+                memory_mb=h.memory_mb,
+                vcpus=h.vcpus,
+                gpu_pci_addresses=tuple(h.gpu_pci_addresses),
+                max_slots=h.max_slots,
+                image_name=h.image_name,
+                image_ref=h.image_ref,
+            )
+            for h in b.hosts
+        ),
+    )
     return Config(
-        github=GithubConfig(repo=s.github.repo, token=token),
+        github=github,
         runner=RunnerConfig(
-            version=s.runner.version,
-            labels=list(s.runner.labels),
-            runner_group_id=s.runner.runner_group_id,
-            gpu=s.runner.gpu,
-            prebaked=s.runner.prebaked,
+            version=p.runner.version,
+            labels=list(p.runner.labels),
+            runner_group_id=p.runner.runner_group_id,
+            gpu=p.runner.gpu,
+            prebaked=p.runner.prebaked,
         ),
-        backend=BackendConfig(
-            name=s.backend.name,
-            type=s.backend.type,
-            vm_prefix=s.backend.vm_prefix,
-            cloud=s.backend.cloud,
-            image_name=s.backend.image_name,
-            image_ref=s.backend.image_ref,
-            image_cache_dir=s.backend.image_cache_dir,
-            flavor_name=s.backend.flavor_name,
-            network_name=s.backend.network_name,
-            keypair=s.backend.keypair,
-            rebuild_microversion=s.backend.rebuild_microversion,
-            min_ready=s.backend.min_ready,
-            max_total=s.backend.max_total,
-            hosts=tuple(
-                HostConfig(
-                    name=h.name,
-                    libvirt_uri=h.libvirt_uri,
-                    ssh_target=h.ssh_target or _ssh_target_from_uri(h.libvirt_uri),
-                    pool=h.pool,
-                    network=h.network,
-                    memory_mb=h.memory_mb,
-                    vcpus=h.vcpus,
-                    gpu_pci_addresses=tuple(h.gpu_pci_addresses),
-                    max_slots=h.max_slots,
-                    image_name=h.image_name,
-                    image_ref=h.image_ref,
-                )
-                for h in s.backend.hosts
-            ),
-        ),
+        backend=backend,
         timeouts=TimeoutsConfig(
-            poll_interval_sec=s.timeouts.poll_interval_sec,
-            idle_timeout_sec=s.timeouts.idle_timeout_sec,
-            startup_grace_sec=s.timeouts.startup_grace_sec,
-            max_job_duration_sec=s.timeouts.max_job_duration_sec,
+            poll_interval_sec=p.timeouts.poll_interval_sec,
+            idle_timeout_sec=p.timeouts.idle_timeout_sec,
+            startup_grace_sec=p.timeouts.startup_grace_sec,
+            max_job_duration_sec=p.timeouts.max_job_duration_sec,
         ),
-        controller=ControllerConfig(
-            lock_path=s.controller.lock_path,
-            state_path=s.controller.state_path,
-            http_addr=s.controller.http_addr,
-            shrink_ticks=s.controller.shrink_ticks,
-        ),
+        controller=controller,
     )
