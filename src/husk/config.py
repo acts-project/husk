@@ -76,6 +76,11 @@ class BackendConfig:
     type: str
     min_ready: int
     max_total: int
+    # VM/runner name prefix — minted into `vm_name()`. Under multi-pool every pool
+    # MUST have a unique prefix: GitHub's runner APIs are repo-wide, so pool
+    # isolation relies on names not colliding (match_runner is prefix-based). The
+    # loader derives `husk-<slug(pool.name)>`; "husk" is the single-pool default.
+    vm_prefix: str = "husk"
     # Image source. OpenStack uses `image_name` (a Glance image name). libvirt
     # uses `image_ref` (an OCI artifact ref, e.g. ghcr.io/org/husk-gpu:v1 — synced
     # to each host by the controller) when set, else `image_name` as a literal
@@ -167,6 +172,7 @@ def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
     class _Backend(BaseModel):
         name: str
         type: str = "openstack"
+        vm_prefix: str = "husk"
         image_name: str = ""
         image_ref: str = ""
         image_cache_dir: str = ""
@@ -255,6 +261,7 @@ def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
         backend=BackendConfig(
             name=s.backend.name,
             type=s.backend.type,
+            vm_prefix=s.backend.vm_prefix,
             cloud=s.backend.cloud,
             image_name=s.backend.image_name,
             image_ref=s.backend.image_ref,

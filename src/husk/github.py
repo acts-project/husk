@@ -14,6 +14,11 @@ log = logging.getLogger("husk.github")
 
 GH_API = "https://api.github.com"
 
+# Cap every GitHub call so a hung/black-holed request can't wedge a reconcile tick.
+# This matters most under multi-pool: pools tick sequentially in one process, so an
+# unbounded GitHub call in one pool would stall every other pool's reconcile.
+_HTTP_TIMEOUT_S = 30
+
 
 class GitHubError(Exception):
     """A GitHub API call failed."""
@@ -44,7 +49,10 @@ class GitHubClient:
     # ------------------------------------------------------------------ reads
     def _list_raw(self) -> list[dict]:
         try:
-            r = self._s.get(f"{GH_API}/repos/{self.repo}/actions/runners?per_page=100")
+            r = self._s.get(
+                f"{GH_API}/repos/{self.repo}/actions/runners?per_page=100",
+                timeout=_HTTP_TIMEOUT_S,
+            )
             r.raise_for_status()
         except requests.RequestException as e:
             raise GitHubError(f"list runners failed: {e}") from e
@@ -84,7 +92,7 @@ class GitHubClient:
         }
         url = f"{GH_API}/repos/{self.repo}/actions/runners/generate-jitconfig"
         log.debug("POST generate-jitconfig name=%s labels=%s", name, self.labels)
-        r = self._s.post(url, json=body)
+        r = self._s.post(url, json=body, timeout=_HTTP_TIMEOUT_S)
         if r.status_code == 409:
             existing = self.find_runner(name)
             if existing:
@@ -94,7 +102,7 @@ class GitHubClient:
                     existing.get("status"),
                 )
                 self.delete_runner(existing["id"])
-            r = self._s.post(url, json=body)
+            r = self._s.post(url, json=body, timeout=_HTTP_TIMEOUT_S)
         if r.status_code != 201:
             raise GitHubError(f"JIT mint failed: HTTP {r.status_code}: {r.text[:300]}")
         log.debug("minted JIT for runner %s", name)
@@ -103,7 +111,8 @@ class GitHubClient:
     def delete_runner(self, runner_id: int) -> None:
         try:
             r = self._s.delete(
-                f"{GH_API}/repos/{self.repo}/actions/runners/{runner_id}"
+                f"{GH_API}/repos/{self.repo}/actions/runners/{runner_id}",
+                timeout=_HTTP_TIMEOUT_S,
             )
         except requests.RequestException as e:
             raise GitHubError(f"delete runner {runner_id} failed: {e}") from e

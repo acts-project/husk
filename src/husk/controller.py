@@ -489,7 +489,7 @@ class Controller:
             self._create_one(now)
 
     def _create_one(self, now: float) -> None:
-        vm = vm_name("husk", next(self._namer))
+        vm = vm_name(self.cfg.backend.vm_prefix, next(self._namer))
         name = runner_name(vm, 0)
         log.debug("creating slot %s (runner %s)", vm, name)
         try:
