@@ -272,9 +272,22 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         )
 
     if not s.pool:
+        hint = ""
+        try:  # nudge the common case: an old flat [backend]/[runner] config
+            import tomllib
+
+            with open(path, "rb") as f:
+                raw = tomllib.load(f)
+            if "backend" in raw or "runner" in raw:
+                hint = (
+                    " — this looks like the old flat format; wrap [runner]/[backend]/"
+                    "[timeouts] under a [[pool]] (with a name). See config.example.toml"
+                )
+        except Exception:
+            pass
         raise RuntimeError(
             "no [[pool]] defined: huskd needs at least one pool (each with its own "
-            "[pool.runner] and [pool.backend])"
+            "[pool.runner] and [pool.backend])" + hint
         )
 
     # Shared across every pool — one repo+PAT, one lock/state/http per daemon.
