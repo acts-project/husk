@@ -192,6 +192,19 @@ def test_list_slots_filters_by_pool():
     assert [s.name for s in slots] == ["husk-lv-1"]  # only this pool's domain
 
 
+def test_capacity_is_zero_until_image_staged():
+    # OCI mode: a host whose golden hasn't staged yet contributes no capacity, so
+    # the controller never attempts a create (nor mints a JIT) before it's ready.
+    b = _backend()
+    b._occupied = lambda: set()
+    assert b.capacity().free_instances == 0
+    assert not b.capacity().can_create
+
+    b._hosts["h1"].image_digest = CURR  # golden staged
+    cap = b.capacity()
+    assert cap.can_create and cap.free_instances > 0
+
+
 def test_no_image_source_is_rejected():
     cfg = BackendConfig(
         name="lv",

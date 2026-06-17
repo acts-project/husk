@@ -327,8 +327,25 @@ class LibvirtBackend:
             if meta.get("unit")
         }
 
+    def _host_ready(self, host: _HostConn) -> bool:
+        """Can this host back a NEW slot yet? In OCI mode the golden is staged
+        asynchronously (off the reconcile thread), so a host is ready only once its
+        image has landed (`image_digest` known); the manual/local-file path (a
+        literal `image_name`) is always ready. Gating capacity + placement on this
+        means the controller simply sees zero capacity while staging — it never
+        attempts a create (nor mints a wasted JIT runner) before the image is up."""
+        if host.cfg.image_ref or self._backend_ref:
+            return host.image_digest is not None
+        return True
+
     def _host_units(self) -> list[lx.HostUnits]:
-        return [lx.HostUnits(name, h.units) for name, h in self._hosts.items()]
+        # Only hosts whose golden has finished staging contribute slot-units, so a
+        # not-yet-staged host reports no capacity rather than erroring on create.
+        return [
+            lx.HostUnits(name, h.units)
+            for name, h in self._hosts.items()
+            if self._host_ready(h)
+        ]
 
     # ----------------------------------------------------------- image sync
     def sync_images(self, cfg: BackendConfig | None = None) -> None:
@@ -524,12 +541,9 @@ class LibvirtBackend:
         if placed is None:
             raise BackendError("no free slot-units across host pool")
         host_name, unit = placed
+        # Placement only returns a host whose golden has staged (see _host_units /
+        # _host_ready), so the overlay always has a backing image here.
         host = self._hosts[host_name]
-        # In OCI mode the golden is staged asynchronously; until it lands the host
-        # has no current image to back an overlay. Fail clean (the controller logs
-        # and retries next tick) rather than building off a missing/old golden.
-        if (host.cfg.image_ref or self._backend_ref) and host.image_digest is None:
-            raise BackendError(f"host {host_name} image not staged yet; deferring")
         conn = host.conn()
 
         overlay = self._make_overlay(host, name)
