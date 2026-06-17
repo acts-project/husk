@@ -156,6 +156,14 @@ def test_gc_removes_only_superseded_goldens():
     assert b.conn.image.deleted == ["img-orphan"]
 
 
+def test_capacity_zero_while_staging():
+    # OCI mode, image not uploaded to Glance yet → zero capacity, so no create is
+    # attempted (and no JIT runner minted) until the golden lands.
+    b = _backend()  # image_ref set, image_id None
+    cap = b.capacity()
+    assert cap.free_instances == 0 and not cap.can_create
+
+
 def test_slot_image_stale_only_in_oci_mode():
     b = _backend()
     b.image_id = "img-cur"

@@ -350,6 +350,13 @@ class OpenStackBackend:
         self.conn.compute.delete_server(slot.id, ignore_missing=True)
 
     def capacity(self) -> Capacity:
+        # OCI mode: while the golden is still staging (oras pull + Glance upload),
+        # there is no image to boot — report zero so the controller doesn't attempt
+        # a create (and mint a wasted JIT runner) until it lands. Legacy image_name
+        # mode resolves the id at init, so this never trips there.
+        if self._backend_ref and not self.image_id:
+            log.debug("image not staged yet; reporting zero capacity")
+            return Capacity(can_create=False, free_instances=0)
         try:
             limits = self.conn.compute.get_limits().absolute
             max_instances = getattr(limits, "instances", None) or getattr(
