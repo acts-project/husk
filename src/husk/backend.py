@@ -79,3 +79,11 @@ class Backend(Protocol):
     def capacity(self) -> Capacity:
         """Best-effort free capacity. The controller also clamps to max_total."""
         ...
+
+    def image_ready(self, slot: Slot) -> bool:
+        """Whether this slot can be (re)imaged now — i.e. the configured golden has
+        finished staging for it. `capacity()` already gates *grows* on this; the
+        controller also consults it before a *rebuild* so a recycle doesn't drive
+        into a no-image error while the golden is still in flight. Backends with no
+        async image delivery (fake / manual local-file) are always ready."""
+        ...

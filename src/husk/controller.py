@@ -432,7 +432,22 @@ class Controller:
         return classified
 
     # ----------------------------------------------------------- remediation
+    def _image_ready(self, slot: Slot) -> bool:
+        """Whether the backend can re-image this slot yet. Grows are already gated
+        by `capacity()` reporting zero while the golden stages; rebuilds need the
+        same gate so a NEEDS_RECYCLE/UNHEALTHY slot doesn't drive `rebuild_slot`
+        into a no-image error (and burn a JIT token) every tick during staging.
+        Optional on the backend — absent ⇒ ready (fake/manual paths)."""
+        fn = getattr(self.backend, "image_ready", None)
+        return fn(slot) if fn else True
+
     def _rebuild_then_start(self, slot: Slot, now: float) -> None:
+        if not self._image_ready(slot):
+            log.info(
+                "slot %s needs recycle but golden image still staging; deferring",
+                slot.id,
+            )
+            return
         cycle = self.cycle_counter.get(slot.id, slot.cycle) + 1
         name = runner_name(slot.name, cycle)
         try:

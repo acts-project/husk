@@ -339,6 +339,14 @@ class LibvirtBackend:
             return host.image_digest is not None
         return True
 
+    def image_ready(self, slot: Slot) -> bool:
+        """Whether the host backing `slot` has its golden staged (same gate as
+        capacity uses for grows), so the controller can defer a rebuild instead of
+        erroring while staging. An unknown host ⇒ ready, so the rebuild proceeds
+        and surfaces the real unknown-host error rather than being silently held."""
+        host = self._hosts.get(slot.id.partition(":")[0])
+        return host is None or self._host_ready(host)
+
     def _host_units(self) -> list[lx.HostUnits]:
         # Only hosts whose golden has finished staging contribute slot-units, so a
         # not-yet-staged host reports no capacity rather than erroring on create.

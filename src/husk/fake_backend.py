@@ -23,9 +23,11 @@ class FakeBackend:
         self,
         slots: list[Slot] | None = None,
         capacity: Capacity = Capacity(can_create=True, free_instances=99),
+        image_ready: bool = True,
     ) -> None:
         self.slots: list[Slot] = list(slots or [])
         self.cap = capacity
+        self._image_ready = image_ready
         self.raise_on_list = False
         self.calls: list[tuple] = []
         self._ids = itertools.count(1)
@@ -74,6 +76,9 @@ class FakeBackend:
 
     def capacity(self) -> Capacity:
         return self.cap
+
+    def image_ready(self, slot: Slot) -> bool:
+        return self._image_ready
 
     # --- test helpers -----------------------------------------------------
     def set_status(self, slot_id: str, **changes) -> None:

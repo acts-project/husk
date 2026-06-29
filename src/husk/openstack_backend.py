@@ -256,6 +256,12 @@ class OpenStackBackend:
         except Exception:
             log.warning("Glance golden GC failed; leaving images", exc_info=True)
 
+    def image_ready(self, slot: Slot) -> bool:
+        """OCI mode: ready once the golden has been adopted into Glance
+        (`image_id` set). Legacy image_name mode resolves the id at init, so it is
+        always ready. Mirrors the `capacity()` gate, for rebuilds."""
+        return bool(self.image_id) or not self._backend_ref
+
     def _require_image(self) -> str:
         """The current Glance image id, or a clear error if an OCI sync hasn't
         landed yet (the controller calls sync_images before any create/rebuild, so

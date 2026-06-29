@@ -38,3 +38,31 @@ def test_sync_hook_absent_backend_is_noop(clock):
     github = FakeGitHub(runners=[make_runner(id=1, name="husk-1-c0")])
     ctrl = make_controller(backend, github, make_config(), clock)
     ctrl.tick()  # must not raise
+
+
+def test_recycle_deferred_while_image_stages(clock):
+    # SHUTOFF + no runner ⇒ NEEDS_RECYCLE. While the golden is still staging the
+    # backend reports image not ready: the controller must NOT rebuild (nor mint a
+    # JIT) — it defers until the image lands rather than erroring every tick.
+    slot = make_slot(id="vm-1", name="husk-1", status="SHUTOFF", cycle=4)
+    backend = FakeBackend(slots=[slot], image_ready=False)
+    github = FakeGitHub()
+    ctrl = make_controller(backend, github, make_config(), clock)
+
+    ctrl.tick()
+
+    assert "rebuild" not in backend.ops()
+    assert "mint" not in [c[0] for c in github.calls]
+
+
+def test_recycle_proceeds_once_image_ready(clock):
+    # Same slot, image now staged: the recycle rebuilds and mints a fresh JIT.
+    slot = make_slot(id="vm-1", name="husk-1", status="SHUTOFF", cycle=4)
+    backend = FakeBackend(slots=[slot], image_ready=True)
+    github = FakeGitHub()
+    ctrl = make_controller(backend, github, make_config(), clock)
+
+    ctrl.tick()
+
+    assert "rebuild" in backend.ops()
+    assert ("mint", "husk-1-c5") in github.calls
