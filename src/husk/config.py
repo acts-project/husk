@@ -67,7 +67,7 @@ class HostConfig:
     name: str
     libvirt_uri: str  # e.g. qemu+ssh://user@host/system
     ssh_target: str  # user@host for host-side qemu-img/genisoimage (derived if unset)
-    pool: str = "husk"
+    storage_pool: str = "husk"  # libvirt storage pool name (NOT the husk [[pool]])
     network: str = "default"
     memory_mb: int = 4096
     vcpus: int = 4
@@ -180,7 +180,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         name: str
         libvirt_uri: str
         ssh_target: str | None = None  # derived from the URI when omitted
-        pool: str = "husk"
+        storage_pool: str = "husk"  # libvirt storage pool (NOT the husk [[pool]])
         network: str = "default"
         memory_mb: int = 4096
         vcpus: int = 4
@@ -339,7 +339,7 @@ def _pool_config(p, github: GithubConfig, controller: ControllerConfig) -> Confi
                 name=h.name,
                 libvirt_uri=h.libvirt_uri,
                 ssh_target=h.ssh_target or _ssh_target_from_uri(h.libvirt_uri),
-                pool=h.pool,
+                storage_pool=h.storage_pool,
                 network=h.network,
                 memory_mb=h.memory_mb,
                 vcpus=h.vcpus,

@@ -119,10 +119,12 @@ class _HostConn:
         """Absolute host path of the storage pool's target dir (where overlays +
         seeds live, and where the golden qcow2 is expected)."""
         if self._pool_dir is None:
-            pool = self.conn().storagePoolLookupByName(self.cfg.pool)
+            pool = self.conn().storagePoolLookupByName(self.cfg.storage_pool)
             path = ET.fromstring(pool.XMLDesc()).findtext("target/path")
             if not path:
-                raise BackendError(f"pool {self.cfg.pool!r} has no target path")
+                raise BackendError(
+                    f"storage pool {self.cfg.storage_pool!r} has no target path"
+                )
             self._pool_dir = path
         return self._pool_dir
 

@@ -166,7 +166,7 @@ def test_ssh_target_from_uri_preserves_case_and_strips_port():
     assert _ssh_target_from_uri("qemu:///system") == ""
 
 
-def test_libvirt_config_parses_host_pool(tmp_path, monkeypatch):
+def test_libvirt_config_parses_host_storage_pool(tmp_path, monkeypatch):
     monkeypatch.setenv("GH_TOKEN", "ghp_x")
     p = tmp_path / "multi.toml"
     p.write_text(_MULTI_TOML)
@@ -177,4 +177,4 @@ def test_libvirt_config_parses_host_pool(tmp_path, monkeypatch):
     assert h.ssh_target == "paul@GpuBox"  # derived, case preserved
     assert h.gpu_pci_addresses == ("0000:01:00.0",)
     assert h.max_slots is None
-    assert h.pool == "husk" and h.network == "default"  # defaults applied
+    assert h.storage_pool == "husk" and h.network == "default"  # defaults applied
