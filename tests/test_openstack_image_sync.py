@@ -11,8 +11,9 @@ from __future__ import annotations
 import dataclasses
 
 from husk.config import BackendConfig
-from husk.image_sync import BackgroundImagePreparer, ResolvedImage
+from husk.image_sync import ResolvedImage
 from husk.openstack_backend import GLANCE_PREFIX, OpenStackBackend
+from husk.ops import OpStore
 
 CURR = "sha256:" + "c" * 64  # short cccccccccccc → husk-golden-cccccccccccc
 REF = "ghcr.io/acts-project/husk-base:v1"
@@ -101,7 +102,7 @@ def _backend(ref: str = REF, servers=None) -> OpenStackBackend:
     b.image_id = None
     b._image_conn = b.conn  # upload via the same fake conn (no second connect)
     # Stage synchronously so a single sync_images() adopts (prod uses a thread).
-    b._preparer = BackgroundImagePreparer(b._prepare_image, spawn=lambda fn: fn())
+    b._ops = OpStore(spawn=lambda fn: fn())
     return b
 
 

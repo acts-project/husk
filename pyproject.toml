@@ -13,6 +13,9 @@ dependencies = [
     # by BOTH backends now — the controller pulls one qcow2 and fans it to libvirt
     # hosts *and* uploads it to Glance — so it lives in base deps, not an extra.
     "oras>=0.2",
+    # Retry/backoff for the in-process async-op registry (husk.ops) that runs the
+    # slow image staging off the reconcile thread — replaces hand-rolled backoff.
+    "tenacity>=8.2",
 ]
 
 [project.optional-dependencies]

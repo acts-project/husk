@@ -13,6 +13,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 
+from husk.ops import OpView
 from husk.slot import SlotState
 
 
@@ -50,6 +51,7 @@ class ControllerState:
     desired_total: int
     counts: dict[str, int]  # SlotState.value -> count
     slots: list[SlotView] = field(default_factory=list)
+    ops: list[OpView] = field(default_factory=list)  # in-flight/recent staging ops
 
     @classmethod
     def from_classified(
@@ -62,6 +64,7 @@ class ControllerState:
         desired_total: int,
         classified: list[tuple],  # list of (Slot, Runner|None, SlotState)
         timing: dict | None = None,  # slot_id -> SlotTiming (optional)
+        ops: list[OpView] | None = None,  # backend async ops (image staging)
     ) -> "ControllerState":
         timing = timing or {}
         counts = {st.value: 0 for st in SlotState}
@@ -103,6 +106,7 @@ class ControllerState:
             desired_total=desired_total,
             counts=counts,
             slots=views,
+            ops=list(ops or []),
         )
 
     def to_dict(self) -> dict:
@@ -116,6 +120,7 @@ class ControllerState:
             "desired_total": self.desired_total,
             "counts": dict(self.counts),
             "slots": [vars(v) for v in self.slots],
+            "ops": [vars(o) for o in self.ops],
         }
 
     @classmethod
@@ -129,6 +134,7 @@ class ControllerState:
             desired_total=d["desired_total"],
             counts=dict(d["counts"]),
             slots=[SlotView(**sv) for sv in d["slots"]],
+            ops=[OpView(**o) for o in d.get("ops", [])],
         )
 
 

@@ -23,7 +23,8 @@ import openstack
 from husk.backend import ListSlotsError
 from husk.cloudinit import b64
 from husk.config import BackendConfig
-from husk.image_sync import BackgroundImagePreparer, ImageSync
+from husk.image_sync import ImageSync
+from husk.ops import DONE, OpStore, OpView
 from husk.slot import Capacity, Slot
 
 log = logging.getLogger("husk.openstack")
@@ -89,10 +90,10 @@ class OpenStackBackend:
         self._synced_ref = ""  # the ref behind the current image_id (sync no-op guard)
         self._image_digest: str | None = None
         self.image_id: str | None = None
-        # Heavy staging (oras pull + Glance upload) runs off the reconcile thread;
-        # the tick only adopts a ready result. A dedicated upload connection keeps
-        # the worker's Glance calls off the connection the tick uses for compute.
-        self._preparer = BackgroundImagePreparer(self._prepare_image)
+        # Heavy staging (oras pull + Glance upload) runs off the reconcile thread
+        # as a keyed op; the tick only adopts a ready result. A dedicated upload
+        # connection keeps the worker's Glance calls off the tick's compute conn.
+        self._ops = OpStore()
         self._image_conn = None
         if not self._backend_ref:
             if not cfg.image_name:
@@ -186,19 +187,29 @@ class OpenStackBackend:
             return  # legacy image_name mode — nothing to pull/upload
         if self._synced_ref == ref and self.image_id:
             return  # already current
-        prepared = self._preparer.ready(ref)
-        if prepared is None:
-            return  # still staging in the background — keep the current image
+        key = f"glance:{ref}"
+        view = self._ops.submit(
+            key, "glance-upload", lambda report: self._prepare_image(ref, report)
+        )
+        if view.state != DONE:
+            return  # still staging (or failed + backing off) — keep current image
+        prepared = self._ops.result(key)
         self.image_id = prepared.image_id
         self._image_digest = prepared.digest
         self._synced_ref = ref
         log.info("adopted Glance golden %s for %s", self.image_id, ref)
         self._gc_glance()
 
-    def _prepare_image(self, ref: str) -> _GlancePrepared:
-        """Heavy staging (background thread): pull the OCI golden to the controller
-        cache and ensure it's uploaded to Glance. Returns what the tick adopts."""
+    def staging_ops(self) -> list[OpView]:
+        """In-flight / recent image-staging ops, for the status board."""
+        return self._ops.views()
+
+    def _prepare_image(self, ref: str, report) -> _GlancePrepared:
+        """Heavy staging (op worker): pull the OCI golden to the controller cache
+        and ensure it's uploaded to Glance. Returns what the tick adopts."""
+        report("pulling golden from registry")
         resolved = self._sync.resolve(ref)
+        report("uploading golden to Glance")
         image_id = self._ensure_in_glance(self._upload_conn(), resolved)
         return _GlancePrepared(digest=resolved.digest, image_id=image_id)
 

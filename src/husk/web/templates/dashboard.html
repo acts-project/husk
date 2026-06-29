@@ -11,6 +11,25 @@ const secs = v => v==null ? "-" : Math.round(v)+"s";
 const pct = v => v==null ? "-" : Math.round(v*100)+"%";
 const esc = s => (s==null ? "" : ""+s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 
+function opsHtml(ops) {
+  if (!ops || !ops.length) return "";
+  // Newest first; show in-flight before recently-done.
+  const order = { pending: 0, failed: 1, done: 2 };
+  const chips = ops.slice()
+    .sort((a,b) => (order[a.state]-order[b.state]) || (b.started_at-a.started_at))
+    .map(o => {
+      const detail = o.state === "failed"
+        ? `<span class="err">${esc(o.error || "failed")}</span>`
+        : o.state === "done"
+          ? `<span class="prog">done</span>`
+          : `<span class="prog">${esc(o.progress || "working")}${o.attempts>1 ? " ·#"+o.attempts : ""}</span>`;
+      return `<span class="op ${o.state}" title="${esc(o.key)}">
+          <span class="dot">●</span><span class="kind">${esc(o.kind)}</span>
+          ${detail}<span class="prog">${ago(o.started_at)}</span></span>`;
+    }).join("");
+  return `<div class="ops"><span class="lbl">staging</span>${chips}</div>`;
+}
+
 function poolHtml(p) {
   const stale = (Date.now()/1000 - p.last_reconcile_epoch) > 60;
   const counts = STATES.map(s => `<span class="s-${s}">${s}=${p.counts[s]||0}</span>`).join("");
@@ -47,7 +66,7 @@ function poolHtml(p) {
       <span class="meta">desired=${p.desired_total} min_ready=${p.min_ready} max_total=${p.max_total}</span>
       <span class="meta ${stale ? "stale" : ""}">updated ${ago(p.last_reconcile_epoch)}${stale ? " — stale?" : ""} · gen ${p.generation}</span>
       <span class="counts">${counts}</span>
-    </div>${body}</section>`;
+    </div>${opsHtml(p.ops)}${body}</section>`;
 }
 
 function render(pools) {

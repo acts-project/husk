@@ -29,7 +29,8 @@ from dataclasses import dataclass
 from husk import libvirt_xml as lx
 from husk.backend import BackendError, ListSlotsError
 from husk.config import BackendConfig, HostConfig
-from husk.image_sync import BackgroundImagePreparer, ImageSync
+from husk.image_sync import ImageSync
+from husk.ops import DONE, OpStore, OpView
 from husk.slot import Capacity, Slot
 
 
@@ -144,9 +145,9 @@ class LibvirtBackend:
         # each tick until the configured ref actually changes.
         self._synced_ref: dict[str, str] = {}
         # Heavy staging (oras pull + scp to each host) runs off the reconcile
-        # thread; the tick only adopts a ready result (points each host's current
-        # image at the staged golden).
-        self._preparer = BackgroundImagePreparer(self._prepare_image)
+        # thread as a keyed op; the tick only adopts a ready result (points each
+        # host's current image at the staged golden).
+        self._ops = OpStore()
         self._hosts: dict[str, _HostConn] = {}
         for h in cfg.hosts:
             if h.gpu_pci_addresses and h.max_slots is not None:
@@ -384,24 +385,34 @@ class LibvirtBackend:
                 continue  # manual/local-file host — nothing to pull
             if self._synced_ref.get(name) == ref and host.image_digest:
                 continue  # already current
-            prepared = self._preparer.ready(ref)
-            if prepared is None:
-                continue  # still staging in the background — keep current golden
+            key = f"stage:{ref}"
+            view = self._ops.submit(
+                key, "host-stage", lambda report, r=ref: self._prepare_image(r, report)
+            )
+            if view.state != DONE:
+                continue  # still staging (or failed + backing off) — keep current
+            prepared = self._ops.result(key)
             host.image = prepared.golden
             host.image_digest = prepared.digest
             self._synced_ref[name] = ref
             log.info("host %s now serving %s (%s)", name, ref, prepared.golden)
         self._gc_goldens()
 
-    def _prepare_image(self, ref: str) -> _GoldenPrepared:
-        """Heavy staging (background thread): pull the OCI golden to the controller
-        cache and scp it into the pool of every host that uses this ref. Returns
-        what the tick adopts; it does NOT touch live host fields (only the tick
-        thread does, in sync_images)."""
+    def staging_ops(self) -> list[OpView]:
+        """In-flight / recent image-staging ops, for the status board."""
+        return self._ops.views()
+
+    def _prepare_image(self, ref: str, report) -> _GoldenPrepared:
+        """Heavy staging (op worker): pull the OCI golden to the controller cache
+        and scp it into the pool of every host that uses this ref. Returns what the
+        tick adopts; it does NOT touch live host fields (only the tick thread does,
+        in sync_images)."""
+        report("pulling golden from registry")
         resolved = self._sync.resolve(ref)
         golden = f"husk-golden-{resolved.short}.qcow2"
         for host in self._hosts.values():
             if (host.cfg.image_ref or self._backend_ref) == ref:
+                report(f"staging to host {host.cfg.name}")
                 self._ensure_on_host(host, resolved.local_path, golden)
                 # Mark this pool's current golden the moment it lands, BEFORE the
                 # tick adopts it — so another pool sharing this host's pool dir

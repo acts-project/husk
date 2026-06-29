@@ -48,7 +48,7 @@ def _backend(**host_overrides):
     b._hosts["h1"]._pool_dir = "/pool"  # avoid opening a connection
     b._list_raw = lambda: []  # GC sees no live slots unless a test overrides
     # Stage synchronously so a single sync_images() adopts (prod uses a thread).
-    b._preparer._spawn = lambda fn: fn()
+    b._ops._spawn = lambda fn: fn()
     return b
 
 

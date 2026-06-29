@@ -30,6 +30,19 @@
     .s-needs_recycle{color:#58a6ff} .s-unhealthy{color:#f85149}
     .s-error{color:#f85149;font-weight:700}
     .stale{color:#f85149}
+    .ops { padding:7px 14px; border-bottom:1px solid #21262d; background:#11161d;
+           display:flex; flex-wrap:wrap; gap:6px 10px; align-items:center; }
+    .ops .lbl { color:#8b949e; text-transform:uppercase; letter-spacing:.4px; font-size:11px; }
+    .op { display:inline-flex; gap:7px; align-items:baseline; padding:2px 9px;
+          border:1px solid #21262d; border-radius:12px; background:#0d1117; }
+    .op .kind { color:#c9d1d9; }
+    .op .prog { color:#8b949e; }
+    .op .err { color:#f85149; }
+    .op.pending .dot{ color:#d29922; } .op.done .dot{ color:#3fb950; }
+    .op.failed .dot{ color:#f85149; }
+    .op .dot { animation:none; }
+    .op.pending .dot { animation:pulse 1.4s ease-in-out infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
   </style>
 </head>
 <body>

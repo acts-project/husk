@@ -359,6 +359,7 @@ class Controller:
             desired_total=desired,
             classified=classified,
             timing=self.timing,
+            ops=self._backend_ops(),
         )
         log.debug(
             "tick %d done: %s",
@@ -401,6 +402,7 @@ class Controller:
             desired_total=desired,
             classified=classified,
             timing=self.timing,
+            ops=self._backend_ops(),
         )
         return self.snapshot
 
@@ -432,6 +434,12 @@ class Controller:
         return classified
 
     # ----------------------------------------------------------- remediation
+    def _backend_ops(self) -> list:
+        """The backend's in-flight/recent async ops (image staging) for the status
+        board. Optional — backends with no async delivery (fake) don't expose it."""
+        fn = getattr(self.backend, "staging_ops", None)
+        return fn() if fn else []
+
     def _image_ready(self, slot: Slot) -> bool:
         """Whether the backend can re-image this slot yet. Grows are already gated
         by `capacity()` reporting zero while the golden stages; rebuilds need the
