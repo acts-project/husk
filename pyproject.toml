@@ -16,16 +16,17 @@ dependencies = [
     # Retry/backoff for the in-process async-op registry (husk.ops) that runs the
     # slow image staging off the reconcile thread — replaces hand-rolled backoff.
     "tenacity>=8.2",
+    # huskd's single HTTP surface (dashboard + /status /metrics /healthz /events).
+    # Quart owns the event loop; the reconcile loop runs in a background thread.
+    # hypercorn is the ASGI server Quart's run_task drives.
+    "quart>=0.19",
+    "hypercorn>=0.16",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff>=0.15"]
 # libvirt backend — kept optional so the OpenStack/CI path needs no libvirt headers.
 libvirt = ["libvirt-python>=10"]
-# web dashboard — an optional Quart (ASGI) app with Jinja templates that streams
-# live per-pool status over SSE. Kept out of the core so huskd's /status /metrics
-# /healthz stay zero-dep (stdlib http server). hypercorn is the ASGI server.
-web = ["quart>=0.19", "hypercorn>=0.16"]
 
 [project.scripts]
 huskd = "husk.cli:huskd"

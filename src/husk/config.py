@@ -116,12 +116,9 @@ class TimeoutsConfig:
 @dataclass(frozen=True)
 class ControllerConfig:
     lock_path: str = "/tmp/huskd.lock"
-    state_path: str = "/tmp/huskd-state.json"
-    http_addr: str = (
-        "127.0.0.1:9100"  # huskd serves /status /metrics /healthz; "" disables
-    )
-    # Optional web dashboard (Quart + SSE; needs the `web` extra). "" disables it.
-    web_addr: str = ""
+    # huskd's single HTTP surface: dashboard + /status /metrics /healthz /events.
+    # Always on (the only way huskctl reads state); must be set.
+    http_addr: str = "127.0.0.1:9100"
     shrink_ticks: int = 3
 
 
@@ -221,9 +218,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
 
     class _Controller(BaseModel):
         lock_path: str = "/tmp/huskd.lock"
-        state_path: str = "/tmp/huskd-state.json"
         http_addr: str = "127.0.0.1:9100"
-        web_addr: str = ""
         shrink_ticks: int = 3
 
     class _Settings(BaseSettings):
@@ -293,13 +288,11 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
             "[pool.runner] and [pool.backend])" + hint
         )
 
-    # Shared across every pool — one repo+PAT, one lock/state/http per daemon.
+    # Shared across every pool — one repo+PAT, one lock/http per daemon.
     github = GithubConfig(repo=s.github.repo, token=token)
     controller = ControllerConfig(
         lock_path=s.controller.lock_path,
-        state_path=s.controller.state_path,
         http_addr=s.controller.http_addr,
-        web_addr=s.controller.web_addr,
         shrink_ticks=s.controller.shrink_ticks,
     )
 

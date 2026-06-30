@@ -370,9 +370,11 @@ name = "husk"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "hypercorn" },
     { name = "openstacksdk" },
     { name = "oras" },
     { name = "pydantic-settings" },
+    { name = "quart" },
     { name = "requests" },
     { name = "rich" },
     { name = "tenacity" },
@@ -387,27 +389,23 @@ dev = [
 libvirt = [
     { name = "libvirt-python" },
 ]
-web = [
-    { name = "hypercorn" },
-    { name = "quart" },
-]
 
 [package.metadata]
 requires-dist = [
-    { name = "hypercorn", marker = "extra == 'web'", specifier = ">=0.16" },
+    { name = "hypercorn", specifier = ">=0.16" },
     { name = "libvirt-python", marker = "extra == 'libvirt'", specifier = ">=10" },
     { name = "openstacksdk" },
     { name = "oras", specifier = ">=0.2" },
     { name = "pydantic-settings", specifier = ">=2" },
     { name = "pytest", marker = "extra == 'dev'" },
-    { name = "quart", marker = "extra == 'web'", specifier = ">=0.19" },
+    { name = "quart", specifier = ">=0.19" },
     { name = "requests" },
     { name = "rich", specifier = ">=13" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15" },
     { name = "tenacity", specifier = ">=8.2" },
     { name = "typer", specifier = ">=0.12" },
 ]
-provides-extras = ["dev", "libvirt", "web"]
+provides-extras = ["dev", "libvirt"]
 
 [[package]]
 name = "hypercorn"

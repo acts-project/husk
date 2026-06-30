@@ -1,5 +1,5 @@
-"""huskctl status renders every pool from the published state-file list, and
---pool / --json scope it. Exercises the full CLI command (file source)."""
+"""huskctl status renders every pool from huskd's live HTTP endpoint, and
+--pool / --json scope it. Exercises the full CLI command against a real server."""
 
 from __future__ import annotations
 
@@ -7,10 +7,10 @@ import json
 
 from typer.testing import CliRunner
 
-from conftest import make_runner, make_slot
+from conftest import make_runner, make_slot, serve_in_thread
 from husk.cli import huskctl_app
 from husk.slot import SlotState
-from husk.snapshot import ControllerState, write_states
+from husk.snapshot import ControllerState
 
 runner = CliRunner()
 
@@ -32,12 +32,18 @@ def _snap(backend: str, slot_name: str):
     )
 
 
+def _snaps():
+    return [
+        _snap("openstack-cpu", "husk-openstack-cpu-1"),
+        _snap("libvirt-gpu", "husk-libvirt-gpu-1"),
+    ]
+
+
 _CONFIG = """
 [github]
 repo = "acts-project/husk-test"
 [controller]
-http_addr = ""
-state_path = "{state}"
+http_addr = "{http_addr}"
 
 [[pool]]
 name = "openstack-cpu"
@@ -57,44 +63,46 @@ type = "libvirt"
 """
 
 
-def _setup(tmp_path, monkeypatch):
+def _config(tmp_path, monkeypatch, http_addr: str) -> str:
     monkeypatch.setenv("GH_TOKEN", "ghp_x")
-    state = tmp_path / "state.json"
-    write_states(
-        str(state),
-        [
-            _snap("openstack-cpu", "husk-openstack-cpu-1"),
-            _snap("libvirt-gpu", "husk-libvirt-gpu-1"),
-        ],
-    )
     cfg = tmp_path / "config.toml"
-    cfg.write_text(_CONFIG.format(state=state))
+    cfg.write_text(_CONFIG.format(http_addr=http_addr))
     return str(cfg)
 
 
 def test_status_renders_all_pools(tmp_path, monkeypatch):
-    cfg = _setup(tmp_path, monkeypatch)
-    result = runner.invoke(huskctl_app, ["status", "-c", cfg])
+    snaps = _snaps()
+    with serve_in_thread(lambda: snaps) as base:
+        cfg = _config(tmp_path, monkeypatch, base.removeprefix("http://"))
+        result = runner.invoke(huskctl_app, ["status", "-c", cfg])
     assert result.exit_code == 0
     assert "openstack-cpu" in result.stdout and "libvirt-gpu" in result.stdout
 
 
 def test_status_pool_filter(tmp_path, monkeypatch):
-    cfg = _setup(tmp_path, monkeypatch)
-    result = runner.invoke(huskctl_app, ["status", "-c", cfg, "--pool", "libvirt-gpu"])
+    snaps = _snaps()
+    with serve_in_thread(lambda: snaps) as base:
+        cfg = _config(tmp_path, monkeypatch, base.removeprefix("http://"))
+        result = runner.invoke(
+            huskctl_app, ["status", "-c", cfg, "--pool", "libvirt-gpu"]
+        )
     assert result.exit_code == 0
     assert "libvirt-gpu" in result.stdout and "openstack-cpu" not in result.stdout
 
 
 def test_status_unknown_pool_errors(tmp_path, monkeypatch):
-    cfg = _setup(tmp_path, monkeypatch)
-    result = runner.invoke(huskctl_app, ["status", "-c", cfg, "--pool", "nope"])
+    snaps = _snaps()
+    with serve_in_thread(lambda: snaps) as base:
+        cfg = _config(tmp_path, monkeypatch, base.removeprefix("http://"))
+        result = runner.invoke(huskctl_app, ["status", "-c", cfg, "--pool", "nope"])
     assert result.exit_code == 1
 
 
 def test_status_json_is_a_list(tmp_path, monkeypatch):
-    cfg = _setup(tmp_path, monkeypatch)
-    result = runner.invoke(huskctl_app, ["status", "-c", cfg, "--json"])
+    snaps = _snaps()
+    with serve_in_thread(lambda: snaps) as base:
+        cfg = _config(tmp_path, monkeypatch, base.removeprefix("http://"))
+        result = runner.invoke(huskctl_app, ["status", "-c", cfg, "--json"])
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
     assert isinstance(payload, list)

@@ -4,24 +4,28 @@ A thin facade over N validated `Controller` instances (one per pool). The
 `Controller` is unchanged: each owns its backend + GitHub client + per-slot
 bookkeeping (keyed by globally-unique `slot.id`), so the pools share nothing
 implicitly. The facade only owns what is genuinely process-wide: the reconcile
-loop, the combined state publish, and the per-tick config reload.
+loop and the per-tick config reload. Snapshots stay in memory on each Controller
+(`snapshots()` gathers them); the HTTP layer reads that provider directly.
 
 Pools tick **sequentially** on their own `poll_interval_sec` cadence (one thread,
 no cross-pool shared state to reason about). Each pool's `tick()` is wrapped so an
-unexpected raise in one pool can neither skip the others nor the publish — the
-same per-tick safety `Controller.run()` gives a single pool today.
+unexpected raise in one pool can neither skip the others — the same per-tick
+safety `Controller.run()` gives a single pool today. `run()` is driven on a
+background thread by the CLI (the event loop owns the main thread); a `stop()`
+event makes the loop's sleep interruptible so shutdown is prompt.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import logging
+import threading
 import time
 from typing import Callable
 
 from husk.config import Config
 from husk.controller import Controller
-from husk.snapshot import ControllerState, write_states
+from husk.snapshot import ControllerState
 
 log = logging.getLogger("husk.multipool")
 
@@ -31,16 +35,15 @@ class MultiPoolController:
         self,
         controllers: list[Controller],
         *,
-        state_path: str = "",
         reload_configs: Callable[[], list[Config] | None] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not controllers:
             raise ValueError("MultiPoolController needs at least one pool")
         self._controllers = controllers
-        self._state_path = state_path
         self._reload = reload_configs
         self._clock = clock
+        self._stop = threading.Event()
         # Per-pool next-due timestamp (monotonic) so each pool keeps its own
         # cadence within the single loop.
         self._next_due: dict[str, float] = {self._name(c): 0.0 for c in controllers}
@@ -54,19 +57,22 @@ class MultiPoolController:
         return self._controllers
 
     def snapshots(self) -> list[ControllerState]:
-        """The current per-pool snapshots (one per pool; the HTTP/state surface)."""
+        """The current per-pool snapshots (one per pool; the in-memory HTTP source).
+        Read cross-thread by the HTTP layer — each `c.snapshot` is an immutable
+        frozen dataclass swapped atomically per tick, so this is safe."""
         return [c.snapshot for c in self._controllers if c.snapshot is not None]
 
     # ------------------------------------------------------------------- run
     def run(self) -> None:
-        """Blocking multi-pool reconcile loop. Caller holds the single lock."""
+        """Blocking multi-pool reconcile loop, run on a background thread by the
+        CLI. Loops until `stop()` is set; the sleep is interruptible so shutdown
+        is prompt. Caller holds the single process lock."""
         log.info(
             "huskd starting: %d pool(s): %s",
             len(self._controllers),
             ", ".join(self._name(c) for c in self._controllers),
         )
-        self._publish()  # seed the state file with the empty per-pool snapshots
-        while True:
+        while not self._stop.is_set():
             self._maybe_reload()
             now = self._clock()
             for c in self._controllers:
@@ -76,35 +82,26 @@ class MultiPoolController:
                     self._next_due[name] = (
                         self._clock() + c.cfg.timeouts.poll_interval_sec
                     )
-            self._publish()
             soonest = min(self._next_due.values())
-            time.sleep(max(0.0, soonest - self._clock()))
+            self._stop.wait(timeout=max(0.0, soonest - self._clock()))
+
+    def stop(self) -> None:
+        """Signal `run()` to exit at the next loop boundary (wakes the sleep)."""
+        self._stop.set()
 
     def tick_all(self) -> None:
-        """Tick every pool once and publish (the `--once` path / tests)."""
+        """Tick every pool once (the `--once` path / tests)."""
         for c in self._controllers:
             self._tick_one(c)
-        self._publish()
 
     def _tick_one(self, ctrl: Controller) -> None:
         try:
             ctrl.tick()
         except Exception:
             # A pool's tick should be self-contained (list failures fail safe
-            # inside tick), but never let an unexpected raise stop the other pools
-            # or the publish.
+            # inside tick), but never let an unexpected raise stop the other pools.
             log.exception(
                 "pool %s: tick raised; other pools continue", self._name(ctrl)
-            )
-
-    def _publish(self) -> None:
-        if not self._state_path:
-            return
-        try:
-            write_states(self._state_path, self.snapshots())
-        except Exception:
-            log.warning(
-                "could not publish state to %s", self._state_path, exc_info=True
             )
 
     # ---------------------------------------------------------------- reload
@@ -134,16 +131,14 @@ class MultiPoolController:
             if ctrl is None:
                 continue  # a new pool — restart-only (warned above)
             # Normalize the shared sections to what the sub-controller was built
-            # with: the facade owns state_path/http_addr (blanked on the sub-
-            # controller), so feeding the file's real paths would spuriously trip
+            # with: the facade owns http_addr (blanked on the sub-controller), so
+            # feeding the file's real value would spuriously trip
             # apply_reloaded_config's structural-change warning every reload. Keep
             # the *new* hot knobs (controller.shrink_ticks) by blanking only the
-            # facade-owned fields, and reuse the shared github object as-is.
+            # facade-owned field, and reuse the shared github object as-is.
             norm = dataclasses.replace(
                 cfg,
-                controller=dataclasses.replace(
-                    cfg.controller, state_path="", http_addr=""
-                ),
+                controller=dataclasses.replace(cfg.controller, http_addr=""),
                 github=ctrl.cfg.github,
             )
             ctrl.apply_reloaded_config(norm)

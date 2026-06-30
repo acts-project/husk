@@ -1,15 +1,12 @@
 """Published controller state — the metrics / status-board data seam.
 
-The reconcile loop publishes one `ControllerState` per tick. `huskctl status`
-renders it now; a future `/metrics` (Prometheus) or `/status` (web board) are
-thin renderers of this same object — no controller change required.
+The reconcile loop builds one `ControllerState` per tick and swaps it onto the
+Controller atomically; the HTTP/SSE endpoints (`husk.web`) render this same
+object straight from memory — no controller change required, no file IPC.
 """
 
 from __future__ import annotations
 
-import json
-import os
-import tempfile
 import time
 from dataclasses import dataclass, field
 
@@ -136,51 +133,3 @@ class ControllerState:
             slots=[SlotView(**sv) for sv in d["slots"]],
             ops=[OpView(**o) for o in d.get("ops", [])],
         )
-
-
-def _atomic_write(path: str, data: str) -> None:
-    """Write `data` to `path` via tmp file + rename (never a torn read)."""
-    directory = os.path.dirname(path) or "."
-    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".huskd-state-")
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(data)
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
-def write_state(path: str, state: ControllerState) -> None:
-    """Atomically publish one snapshot to `path` (single-pool / direct Controller)."""
-    _atomic_write(path, json.dumps(state.to_dict()))
-
-
-def read_state(path: str) -> ControllerState | None:
-    """Read a single published snapshot; None if missing or unparseable."""
-    try:
-        with open(path) as f:
-            return ControllerState.from_dict(json.load(f))
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
-
-
-def write_states(path: str, states: list[ControllerState]) -> None:
-    """Atomically publish the per-pool snapshots as a JSON list (multi-pool huskd).
-
-    The container is always a list (one element per pool); element format is the
-    same `ControllerState.to_dict()` a single-pool publish used. huskd and huskctl
-    ship together, so there is no bare-object back-compat to carry."""
-    _atomic_write(path, json.dumps([s.to_dict() for s in states]))
-
-
-def read_states(path: str) -> list[ControllerState]:
-    """Read the published per-pool snapshots; [] if missing or unparseable."""
-    try:
-        with open(path) as f:
-            return [ControllerState.from_dict(d) for d in json.load(f)]
-    except (OSError, ValueError, KeyError, TypeError):
-        return []

@@ -1,13 +1,18 @@
-"""The web dashboard: a Quart (ASGI) app with Jinja templates that streams the
-per-pool status to the browser over Server-Sent Events (no polling).
+"""The single HTTP surface: an async Quart app serving every endpoint, plus a
+coroutine the CLI awaits to run it on the main event loop.
 
-Kept entirely separate from the stdlib status server (`http_server.py`), which
-still serves `/status` / `/metrics` / `/healthz` zero-dep for huskctl, Prometheus,
-and k8s probes. The dashboard reads the SAME in-memory snapshot provider (a 0-arg
-callable returning `list[ControllerState]`), so it never touches the backends.
+  GET /         — live dashboard (Jinja + SSE, no polling)
+  GET /status   — JSON list of ControllerState, one per pool (huskctl, dashboards)
+  GET /metrics  — Prometheus text exposition (per-pool gauges, backend="..." label)
+  GET /healthz  — 200 if every pool has a recent reconcile, else 503
+  GET /events   — Server-Sent Events stream of the per-pool snapshots
 
-Importing this module requires the `web` extra (quart + hypercorn); the CLI guards
-the import so huskd runs without the dashboard when it isn't installed.
+All endpoints read the SAME in-memory snapshot provider (a 0-arg callable
+returning `list[ControllerState]`, swapped atomically per tick), so they never
+touch the backends and a cross-thread read is safe. The reconcile loop runs in a
+background thread; this app owns the event loop on the main thread (see
+`husk.cli._serve`). No auth: it exposes slot ids / runner names (not secrets) —
+bind to localhost unless it sits behind network controls.
 """
 
 from __future__ import annotations
@@ -15,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import threading
+import time
 from typing import Callable
 
 from hypercorn.asyncio import serve
@@ -29,13 +34,88 @@ log = logging.getLogger("husk.web")
 # How often the SSE stream pushes a fresh snapshot to each connected dashboard.
 _PUSH_INTERVAL_S = 2.0
 
+# /healthz reports 503 once a pool's last reconcile is older than this.
+STALE_AFTER_SEC = 60
+
+
+def parse_addr(addr: str) -> tuple[str, int]:
+    """Split a "host:port" bind address. Bare ":9100" / "9100" bind all interfaces."""
+    addr = addr.strip()
+    if ":" in addr:
+        host, _, port = addr.rpartition(":")
+        return (host or "0.0.0.0", int(port))
+    return ("0.0.0.0", int(addr))
+
+
+def render_prometheus(s: ControllerState) -> str:
+    b = s.backend
+    out = [
+        "# HELP husk_slots Slots by classified state",
+        "# TYPE husk_slots gauge",
+    ]
+    out += [
+        f'husk_slots{{backend="{b}",state="{state}"}} {n}'
+        for state, n in s.counts.items()
+    ]
+    out += [
+        "# HELP husk_slots_desired Desired total slots",
+        "# TYPE husk_slots_desired gauge",
+        f'husk_slots_desired{{backend="{b}"}} {s.desired_total}',
+        "# HELP husk_slots_min_ready Configured min_ready",
+        "# TYPE husk_slots_min_ready gauge",
+        f'husk_slots_min_ready{{backend="{b}"}} {s.min_ready}',
+        "# HELP husk_slots_max_total Configured max_total",
+        "# TYPE husk_slots_max_total gauge",
+        f'husk_slots_max_total{{backend="{b}"}} {s.max_total}',
+        "# HELP husk_last_reconcile_timestamp_seconds Unix time of the last reconcile",
+        "# TYPE husk_last_reconcile_timestamp_seconds gauge",
+        f'husk_last_reconcile_timestamp_seconds{{backend="{b}"}} {s.last_reconcile_epoch}',
+        "# HELP husk_reconcile_generation Monotonic reconcile counter",
+        "# TYPE husk_reconcile_generation counter",
+        f'husk_reconcile_generation{{backend="{b}"}} {s.generation}',
+    ]
+    # Per-slot timing (low cardinality — slots are long-lived). Emit only when
+    # a value exists so a never-recycled slot doesn't report a bogus 0.
+    out += [
+        "# HELP husk_slot_last_cloudinit_seconds Last ACTIVE->runner-online duration",
+        "# TYPE husk_slot_last_cloudinit_seconds gauge",
+    ]
+    out += [
+        f'husk_slot_last_cloudinit_seconds{{backend="{b}",slot="{v.name}"}} {v.cloudinit_seconds}'
+        for v in s.slots
+        if v.cloudinit_seconds is not None
+    ]
+    out += [
+        "# HELP husk_slot_last_recycle_seconds Last issue->runner-online duration",
+        "# TYPE husk_slot_last_recycle_seconds gauge",
+    ]
+    out += [
+        f'husk_slot_last_recycle_seconds{{backend="{b}",slot="{v.name}"}} {v.recycle_seconds}'
+        for v in s.slots
+        if v.recycle_seconds is not None
+    ]
+    out += [
+        "# HELP husk_slot_live_fraction Fraction of tracked time the slot was available to serve (busy or idle)",
+        "# TYPE husk_slot_live_fraction gauge",
+    ]
+    out += [
+        f'husk_slot_live_fraction{{backend="{b}",slot="{v.name}"}} {v.live_fraction}'
+        for v in s.slots
+        if v.live_fraction is not None
+    ]
+    return "\n".join(out) + "\n"
+
 
 def make_app(snapshot_provider: Callable[[], list[ControllerState]]) -> Quart:
-    """Build the dashboard app over a per-pool snapshot provider."""
-    app = Quart(__name__)  # templates/ resolved relative to this package
+    """Build the app over a per-pool snapshot provider (the same one every
+    endpoint reads). Templates resolve relative to this package."""
+    app = Quart(__name__)
+
+    def _snaps() -> list[ControllerState]:
+        return snapshot_provider() or []
 
     def _payload() -> str:
-        return json.dumps([s.to_dict() for s in (snapshot_provider() or [])])
+        return json.dumps([s.to_dict() for s in _snaps()])
 
     @app.get("/")
     async def index():
@@ -43,8 +123,27 @@ def make_app(snapshot_provider: Callable[[], list[ControllerState]]) -> Quart:
 
     @app.get("/status")
     async def status():
-        # Same shape as the stdlib /status, so the page can fall back to a fetch.
         return Response(_payload(), content_type="application/json")
+
+    @app.get("/metrics")
+    async def metrics():
+        # Per-pool series are distinguished by the backend="..." label already on
+        # every metric, so concatenation across pools is a valid exposition.
+        body = "".join(render_prometheus(s) for s in _snaps())
+        return Response(body, content_type="text/plain; version=0.0.4; charset=utf-8")
+
+    @app.get("/healthz")
+    async def healthz():
+        # Healthy only when every pool has published a recent reconcile.
+        snaps = _snaps()
+        ok = bool(snaps) and all(
+            (time.time() - s.last_reconcile_epoch) <= STALE_AFTER_SEC for s in snaps
+        )
+        return Response(
+            "ok\n" if ok else "stale\n",
+            status=200 if ok else 503,
+            content_type="text/plain",
+        )
 
     @app.get("/events")
     async def events():
@@ -67,43 +166,14 @@ def make_app(snapshot_provider: Callable[[], list[ControllerState]]) -> Quart:
     return app
 
 
-class WebServer:
-    """Runs a Quart app on its own asyncio loop in a daemon thread (mirrors
-    `http_server.StatusServer`'s lifecycle so the CLI manages both the same way)."""
+async def serve_app(app: Quart, host: str, port: int, *, shutdown_trigger) -> None:
+    """Serve `app` on the current event loop until `shutdown_trigger` fires.
 
-    def __init__(self, app: Quart, host: str, port: int) -> None:
-        self._app = app
-        self._host = host
-        self._port = port
-        self._thread: threading.Thread | None = None
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._shutdown: asyncio.Event | None = None
-
-    def start(self) -> None:
-        self._thread = threading.Thread(target=self._run, name="husk-web", daemon=True)
-        self._thread.start()
-        log.info("web dashboard listening on http://%s:%d", self._host, self._port)
-
-    def _run(self) -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        self._loop = loop
-        self._shutdown = asyncio.Event()
-        cfg = HypercornConfig()
-        cfg.bind = [f"{self._host}:{self._port}"]
-        cfg.accesslog = None
-        cfg.errorlog = None
-        try:
-            # shutdown_trigger avoids hypercorn's signal handlers (which only work
-            # on the main thread); stop() fires the event to unblock serve().
-            loop.run_until_complete(
-                serve(self._app, cfg, shutdown_trigger=self._shutdown.wait)
-            )
-        finally:
-            loop.close()
-
-    def stop(self) -> None:
-        if self._loop is not None and self._shutdown is not None:
-            self._loop.call_soon_threadsafe(self._shutdown.set)
-        if self._thread is not None:
-            self._thread.join(timeout=3)
+    Drives hypercorn directly (not `app.run`) so it installs NO signal handlers —
+    the caller owns SIGINT/SIGTERM and trips `shutdown_trigger`. Works on any
+    thread, so tests can run it on a background loop."""
+    cfg = HypercornConfig()
+    cfg.bind = [f"{host}:{port}"]
+    cfg.accesslog = None
+    cfg.errorlog = None
+    await serve(app, cfg, shutdown_trigger=shutdown_trigger)

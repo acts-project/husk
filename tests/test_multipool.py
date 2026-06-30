@@ -1,5 +1,5 @@
 """MultiPoolController: pools reconcile independently, never cross-delete each
-other's runners, and one pool's failure can't suppress the others or the publish."""
+other's runners, and one pool's failure can't suppress the others' snapshots."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ def _pool(name, prefix, *, github=None, slots=None, runners=None, **cfg_kw):
     cfg = dataclasses.replace(
         cfg,
         backend=dataclasses.replace(cfg.backend, name=name, vm_prefix=prefix),
-        controller=dataclasses.replace(cfg.controller, state_path="", http_addr=""),
+        controller=dataclasses.replace(cfg.controller, http_addr=""),
     )
     ctrl = Controller(backend, gh, cfg, clock=FakeClock())
     return ctrl, backend, gh
@@ -65,33 +65,30 @@ def test_no_cross_pool_runner_deletion():
     assert {r.id for r in shared.runners} == {2}
 
 
-def test_one_pool_raise_does_not_block_others_or_publish(tmp_path, monkeypatch):
-    from husk.snapshot import read_states
-
+def test_one_pool_raise_does_not_block_others(monkeypatch):
     a, _, _ = _pool("pool-a", "husk-a", min_ready=1)
-    b, backend_b, _ = _pool("pool-b", "husk-b", min_ready=1)
+    b, _, _ = _pool("pool-b", "husk-b", min_ready=1)
     monkeypatch.setattr(a, "tick", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
 
-    state = str(tmp_path / "state.json")
-    MultiPoolController([a, b], state_path=state).tick_all()
+    facade = MultiPoolController([a, b])
+    facade.tick_all()
 
-    published = {s.backend: s for s in read_states(state)}
-    assert set(published) == {"pool-a", "pool-b"}
+    # snapshots() reads each pool's in-memory state (no file).
+    snaps = {s.backend: s for s in facade.snapshots()}
+    assert set(snaps) == {"pool-a", "pool-b"}
     # pool-b ticked (generation advanced); pool-a stayed at its seeded snapshot.
-    assert published["pool-b"].generation >= 1
-    assert published["pool-a"].generation == 0
+    assert snaps["pool-b"].generation >= 1
+    assert snaps["pool-a"].generation == 0
 
 
 def test_reload_matches_by_name_without_structural_warning(caplog):
     a, _, _ = _pool("pool-a", "husk-a", min_ready=1, max_total=2)
-    # The reload yields the file's REAL controller paths; the facade must normalize
-    # them (facade owns state/http) so no spurious "structural changes" warning.
+    # The reload yields the file's REAL controller http_addr; the facade must
+    # normalize it (facade owns http) so no spurious "structural changes" warning.
     new = dataclasses.replace(
         make_config(min_ready=3, max_total=5),
         backend=dataclasses.replace(a.cfg.backend, min_ready=3, max_total=5),
-        controller=dataclasses.replace(
-            a.cfg.controller, state_path="/real/state.json", http_addr="127.0.0.1:9100"
-        ),
+        controller=dataclasses.replace(a.cfg.controller, http_addr="127.0.0.1:9100"),
     )
     facade = MultiPoolController([a], reload_configs=lambda: [new])
 

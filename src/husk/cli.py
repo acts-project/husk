@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import logging
 import os
+import signal
+import threading
 import time
 from pathlib import Path
 from typing import Annotated, Callable, Optional
@@ -358,7 +361,7 @@ def run(
     """Run the reconcile loop across every [[pool]] (or a single tick with --once)."""
     _setup_logging(log_level)
     cfgs = _load_all(config, secrets_dir)
-    # One lock / state file / HTTP port for the whole daemon (shared [controller]).
+    # One lock / HTTP port for the whole daemon (shared [controller]).
     shared = cfgs[0].controller
     lock = SingleControllerLock(shared.lock_path)
     try:
@@ -366,13 +369,11 @@ def run(
     except LockHeld as e:
         typer.echo(str(e), err=True)
         raise typer.Exit(code=1)
-    server = None
-    web = None
     try:
-        # One Controller per pool. The facade owns publish + HTTP + reload, so the
-        # sub-controllers get blanked state_path/http_addr and no reload hook. A pool
-        # that can't be built (bad backend config, unreachable cloud) is skipped with
-        # a loud error rather than taking the whole daemon down — the other pools run.
+        # One Controller per pool. The facade owns the loop + HTTP + reload, so the
+        # sub-controllers get a blanked http_addr and no reload hook. A pool that
+        # can't be built (bad backend config, unreachable cloud) is skipped with a
+        # loud error rather than taking the whole daemon down — the other pools run.
         controllers = []
         for cfg in cfgs:
             try:
@@ -388,9 +389,7 @@ def run(
                 continue
             sub = dataclasses.replace(
                 cfg,
-                controller=dataclasses.replace(
-                    cfg.controller, state_path="", http_addr=""
-                ),
+                controller=dataclasses.replace(cfg.controller, http_addr=""),
             )
             controllers.append(Controller(backend, github, sub))
         if not controllers:
@@ -398,7 +397,6 @@ def run(
             raise typer.Exit(code=1)
         facade = MultiPoolController(
             controllers,
-            state_path=shared.state_path,
             reload_configs=_configs_reloader(config, secrets_dir),
         )
         if once:
@@ -406,37 +404,35 @@ def run(
             for snap in facade.snapshots():
                 _print_status(snap)
         else:
-            from husk.http_server import parse_addr
-
-            if shared.http_addr:
-                from husk.http_server import StatusServer
-
-                host, port = parse_addr(shared.http_addr)
-                server = StatusServer(facade.snapshots, host, port)
-                server.start()
-            if shared.web_addr:
-                try:
-                    from husk.web import WebServer, make_app
-
-                    whost, wport = parse_addr(shared.web_addr)
-                    web = WebServer(make_app(facade.snapshots), whost, wport)
-                    web.start()
-                except ImportError:
-                    typer.echo(
-                        "web dashboard needs the 'web' extra "
-                        "(pip install 'husk[web]'); continuing without it",
-                        err=True,
-                    )
-            try:
-                facade.run()
-            except KeyboardInterrupt:
-                typer.echo("shutting down", err=True)
+            if not shared.http_addr:
+                typer.echo("controller.http_addr must be set", err=True)
+                raise typer.Exit(code=1)
+            asyncio.run(_serve(facade, shared.http_addr))
     finally:
-        if web is not None:
-            web.stop()
-        if server is not None:
-            server.stop()
         lock.release()
+
+
+async def _serve(facade: MultiPoolController, http_addr: str) -> None:
+    """Run the reconcile loop on a background thread while Quart serves every
+    endpoint on this event loop. SIGINT/SIGTERM trip the shutdown event, which
+    stops hypercorn (via `shutdown_trigger`) and then the reconcile loop."""
+    from husk.web import make_app, parse_addr, serve_app
+
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop.set)
+
+    thread = threading.Thread(target=facade.run, name="husk-reconcile", daemon=True)
+    thread.start()
+    try:
+        host, port = parse_addr(http_addr)
+        await serve_app(
+            make_app(facade.snapshots), host, port, shutdown_trigger=stop.wait
+        )
+    finally:
+        facade.stop()
+        thread.join(timeout=5)
 
 
 # ------------------------------------------------------------------- huskctl
@@ -458,13 +454,6 @@ def status(
             "--url", help="huskd status URL (default: from controller.http_addr)"
         ),
     ] = None,
-    live: Annotated[
-        bool,
-        typer.Option(
-            "--live",
-            help="Query OpenStack/GitHub directly instead of huskd's published state",
-        ),
-    ] = False,
     pool: Annotated[
         Optional[str],
         typer.Option(
@@ -474,13 +463,11 @@ def status(
 ) -> None:
     """Show the current state of every pool (or one with --pool).
 
-    Source priority: --live (query OpenStack/GitHub directly) > --url / huskd's
-    HTTP endpoint > the published state file. The default renders huskd's exact
-    snapshot with no extra API calls; --live can't see huskd's in-memory grace
-    tracking, so transient STARTING/draining slots may read UNHEALTHY there."""
+    Reads huskd's live snapshot over HTTP (`--url` or `controller.http_addr`).
+    huskd must be running; there is no offline source."""
     _setup_logging(log_level)
     cfgs = _load_all(config, secrets_dir)
-    getter = _snapshot_getter(cfgs, live=live, url=url, pool=pool)
+    getter = _snapshot_getter(cfgs, url=url)
 
     if watch:
         _watch_status(getter, interval)
@@ -504,64 +491,29 @@ def status(
             _print_status(snap)
 
 
-def _snapshot_getter(
-    cfgs: list[Config],
-    *,
-    live: bool,
-    url: Optional[str] = None,
-    pool: Optional[str] = None,
-):
-    """Return a callable yielding the per-pool snapshots (a list) each call.
-
-    Priority: --live (recompute) > HTTP (--url or controller.http_addr) > the
-    published state file. Each getter raises a clear error on failure so the
-    one-shot exits non-zero and the watcher shows the error and keeps polling."""
-    from husk.snapshot import ControllerState as _CS
-    from husk.snapshot import read_states
-
-    if live:
-        # Build only the requested pool when --pool is given (avoids spinning up
-        # every backend connection just to read one).
-        targets = [c for c in cfgs if pool is None or c.backend.name == pool]
-        ctrls: list = []  # built lazily, reused across watch frames
-
-        def from_live() -> list[ControllerState]:
-            if not ctrls:
-                for c in targets:
-                    backend, github = _build(c)
-                    ctrls.append(Controller(backend, github, c))
-            return [c.observe() for c in ctrls]
-
-        return from_live
+def _snapshot_getter(cfgs: list[Config], *, url: Optional[str] = None):
+    """Return a callable that fetches the per-pool snapshots from huskd over HTTP
+    each call. Raises a clear error on failure so the one-shot exits non-zero and
+    the watcher shows the error and keeps polling."""
+    import urllib.request
 
     shared = cfgs[0].controller
     target = url or (f"http://{shared.http_addr}/status" if shared.http_addr else None)
-    if target:
-        import urllib.request
 
-        def from_http() -> list[ControllerState]:
-            try:
-                with urllib.request.urlopen(target, timeout=5) as r:
-                    return [_CS.from_dict(d) for d in json.loads(r.read())]
-            except Exception as e:
-                raise RuntimeError(
-                    f"could not fetch status from {target}: {e} "
-                    "(is huskd running? use --live to query directly)"
-                )
-
-        return from_http
-
-    path = shared.state_path
-
-    def from_file() -> list[ControllerState]:
-        snaps = read_states(path)
-        if not snaps:
+    def from_http() -> list[ControllerState]:
+        if not target:
             raise RuntimeError(
-                f"no huskd state at {path} — is huskd running? (use --live to query directly)"
+                "no huskd HTTP endpoint: set controller.http_addr or pass --url"
             )
-        return snaps
+        try:
+            with urllib.request.urlopen(target, timeout=5) as r:
+                return [ControllerState.from_dict(d) for d in json.loads(r.read())]
+        except Exception as e:
+            raise RuntimeError(
+                f"could not fetch status from {target}: {e} (is huskd running?)"
+            )
 
-    return from_file
+    return from_http
 
 
 @huskctl_app.command()
