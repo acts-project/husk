@@ -106,9 +106,18 @@ def render_prometheus(s: ControllerState) -> str:
     return "\n".join(out) + "\n"
 
 
-def make_app(snapshot_provider: Callable[[], list[ControllerState]]) -> Quart:
+def make_app(
+    snapshot_provider: Callable[[], list[ControllerState]],
+    *,
+    shutdown: asyncio.Event | None = None,
+) -> Quart:
     """Build the app over a per-pool snapshot provider (the same one every
-    endpoint reads). Templates resolve relative to this package."""
+    endpoint reads). Templates resolve relative to this package.
+
+    `shutdown`, if given, is the server's shutdown event: the long-lived `/events`
+    SSE stream watches it and returns promptly when it fires, so a connected
+    dashboard doesn't hold graceful shutdown open until hypercorn's much longer
+    `shutdown_timeout` (this is what made Ctrl-C appear to hang)."""
     app = Quart(__name__)
 
     def _snaps() -> list[ControllerState]:
@@ -149,11 +158,21 @@ def make_app(snapshot_provider: Callable[[], list[ControllerState]]) -> Quart:
     async def events():
         async def stream():
             # Send immediately, then on every push interval. EventSource on the
-            # client auto-reconnects if the stream drops.
+            # client auto-reconnects if the stream drops. The inter-push wait races
+            # the server shutdown event, so on Ctrl-C the stream returns at once
+            # instead of holding the connection open through graceful shutdown.
             try:
-                while True:
+                while shutdown is None or not shutdown.is_set():
                     yield f"data: {_payload()}\n\n".encode()
-                    await asyncio.sleep(_PUSH_INTERVAL_S)
+                    if shutdown is None:
+                        await asyncio.sleep(_PUSH_INTERVAL_S)
+                    else:
+                        try:
+                            await asyncio.wait_for(
+                                shutdown.wait(), timeout=_PUSH_INTERVAL_S
+                            )
+                        except asyncio.TimeoutError:
+                            pass  # normal push cadence; loop and send again
             except asyncio.CancelledError:  # client disconnected
                 return
 
@@ -176,4 +195,7 @@ async def serve_app(app: Quart, host: str, port: int, *, shutdown_trigger) -> No
     cfg.bind = [f"{host}:{port}"]
     cfg.accesslog = None
     cfg.errorlog = None
+    # Bound a stuck response at shutdown (default is 60s): the SSE stream already
+    # exits cooperatively, this just caps any other slow handler on Ctrl-C.
+    cfg.shutdown_timeout = 3.0
     await serve(app, cfg, shutdown_trigger=shutdown_trigger)

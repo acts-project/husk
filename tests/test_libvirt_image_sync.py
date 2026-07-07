@@ -24,7 +24,7 @@ class FakeSync:
         self.digest = digest
         self.calls = 0
 
-    def resolve(self, ref: str) -> ResolvedImage:
+    def resolve(self, ref: str, report=None) -> ResolvedImage:
         self.calls += 1
         return ResolvedImage(ref=ref, digest=self.digest, local_path="/cache/img.qcow2")
 
@@ -59,7 +59,9 @@ def test_sync_pulls_pushes_and_stamps_digest():
     b._ssh = lambda host, cmd, data=None: (
         ssh.append(cmd) or (b"n\n" if cmd.startswith("test -s") else b"")
     )
-    b._push_file = lambda host, local, remote: pushed.append((local, remote))
+    b._push_file = lambda host, local, remote, report=None: pushed.append(
+        (local, remote)
+    )
 
     b.sync_images(b.cfg)
 
@@ -89,7 +91,7 @@ def test_sync_skips_push_when_host_already_has_digest():
     pushed = []
     # test -s reports the golden already present → no push, just adopt it.
     b._ssh = lambda host, cmd, data=None: b"y\n" if cmd.startswith("test -s") else b""
-    b._push_file = lambda host, local, remote: pushed.append(remote)
+    b._push_file = lambda host, local, remote, report=None: pushed.append(remote)
 
     b.sync_images(b.cfg)
     assert pushed == []
@@ -201,7 +203,9 @@ def test_push_rejects_truncated_transfer(tmp_path):
     host = b._hosts["h1"]
     src = tmp_path / "img.qcow2"
     src.write_bytes(b"x" * 2048)
-    b._push_file = lambda host, local, remote: None  # pretend the push happened
+    b._push_file = lambda host, local, remote, report=None: (
+        None
+    )  # pretend the push happened
 
     def ssh_truncated(host, cmd, data=None):
         if cmd.startswith("test -s"):
@@ -241,6 +245,23 @@ def test_capacity_is_zero_until_image_staged():
     b._hosts["h1"].image_digest = CURR  # golden staged
     cap = b.capacity()
     assert cap.can_create and cap.free_instances > 0
+
+
+def test_occupied_ignores_untagged_legacy_domains():
+    # A pre-pool-tag legacy domain (no "pool" in its metadata) is invisible to
+    # list_slots and GC'd by nothing, so if _occupied counted it the unit would be
+    # pinned forever and the pool could never grow onto it. Tagged domains (any
+    # pool, for cross-pool unit safety) still count.
+    b = _backend(max_slots=2)  # host units → cpu0, cpu1
+    b._hosts["h1"].image_digest = CURR  # host ready → units contribute capacity
+    b._list_raw = lambda: [
+        ("h1", object(), {"pool": "lv", "unit": "cpu0"}),  # our live slot → counts
+        ("h1", object(), {"unit": "cpu1"}),  # legacy orphan (no pool) → ignored
+    ]
+
+    assert b._occupied() == {("h1", "cpu0")}  # cpu1 orphan does not occupy
+    cap = b.capacity()
+    assert cap.can_create and cap.free_instances == 1  # cpu1 is free to grow onto
 
 
 def test_no_image_source_is_rejected():

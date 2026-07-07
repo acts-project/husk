@@ -24,7 +24,7 @@ class FakeSync:
         self.digest = digest
         self.calls = 0
 
-    def resolve(self, ref: str) -> ResolvedImage:
+    def resolve(self, ref: str, report=None) -> ResolvedImage:
         self.calls += 1
         return ResolvedImage(ref=ref, digest=self.digest, local_path="/cache/img.qcow2")
 

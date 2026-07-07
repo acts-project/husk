@@ -102,15 +102,16 @@ class ImageSync:
             self._client = self._client_factory()
         return self._client
 
-    def resolve(self, ref: str) -> ResolvedImage:
+    def resolve(self, ref: str, report=None) -> ResolvedImage:
         """Ensure `ref` is present in the controller cache; return its concrete
         qcow2 digest + local path.
 
         Idempotent: a ref already cached at its current digest is reused without a
         re-pull. The manifest is read first to learn the qcow2 layer digest, so a
         moved tag re-pulls (new digest ⇒ new cache dir) while a stable tag/digest
-        is a no-op."""
-        digest = self._qcow2_digest(ref)
+        is a no-op. `report` (if given) receives a live "N/M MiB (P%)" line during
+        a slow pull, for the status board."""
+        digest, size = self._qcow2_layer(ref)
         dest = os.path.join(self.cache_dir, digest.replace(":", "-"))
         cached = self._qcow2_in(dest)
         if cached is not None:
@@ -124,7 +125,7 @@ class ImageSync:
         stop = threading.Event()
         threading.Thread(
             target=self._log_pull_progress,
-            args=(ref, tmp, stop),
+            args=(ref, tmp, stop, size, report),
             name="husk-pull-progress",
             daemon=True,
         ).start()
@@ -152,11 +153,14 @@ class ImageSync:
         log.info("image %s ready at %s", ref, local)
         return ResolvedImage(ref=ref, digest=digest, local_path=local)
 
-    def _log_pull_progress(self, ref: str, tmp: str, stop) -> None:
-        """Log how many MiB have been pulled into the temp dir every
+    def _log_pull_progress(
+        self, ref: str, tmp: str, stop, total: int = 0, report=None
+    ) -> None:
+        """Log how much has been pulled into the temp dir every
         `_PULL_PROGRESS_INTERVAL_S`, so a slow multi-GB registry pull isn't a silent
-        gap. Best-effort: the total isn't known up front, so it reports bytes so far
-        and stops the moment the pull completes."""
+        gap; if given a `report` sink, push the same line onto the op. When the
+        manifest gave a layer `total`, report a percentage, else bytes so far.
+        Best-effort: it stops the moment the pull completes."""
         while not stop.wait(_PULL_PROGRESS_INTERVAL_S):
             try:
                 got = sum(
@@ -167,10 +171,19 @@ class ImageSync:
             except OSError:
                 continue
             if got > 0:
-                log.info("pulling %s: %d MiB so far", ref, got >> 20)
+                line = (
+                    f"pulling golden: {got >> 20}/{total >> 20} MiB "
+                    f"({100 * got // total}%)"
+                    if total > 0
+                    else f"pulling golden: {got >> 20} MiB so far"
+                )
+                log.info("%s (%s)", line, ref)
+                if report is not None:
+                    report(line)
 
-    def _qcow2_digest(self, ref: str) -> str:
-        """The digest of the artifact's qcow2 layer (its content hash)."""
+    def _qcow2_layer(self, ref: str) -> tuple[str, int]:
+        """The (digest, size-in-bytes) of the artifact's qcow2 layer. `size` is 0
+        if the manifest omits it (then pull progress falls back to bytes-so-far)."""
         last: Exception | None = None
         for attempt in range(_MANIFEST_ATTEMPTS):
             try:
@@ -189,13 +202,13 @@ class ImageSync:
         # Prefer the husk qcow2 mediaType; fall back to the only layer / a .qcow2 title.
         for layer in layers:
             if layer.get("mediaType") == _QCOW2_MEDIA_TYPE and layer.get("digest"):
-                return layer["digest"]
+                return layer["digest"], int(layer.get("size") or 0)
         for layer in layers:
             title = (layer.get("annotations") or {}).get(
                 "org.opencontainers.image.title", ""
             )
             if title.endswith(".qcow2") and layer.get("digest"):
-                return layer["digest"]
+                return layer["digest"], int(layer.get("size") or 0)
         raise ImageSyncError(
             f"artifact {ref!r} has no {_QCOW2_MEDIA_TYPE} layer (layers: "
             f"{[layer.get('mediaType') for layer in layers]})"

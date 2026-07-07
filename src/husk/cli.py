@@ -428,7 +428,10 @@ async def _serve(facade: MultiPoolController, http_addr: str) -> None:
     try:
         host, port = parse_addr(http_addr)
         await serve_app(
-            make_app(facade.snapshots), host, port, shutdown_trigger=stop.wait
+            make_app(facade.snapshots, shutdown=stop),
+            host,
+            port,
+            shutdown_trigger=stop.wait,
         )
     finally:
         facade.stop()

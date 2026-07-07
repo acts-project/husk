@@ -325,10 +325,16 @@ class LibvirtBackend:
         return host_name, host, host.conn().lookupByUUIDString(dom_uuid)
 
     def _occupied(self) -> set[tuple[str, str]]:
+        # Units held by live domains, pool-blind ON PURPOSE: two pools can share a
+        # host, so a sibling pool's units (e.g. a GPU PCI address) must be seen here
+        # or placement/capacity would double-book them. But require a `pool` tag:
+        # current huskd always stamps one at create, so an UNtagged domain is a
+        # pre-upgrade legacy leftover (invisible to list_slots, GC'd by nothing) and
+        # must not silently consume a unit forever.
         return {
             (host_name, meta["unit"])
             for host_name, _dom, meta in self._list_raw()
-            if meta.get("unit")
+            if meta.get("unit") and meta.get("pool")
         }
 
     def _host_ready(self, host: _HostConn) -> bool:
@@ -410,19 +416,21 @@ class LibvirtBackend:
         tick adopts; it does NOT touch live host fields (only the tick thread does,
         in sync_images)."""
         report("pulling golden from registry")
-        resolved = self._sync.resolve(ref)
+        resolved = self._sync.resolve(ref, report=report)
         golden = f"husk-golden-{resolved.short}.qcow2"
         for host in self._hosts.values():
             if (host.cfg.image_ref or self._backend_ref) == ref:
                 report(f"staging to host {host.cfg.name}")
-                self._ensure_on_host(host, resolved.local_path, golden)
+                self._ensure_on_host(host, resolved.local_path, golden, report)
                 # Mark this pool's current golden the moment it lands, BEFORE the
                 # tick adopts it — so another pool sharing this host's pool dir
                 # can't GC a freshly-staged golden in the pre-adopt window.
                 self._mark_current(host, golden)
         return _GoldenPrepared(digest=resolved.digest, golden=golden)
 
-    def _ensure_on_host(self, host: _HostConn, local_path: str, golden: str) -> None:
+    def _ensure_on_host(
+        self, host: _HostConn, local_path: str, golden: str, report=None
+    ) -> None:
         """Place `local_path` into the host pool as `golden`, if not already there.
 
         Idempotent (skip a present, non-empty file) and atomic (push to a temp
@@ -450,7 +458,7 @@ class LibvirtBackend:
             host.cfg.name,
         )
         if host.cfg.ssh_target:
-            self._push_file(host, local_path, tmp)
+            self._push_file(host, local_path, tmp, report)
         else:  # local host: a plain copy within the same filesystem
             self._ssh(host, f"cp {shlex.quote(local_path)} {shlex.quote(tmp)}")
         # Verify the whole file landed before publishing it — never `mv` a truncated
@@ -471,7 +479,9 @@ class LibvirtBackend:
         self._ssh(host, f"mv {shlex.quote(tmp)} {shlex.quote(remote)}")
         log.info("staged %s on host %s", golden, host.cfg.name)
 
-    def _push_file(self, host: _HostConn, local_path: str, remote_path: str) -> None:
+    def _push_file(
+        self, host: _HostConn, local_path: str, remote_path: str, report=None
+    ) -> None:
         argv = [
             "scp",
             "-o",
@@ -491,7 +501,7 @@ class LibvirtBackend:
         if total:
             threading.Thread(
                 target=self._log_push_progress,
-                args=(host, remote_path, total, stop),
+                args=(host, remote_path, total, stop, report),
                 name="husk-stage-progress",
                 daemon=True,
             ).start()
@@ -510,11 +520,17 @@ class LibvirtBackend:
             )
 
     def _log_push_progress(
-        self, host: _HostConn, remote_path: str, total: int, stop: threading.Event
+        self,
+        host: _HostConn,
+        remote_path: str,
+        total: int,
+        stop: threading.Event,
+        report=None,
     ) -> None:
         """Poll the destination size every `_PROGRESS_INTERVAL_S` and log MiB/% so a
-        slow golden transfer is visible in the log. Best-effort: a failed probe is
-        skipped, and it stops the moment the push finishes (or errors)."""
+        slow golden transfer is visible in the log; if given a `report` sink, push
+        the same line onto the op so the dashboard shows it live. Best-effort: a
+        failed probe is skipped, and it stops the moment the push finishes."""
         while not stop.wait(_PROGRESS_INTERVAL_S):
             try:
                 got = int(
@@ -527,13 +543,13 @@ class LibvirtBackend:
             except Exception:
                 continue
             if got > 0:
-                log.info(
-                    "staging to host %s: %d/%d MiB (%d%%)",
-                    host.cfg.name,
-                    got >> 20,
-                    total >> 20,
-                    100 * got // total,
+                line = (
+                    f"host {host.cfg.name}: {got >> 20}/{total >> 20} MiB "
+                    f"({100 * got // total}%)"
                 )
+                log.info("staging to %s", line)
+                if report is not None:
+                    report(line)
 
     def _marker_path(self, host: _HostConn) -> str:
         """On-host file recording THIS pool's current golden, so a pool sharing the

@@ -208,9 +208,8 @@ class OpenStackBackend:
         """Heavy staging (op worker): pull the OCI golden to the controller cache
         and ensure it's uploaded to Glance. Returns what the tick adopts."""
         report("pulling golden from registry")
-        resolved = self._sync.resolve(ref)
-        report("uploading golden to Glance")
-        image_id = self._ensure_in_glance(self._upload_conn(), resolved)
+        resolved = self._sync.resolve(ref, report=report)
+        image_id = self._ensure_in_glance(self._upload_conn(), resolved, report)
         return _GlancePrepared(digest=resolved.digest, image_id=image_id)
 
     def _upload_conn(self):
@@ -220,16 +219,22 @@ class OpenStackBackend:
             self._image_conn = openstack.connect(cloud=self.cfg.cloud)
         return self._image_conn
 
-    def _ensure_in_glance(self, conn, resolved) -> str:
+    def _ensure_in_glance(self, conn, resolved, report=None) -> str:
         """Return the Glance image id for a resolved OCI golden, uploading it once
         if absent. Idempotent + content-addressed: the image is named
         `husk-golden-<digest12>`, so a present image of the same digest is reused
-        and a moved tag uploads a new image rather than mutating one in use."""
+        and a moved tag uploads a new image rather than mutating one in use.
+
+        The "uploading" progress is reported only on an actual upload — a reused
+        image is a no-op, so a restart against an already-staged golden shows no
+        spurious upload activity."""
         name = f"{GLANCE_PREFIX}{resolved.short}"
         existing = conn.image.find_image(name)
         if existing is not None:
             log.debug("Glance already has golden %s (%s)", name, existing.id)
             return existing.id
+        if report is not None:
+            report("uploading golden to Glance")
         log.info("uploading golden %s to Glance (qcow2, may take a while)", name)
         # create_image streams the file and waits for the image to go active.
         # disk/container formats match a bare qcow2; the digest is stamped as an
