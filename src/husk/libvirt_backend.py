@@ -48,6 +48,12 @@ log = logging.getLogger("husk.libvirt")
 # Timeouts — a control plane must never be wedged by one unresponsive host.
 _SSH_TIMEOUT_S = 60  # cap each host-side qemu-img/genisoimage/rm command
 _SSH_CONNECT_TIMEOUT_S = 15  # cap the ssh TCP/auth handshake
+# Hard wall-clock bound on the *initial* libvirt.open() connect. libvirt-python's
+# open() takes no timeout and the qemu+ssh transport doesn't bound its own
+# handshake, so a down host would otherwise block the caller (the reconcile
+# thread) for the full kernel SYN-retry window. A bit above the ssh connect bound
+# to leave headroom for the libvirtd RPC negotiation on a healthy host.
+_CONNECT_TIMEOUT_S = _SSH_CONNECT_TIMEOUT_S + 5
 _PUSH_TIMEOUT_S = 3600  # a golden qcow2 is multi-GB; scp to a host can be slow
 _PROGRESS_INTERVAL_S = 30  # how often to log golden-transfer progress (MiB/%)
 # libvirt RPC keepalive: probe every N seconds, drop the connection after C
@@ -102,12 +108,53 @@ class _HostConn:
         """Open (or reopen a dropped) libvirt connection."""
         if self._conn is None or not self._alive():
             log.debug("opening libvirt connection %s", self.cfg.libvirt_uri)
-            self._conn = libvirt.open(self.cfg.libvirt_uri)
+            self._conn = self._open()
             try:  # bound in-flight RPCs to a wedged host (needs the event loop)
                 self._conn.setKeepAlive(_KEEPALIVE_INTERVAL_S, _KEEPALIVE_COUNT)
             except libvirt.libvirtError:
                 log.debug("keepalive unsupported on %s", self.cfg.libvirt_uri)
         return self._conn
+
+    def _open(self):
+        """`libvirt.open` under a hard wall-clock bound (see `_CONNECT_TIMEOUT_S`).
+
+        The keepalive set in `conn()` only bounds RPCs on an *already-open*
+        connection — it can't rescue this initial connect, which for a down host
+        would otherwise hang for minutes and (since it runs on the reconcile
+        thread via list_slots/sync_images) wedge the whole loop. So run the
+        connect on a throwaway daemon thread and give up on it after the bound,
+        raising BackendError so list_slots fails fast and the tick's fail-safe
+        aborts cleanly. The abandoned thread is a daemon and unwinds on its own
+        once ssh finally errors; a connection it opens after we gave up is closed
+        by GC."""
+        box: dict[str, object] = {}
+
+        def _connect() -> None:
+            try:
+                box["conn"] = libvirt.open(self.cfg.libvirt_uri)
+            except BaseException as e:  # surfaced to the caller below
+                box["err"] = e
+
+        t = threading.Thread(
+            target=_connect, name=f"husk-connect-{self.cfg.name}", daemon=True
+        )
+        t.start()
+        t.join(_CONNECT_TIMEOUT_S)
+        if t.is_alive():
+            raise BackendError(
+                f"libvirt connect to host {self.cfg.name} timed out after "
+                f"{_CONNECT_TIMEOUT_S}s (host down/unreachable)"
+            )
+        if "err" in box:
+            raise BackendError(
+                f"libvirt connect to host {self.cfg.name} failed: {box['err']}"
+            ) from box["err"]  # type: ignore[arg-type]
+        conn = box.get("conn")
+        if conn is None:
+            raise BackendError(
+                f"libvirt connect to host {self.cfg.name} returned no connection"
+            )
+        return conn
 
     def _alive(self) -> bool:
         try:

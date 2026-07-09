@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import threading
+import time
 
 from conftest import FakeClock, make_config, make_slot
 from husk.controller import Controller
@@ -79,6 +81,46 @@ def test_one_pool_raise_does_not_block_others(monkeypatch):
     # pool-b ticked (generation advanced); pool-a stayed at its seeded snapshot.
     assert snaps["pool-b"].generation >= 1
     assert snaps["pool-a"].generation == 0
+
+
+def _fast_poll(ctrl, seconds=0.01):
+    ctrl.cfg = dataclasses.replace(
+        ctrl.cfg,
+        timeouts=dataclasses.replace(ctrl.cfg.timeouts, poll_interval_sec=seconds),
+    )
+
+
+def test_stalled_pool_does_not_block_another():
+    # The whole point of per-pool reconcile threads: a pool wedged mid-tick (a
+    # down libvirt host) must not stall another pool's ticks or freeze its snapshot.
+    a, _, _ = _pool("pool-a", "husk-a", min_ready=1)
+    b, _, _ = _pool("pool-b", "husk-b", min_ready=1)
+    _fast_poll(a)
+    _fast_poll(b)
+
+    release = threading.Event()
+    orig_tick = a.tick
+
+    def wedged_tick():
+        release.wait(5)  # hold pool-a's thread as a frozen host would
+        return orig_tick()
+
+    a.tick = wedged_tick
+
+    facade = MultiPoolController([a, b])
+    thread = threading.Thread(target=facade.run, name="test-run", daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 3
+        while b.snapshot.generation < 1 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert b.snapshot.generation >= 1  # pool-b reconciled independently
+        assert a.snapshot.generation == 0  # pool-a still stuck in its own tick
+    finally:
+        release.set()
+        facade.stop()
+        thread.join(timeout=5)
+    assert not thread.is_alive()  # stop() drains both the driver and pool threads
 
 
 def test_reload_matches_by_name_without_structural_warning(caplog):

@@ -4,23 +4,24 @@ A thin facade over N validated `Controller` instances (one per pool). The
 `Controller` is unchanged: each owns its backend + GitHub client + per-slot
 bookkeeping (keyed by globally-unique `slot.id`), so the pools share nothing
 implicitly. The facade only owns what is genuinely process-wide: the reconcile
-loop and the per-tick config reload. Snapshots stay in memory on each Controller
+threads and the config reload. Snapshots stay in memory on each Controller
 (`snapshots()` gathers them); the HTTP layer reads that provider directly.
 
-Pools tick **sequentially** on their own `poll_interval_sec` cadence (one thread,
-no cross-pool shared state to reason about). Each pool's `tick()` is wrapped so an
-unexpected raise in one pool can neither skip the others — the same per-tick
-safety `Controller.run()` gives a single pool today. `run()` is driven on a
-background thread by the CLI (the event loop owns the main thread); a `stop()`
-event makes the loop's sleep interruptible so shutdown is prompt.
-"""
+Each pool runs its **own** reconcile thread on its own `poll_interval_sec`
+cadence, so a pool that stalls (a wedged libvirt host, a slow cloud) can neither
+delay another pool's ticks nor freeze the snapshot the dashboard renders for it.
+Each pool's `tick()` is wrapped so an unexpected raise can't kill its thread. A
+single config-reload runs on the caller's thread (`run()`) — reading the file
+once and dispatching hot knobs to every pool — so N threads don't each re-parse
+it. `run()` is driven on a background thread by the CLI (the event loop owns the
+main thread); a `stop()` event makes every loop's sleep interruptible so shutdown
+is prompt."""
 
 from __future__ import annotations
 
 import dataclasses
 import logging
 import threading
-import time
 from typing import Callable
 
 from husk.config import Config
@@ -29,6 +30,11 @@ from husk.snapshot import ControllerState
 
 log = logging.getLogger("husk.multipool")
 
+# How often the caller thread re-checks the config file for hot-reloadable knobs.
+# Cheap (an mtime stat), so a small fixed cadence keeps edits picked up promptly
+# without coupling to any pool's poll interval.
+_RELOAD_INTERVAL_S = 5.0
+
 
 class MultiPoolController:
     def __init__(
@@ -36,17 +42,12 @@ class MultiPoolController:
         controllers: list[Controller],
         *,
         reload_configs: Callable[[], list[Config] | None] | None = None,
-        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not controllers:
             raise ValueError("MultiPoolController needs at least one pool")
         self._controllers = controllers
         self._reload = reload_configs
-        self._clock = clock
         self._stop = threading.Event()
-        # Per-pool next-due timestamp (monotonic) so each pool keeps its own
-        # cadence within the single loop.
-        self._next_due: dict[str, float] = {self._name(c): 0.0 for c in controllers}
 
     @staticmethod
     def _name(ctrl: Controller) -> str:
@@ -64,29 +65,48 @@ class MultiPoolController:
 
     # ------------------------------------------------------------------- run
     def run(self) -> None:
-        """Blocking multi-pool reconcile loop, run on a background thread by the
-        CLI. Loops until `stop()` is set; the sleep is interruptible so shutdown
-        is prompt. Caller holds the single process lock."""
+        """Blocking multi-pool driver, run on a background thread by the CLI. Spawns
+        one reconcile thread per pool, then runs the config-reload loop on this
+        thread until `stop()` is set; on stop, signals the pool threads and joins
+        them (best-effort — they are daemons, so a pool stuck mid-tick never blocks
+        process exit). Caller holds the single process lock."""
         log.info(
             "huskd starting: %d pool(s): %s",
             len(self._controllers),
             ", ".join(self._name(c) for c in self._controllers),
         )
+        threads = [
+            threading.Thread(
+                target=self._pool_loop,
+                args=(c,),
+                name=f"husk-pool-{self._name(c)}",
+                daemon=True,
+            )
+            for c in self._controllers
+        ]
+        for t in threads:
+            t.start()
+        # Reload runs here (one reader for all pools); it also keeps run() blocking
+        # until stop, holding the process lock for the daemon's lifetime.
         while not self._stop.is_set():
             self._maybe_reload()
-            now = self._clock()
-            for c in self._controllers:
-                name = self._name(c)
-                if now >= self._next_due[name]:
-                    self._tick_one(c)
-                    self._next_due[name] = (
-                        self._clock() + c.cfg.timeouts.poll_interval_sec
-                    )
-            soonest = min(self._next_due.values())
-            self._stop.wait(timeout=max(0.0, soonest - self._clock()))
+            self._stop.wait(timeout=_RELOAD_INTERVAL_S)
+        for t in threads:
+            t.join(timeout=_RELOAD_INTERVAL_S)
+
+    def _pool_loop(self, ctrl: Controller) -> None:
+        """One pool's reconcile loop: tick, then sleep its own `poll_interval_sec`
+        (interruptibly). Isolated on its own thread so a stall here can't delay any
+        other pool or freeze their snapshots."""
+        name = self._name(ctrl)
+        log.info("pool %s: reconcile thread up", name)
+        while not self._stop.is_set():
+            self._tick_one(ctrl)
+            self._stop.wait(timeout=ctrl.cfg.timeouts.poll_interval_sec)
+        log.info("pool %s: reconcile thread stopped", name)
 
     def stop(self) -> None:
-        """Signal `run()` to exit at the next loop boundary (wakes the sleep)."""
+        """Signal `run()` and every pool loop to exit (wakes their sleeps)."""
         self._stop.set()
 
     def tick_all(self) -> None:
