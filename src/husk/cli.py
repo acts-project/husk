@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import json
 import logging
 import os
+import signal
+import threading
 import time
 from pathlib import Path
 from typing import Annotated, Callable, Optional
 
 import typer
 
-from husk.config import Config, load_config
+from husk.config import Config, load_configs
 from husk.controller import Controller
 from husk.lock import LockHeld, SingleControllerLock
+from husk.multipool import MultiPoolController
 from husk.snapshot import ControllerState
 
 huskd_app = typer.Typer(help="Husk controller daemon", add_completion=False)
@@ -60,9 +65,9 @@ def _setup_logging(level: Optional[str]) -> None:
     logging.getLogger("husk").setLevel(husk_level)
 
 
-def _load(config: Path, secrets_dir: Optional[Path]) -> Config:
+def _load_all(config: Path, secrets_dir: Optional[Path]) -> list[Config]:
     try:
-        return load_config(
+        return load_configs(
             str(config), secrets_dir=str(secrets_dir) if secrets_dir else None
         )
     except Exception as e:
@@ -70,36 +75,33 @@ def _load(config: Path, secrets_dir: Optional[Path]) -> Config:
         raise typer.Exit(code=2)
 
 
-def _config_reloader(
+def _configs_reloader(
     config: Path, secrets_dir: Optional[Path]
-) -> "Callable[[], Optional[Config]]":
-    """An mtime-guarded config loader for huskd's per-tick hot reload.
-
-    Returns a freshly loaded Config only when the file's mtime changed since the
-    last call (else None). A parse/IO error is swallowed (logged once) so a bad
-    mid-flight edit never kills the loop — the running config simply stays put."""
+) -> "Callable[[], Optional[list[Config]]]":
+    """mtime-guarded multi-pool reloader for the MultiPoolController (returns the
+    full per-pool list, or None when unchanged / unparseable)."""
     path = str(config)
     last: dict[str, float | None] = {"mtime": None}
 
-    def reload() -> Optional[Config]:
+    def reload() -> Optional[list[Config]]:
         try:
             mtime = os.stat(path).st_mtime
         except OSError:
             return None
-        if last["mtime"] is None:  # first call establishes the baseline, no reload
+        if last["mtime"] is None:
             last["mtime"] = mtime
             return None
         if mtime == last["mtime"]:
             return None
         last["mtime"] = mtime
         try:
-            cfg = load_config(
+            cfgs = load_configs(
                 path, secrets_dir=str(secrets_dir) if secrets_dir else None
             )
-            logging.getLogger("husk.controller").info("config file changed; reloading")
-            return cfg
+            logging.getLogger("husk.multipool").info("config file changed; reloading")
+            return cfgs
         except Exception:
-            logging.getLogger("husk.controller").warning(
+            logging.getLogger("husk.multipool").warning(
                 "config reload skipped: %s could not be loaded", path, exc_info=True
             )
             return None
@@ -125,6 +127,23 @@ def _build(cfg: Config):
         runner_group_id=cfg.runner.runner_group_id,
     )
     return backend, github
+
+
+def _select_pool(cfgs: list[Config], pool: Optional[str]) -> Config:
+    """Pick one pool's Config for a per-pool one-shot (recycle). `--pool` is
+    required when more than one pool is configured."""
+    if pool is not None:
+        for c in cfgs:
+            if c.backend.name == pool:
+                return c
+        names = [c.backend.name for c in cfgs]
+        typer.echo(f"no pool named {pool!r}; have: {names}", err=True)
+        raise typer.Exit(code=2)
+    if len(cfgs) == 1:
+        return cfgs[0]
+    names = [c.backend.name for c in cfgs]
+    typer.echo(f"multiple pools configured; pass --pool <name>: {names}", err=True)
+    raise typer.Exit(code=2)
 
 
 def _table(headers: list[str], rows: list[list[str]]) -> str:
@@ -242,8 +261,8 @@ def _status_renderable(snap: ControllerState):
 
 
 def _watch_status(observe, interval: float) -> None:
-    """Full-screen live-updating status until Ctrl-C."""
-    from rich.console import Console
+    """Full-screen live-updating status (all pools) until Ctrl-C."""
+    from rich.console import Console, Group
     from rich.live import Live
     from rich.text import Text
 
@@ -252,7 +271,15 @@ def _watch_status(observe, interval: float) -> None:
         with Live(console=console, screen=True, auto_refresh=False) as live:
             while True:
                 try:
-                    renderable = _status_renderable(observe())
+                    snaps = observe()
+                    parts: list = []
+                    for i, snap in enumerate(snaps):
+                        if i:
+                            parts.append(Text(""))
+                        parts.append(_status_renderable(snap))
+                    renderable = (
+                        Group(*parts) if parts else Text("(no pools)", style="dim")
+                    )
                 except Exception as e:  # read-only: show the error, keep watching
                     renderable = Text(f"observe failed: {e}", style="red")
                 live.update(renderable, refresh=True)
@@ -331,43 +358,84 @@ def run(
         bool, typer.Option(help="Run a single reconcile tick then exit")
     ] = False,
 ) -> None:
-    """Run the reconcile loop (or a single tick with --once)."""
+    """Run the reconcile loop across every [[pool]] (or a single tick with --once)."""
     _setup_logging(log_level)
-    cfg = _load(config, secrets_dir)
-    lock = SingleControllerLock(cfg.controller.lock_path)
+    cfgs = _load_all(config, secrets_dir)
+    # One lock / HTTP port for the whole daemon (shared [controller]).
+    shared = cfgs[0].controller
+    lock = SingleControllerLock(shared.lock_path)
     try:
         lock.acquire()
     except LockHeld as e:
         typer.echo(str(e), err=True)
         raise typer.Exit(code=1)
-    server = None
     try:
-        backend, github = _build(cfg)
-        if once:
-            ctrl = Controller(backend, github, cfg)
-            ctrl.tick()
-            _print_status(ctrl.snapshot)
-        else:
-            ctrl = Controller(
-                backend,
-                github,
-                cfg,
-                reload_config=_config_reloader(config, secrets_dir),
-            )
-            if cfg.controller.http_addr:
-                from husk.http_server import StatusServer, parse_addr
-
-                host, port = parse_addr(cfg.controller.http_addr)
-                server = StatusServer(lambda: ctrl.snapshot, host, port)
-                server.start()
+        # One Controller per pool. The facade owns the loop + HTTP + reload, so the
+        # sub-controllers get a blanked http_addr and no reload hook. A pool that
+        # can't be built (bad backend config, unreachable cloud) is skipped with a
+        # loud error rather than taking the whole daemon down — the other pools run.
+        controllers = []
+        for cfg in cfgs:
             try:
-                ctrl.run()
-            except KeyboardInterrupt:
-                typer.echo("shutting down", err=True)
+                backend, github = _build(cfg)
+            except Exception as e:
+                typer.echo(
+                    f"pool {cfg.backend.name!r} failed to start, skipping: {e}",
+                    err=True,
+                )
+                logging.getLogger("husk").error(
+                    "pool %s failed to build; skipping", cfg.backend.name, exc_info=True
+                )
+                continue
+            sub = dataclasses.replace(
+                cfg,
+                controller=dataclasses.replace(cfg.controller, http_addr=""),
+            )
+            controllers.append(Controller(backend, github, sub))
+        if not controllers:
+            typer.echo("no pools could be started", err=True)
+            raise typer.Exit(code=1)
+        facade = MultiPoolController(
+            controllers,
+            reload_configs=_configs_reloader(config, secrets_dir),
+        )
+        if once:
+            facade.tick_all()
+            for snap in facade.snapshots():
+                _print_status(snap)
+        else:
+            if not shared.http_addr:
+                typer.echo("controller.http_addr must be set", err=True)
+                raise typer.Exit(code=1)
+            asyncio.run(_serve(facade, shared.http_addr))
     finally:
-        if server is not None:
-            server.stop()
         lock.release()
+
+
+async def _serve(facade: MultiPoolController, http_addr: str) -> None:
+    """Run the reconcile loop on a background thread while Quart serves every
+    endpoint on this event loop. SIGINT/SIGTERM trip the shutdown event, which
+    stops hypercorn (via `shutdown_trigger`) and then the reconcile loop."""
+    from husk.web import make_app, parse_addr, serve_app
+
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop.set)
+
+    thread = threading.Thread(target=facade.run, name="husk-reconcile", daemon=True)
+    thread.start()
+    try:
+        host, port = parse_addr(http_addr)
+        await serve_app(
+            make_app(facade.snapshots, shutdown=stop),
+            host,
+            port,
+            shutdown_trigger=stop.wait,
+        )
+    finally:
+        facade.stop()
+        thread.join(timeout=5)
 
 
 # ------------------------------------------------------------------- huskctl
@@ -389,89 +457,66 @@ def status(
             "--url", help="huskd status URL (default: from controller.http_addr)"
         ),
     ] = None,
-    live: Annotated[
-        bool,
+    pool: Annotated[
+        Optional[str],
         typer.Option(
-            "--live",
-            help="Query OpenStack/GitHub directly instead of huskd's published state",
+            "--pool", help="Show only this pool (by name); default: all pools"
         ),
-    ] = False,
+    ] = None,
 ) -> None:
-    """Show the current pool state.
+    """Show the current state of every pool (or one with --pool).
 
-    Source priority: --live (query OpenStack/GitHub directly) > --url / huskd's
-    HTTP endpoint > the published state file. The default renders huskd's exact
-    snapshot with no extra API calls; --live can't see huskd's in-memory grace
-    tracking, so transient STARTING/draining slots may read UNHEALTHY there."""
+    Reads huskd's live snapshot over HTTP (`--url` or `controller.http_addr`).
+    huskd must be running; there is no offline source."""
     _setup_logging(log_level)
-    cfg = _load(config, secrets_dir)
-    getter = _snapshot_getter(cfg, live=live, url=url)
+    cfgs = _load_all(config, secrets_dir)
+    getter = _snapshot_getter(cfgs, url=url)
 
     if watch:
         _watch_status(getter, interval)
         return
     try:
-        snap = getter()
+        snaps = getter()
     except Exception as e:
         typer.echo(str(e), err=True)
         raise typer.Exit(code=1)
+    if pool is not None:
+        snaps = [s for s in snaps if s.backend == pool]
+        if not snaps:
+            typer.echo(f"no pool named {pool!r}", err=True)
+            raise typer.Exit(code=1)
     if json_out:
-        typer.echo(json.dumps(snap.to_dict(), indent=2))
+        typer.echo(json.dumps([s.to_dict() for s in snaps], indent=2))
     else:
-        _print_status(snap)
+        for i, snap in enumerate(snaps):
+            if i:
+                typer.echo("")  # blank line between pools
+            _print_status(snap)
 
 
-def _snapshot_getter(cfg: Config, *, live: bool, url: Optional[str] = None):
-    """Return a callable yielding a fresh ControllerState each call.
+def _snapshot_getter(cfgs: list[Config], *, url: Optional[str] = None):
+    """Return a callable that fetches the per-pool snapshots from huskd over HTTP
+    each call. Raises a clear error on failure so the one-shot exits non-zero and
+    the watcher shows the error and keeps polling."""
+    import urllib.request
 
-    Priority: --live (recompute) > HTTP (--url or controller.http_addr) > the
-    published state file. Each getter raises a clear error on failure so the
-    one-shot exits non-zero and the watcher shows the error and keeps polling."""
-    from husk.snapshot import ControllerState as _CS
-    from husk.snapshot import read_state
+    shared = cfgs[0].controller
+    target = url or (f"http://{shared.http_addr}/status" if shared.http_addr else None)
 
-    if live:
-        ctrl: list = []  # built lazily, reused across watch frames
-
-        def from_live() -> ControllerState:
-            if not ctrl:
-                backend, github = _build(cfg)
-                ctrl.append(Controller(backend, github, cfg))
-            return ctrl[0].observe()
-
-        return from_live
-
-    target = url or (
-        f"http://{cfg.controller.http_addr}/status"
-        if cfg.controller.http_addr
-        else None
-    )
-    if target:
-        import urllib.request
-
-        def from_http() -> ControllerState:
-            try:
-                with urllib.request.urlopen(target, timeout=5) as r:
-                    return _CS.from_dict(json.loads(r.read()))
-            except Exception as e:
-                raise RuntimeError(
-                    f"could not fetch status from {target}: {e} "
-                    "(is huskd running? use --live to query directly)"
-                )
-
-        return from_http
-
-    path = cfg.controller.state_path
-
-    def from_file() -> ControllerState:
-        snap = read_state(path)
-        if snap is None:
+    def from_http() -> list[ControllerState]:
+        if not target:
             raise RuntimeError(
-                f"no huskd state at {path} — is huskd running? (use --live to query directly)"
+                "no huskd HTTP endpoint: set controller.http_addr or pass --url"
             )
-        return snap
+        try:
+            with urllib.request.urlopen(target, timeout=5) as r:
+                return [ControllerState.from_dict(d) for d in json.loads(r.read())]
+        except Exception as e:
+            raise RuntimeError(
+                f"could not fetch status from {target}: {e} (is huskd running?)"
+            )
 
-    return from_file
+    return from_http
 
 
 @huskctl_app.command()
@@ -480,10 +525,11 @@ def reap(
     secrets_dir: _SecretsOpt = None,
     log_level: _LogLevelOpt = None,
 ) -> None:
-    """Delete all offline runner registrations from GitHub."""
+    """Delete all offline runner registrations from GitHub (repo-wide)."""
     _setup_logging(log_level)
-    cfg = _load(config, secrets_dir)
-    _, github = _build(cfg)
+    cfgs = _load_all(config, secrets_dir)
+    # reap_offline is repo-wide and label-agnostic, so any pool's client does it.
+    _, github = _build(cfgs[0])
     names = github.reap_offline()
     typer.echo(f"reaped {len(names)} offline runner(s): {names}")
 
@@ -556,6 +602,10 @@ def recycle(
         bool,
         typer.Option("--dry-run", help="Show what would be recycled; change nothing"),
     ] = False,
+    pool: Annotated[
+        Optional[str],
+        typer.Option("--pool", help="Which pool to recycle in (required if >1 pool)"),
+    ] = None,
 ) -> None:
     """Stop slots so huskd rebuilds them on its next tick.
 
@@ -572,7 +622,8 @@ def recycle(
         typer.echo("specify slot id(s)/name(s) or --all", err=True)
         raise typer.Exit(code=2)
 
-    cfg = _load(config, secrets_dir)
+    cfgs = _load_all(config, secrets_dir)
+    cfg = _select_pool(cfgs, pool)
     backend, github = _build(cfg)
     try:
         acted, skipped, unknown = _recycle(

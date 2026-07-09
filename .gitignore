@@ -17,3 +17,6 @@ config.libvirt.*.toml
 # Local OpenStack variants (e.g. the OCI/prebaked soak config). The committed
 # template stays config.example.toml.
 config.openstack.*.toml
+
+# Local multi-pool daemon config (OpenStack + libvirt CPU + libvirt GPU at once).
+config.multi.toml

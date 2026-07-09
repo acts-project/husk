@@ -212,49 +212,6 @@ def test_state_roundtrip_to_from_dict():
     assert back.slots[0].runner == "husk-1-c2" and back.slots[0].busy is True
 
 
-def test_write_then_read_state(tmp_path):
-    from husk.snapshot import read_state, write_state
-
-    snap = _snap(
-        [
-            (
-                make_slot(id="vm-1", name="husk-1", status="ACTIVE", cycle=1),
-                make_runner(name="husk-1-c1"),
-                SlotState.IDLE,
-            )
-        ]
-    )
-    path = str(tmp_path / "state.json")
-    write_state(path, snap)
-    loaded = read_state(path)
-    assert loaded is not None and loaded.to_dict() == snap.to_dict()
-
-
-def test_read_state_missing_returns_none(tmp_path):
-    from husk.snapshot import read_state
-
-    assert read_state(str(tmp_path / "nope.json")) is None
-
-
-def test_controller_publishes_state(tmp_path, clock):
-    # huskd's tick writes the published snapshot that huskctl status reads.
-    from dataclasses import replace
-
-    from conftest import make_config, make_controller
-    from husk.config import ControllerConfig
-    from husk.fake_backend import FakeBackend, FakeGitHub
-    from husk.snapshot import read_state
-
-    path = str(tmp_path / "state.json")
-    cfg = replace(make_config(), controller=ControllerConfig(state_path=path))
-    backend = FakeBackend(slots=[make_slot(id="vm-1", name="husk-1", status="ACTIVE")])
-    github = FakeGitHub(runners=[make_runner(name="husk-1-c0")])
-    make_controller(backend, github, cfg, clock).tick()
-
-    published = read_state(path)
-    assert published is not None and published.counts["idle"] == 1
-
-
 def test_table_alignment():
     rendered = _table(["A", "BB"], [["x", "yy"], ["longer", "z"]])
     lines = rendered.splitlines()

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shlex
 import subprocess
 import threading
@@ -28,7 +29,8 @@ from dataclasses import dataclass
 from husk import libvirt_xml as lx
 from husk.backend import BackendError, ListSlotsError
 from husk.config import BackendConfig, HostConfig
-from husk.image_sync import BackgroundImagePreparer, ImageSync
+from husk.image_sync import ImageSync
+from husk.ops import DONE, OpStore, OpView
 from husk.slot import Capacity, Slot
 
 
@@ -46,7 +48,14 @@ log = logging.getLogger("husk.libvirt")
 # Timeouts — a control plane must never be wedged by one unresponsive host.
 _SSH_TIMEOUT_S = 60  # cap each host-side qemu-img/genisoimage/rm command
 _SSH_CONNECT_TIMEOUT_S = 15  # cap the ssh TCP/auth handshake
+# Hard wall-clock bound on the *initial* libvirt.open() connect. libvirt-python's
+# open() takes no timeout and the qemu+ssh transport doesn't bound its own
+# handshake, so a down host would otherwise block the caller (the reconcile
+# thread) for the full kernel SYN-retry window. A bit above the ssh connect bound
+# to leave headroom for the libvirtd RPC negotiation on a healthy host.
+_CONNECT_TIMEOUT_S = _SSH_CONNECT_TIMEOUT_S + 5
 _PUSH_TIMEOUT_S = 3600  # a golden qcow2 is multi-GB; scp to a host can be slow
+_PROGRESS_INTERVAL_S = 30  # how often to log golden-transfer progress (MiB/%)
 # libvirt RPC keepalive: probe every N seconds, drop the connection after C
 # misses (~N*C s). This is what stops an in-flight call to a frozen host from
 # blocking the reconcile loop forever; it needs the event loop (below) running.
@@ -99,12 +108,53 @@ class _HostConn:
         """Open (or reopen a dropped) libvirt connection."""
         if self._conn is None or not self._alive():
             log.debug("opening libvirt connection %s", self.cfg.libvirt_uri)
-            self._conn = libvirt.open(self.cfg.libvirt_uri)
+            self._conn = self._open()
             try:  # bound in-flight RPCs to a wedged host (needs the event loop)
                 self._conn.setKeepAlive(_KEEPALIVE_INTERVAL_S, _KEEPALIVE_COUNT)
             except libvirt.libvirtError:
                 log.debug("keepalive unsupported on %s", self.cfg.libvirt_uri)
         return self._conn
+
+    def _open(self):
+        """`libvirt.open` under a hard wall-clock bound (see `_CONNECT_TIMEOUT_S`).
+
+        The keepalive set in `conn()` only bounds RPCs on an *already-open*
+        connection — it can't rescue this initial connect, which for a down host
+        would otherwise hang for minutes and (since it runs on the reconcile
+        thread via list_slots/sync_images) wedge the whole loop. So run the
+        connect on a throwaway daemon thread and give up on it after the bound,
+        raising BackendError so list_slots fails fast and the tick's fail-safe
+        aborts cleanly. The abandoned thread is a daemon and unwinds on its own
+        once ssh finally errors; a connection it opens after we gave up is closed
+        by GC."""
+        box: dict[str, object] = {}
+
+        def _connect() -> None:
+            try:
+                box["conn"] = libvirt.open(self.cfg.libvirt_uri)
+            except BaseException as e:  # surfaced to the caller below
+                box["err"] = e
+
+        t = threading.Thread(
+            target=_connect, name=f"husk-connect-{self.cfg.name}", daemon=True
+        )
+        t.start()
+        t.join(_CONNECT_TIMEOUT_S)
+        if t.is_alive():
+            raise BackendError(
+                f"libvirt connect to host {self.cfg.name} timed out after "
+                f"{_CONNECT_TIMEOUT_S}s (host down/unreachable)"
+            )
+        if "err" in box:
+            raise BackendError(
+                f"libvirt connect to host {self.cfg.name} failed: {box['err']}"
+            ) from box["err"]  # type: ignore[arg-type]
+        conn = box.get("conn")
+        if conn is None:
+            raise BackendError(
+                f"libvirt connect to host {self.cfg.name} returned no connection"
+            )
+        return conn
 
     def _alive(self) -> bool:
         try:
@@ -116,10 +166,12 @@ class _HostConn:
         """Absolute host path of the storage pool's target dir (where overlays +
         seeds live, and where the golden qcow2 is expected)."""
         if self._pool_dir is None:
-            pool = self.conn().storagePoolLookupByName(self.cfg.pool)
+            pool = self.conn().storagePoolLookupByName(self.cfg.storage_pool)
             path = ET.fromstring(pool.XMLDesc()).findtext("target/path")
             if not path:
-                raise BackendError(f"pool {self.cfg.pool!r} has no target path")
+                raise BackendError(
+                    f"storage pool {self.cfg.storage_pool!r} has no target path"
+                )
             self._pool_dir = path
         return self._pool_dir
 
@@ -135,15 +187,16 @@ class LibvirtBackend:
                 "libvirt backend requires at least one [[backend.hosts]]"
             )
         self.cfg = cfg
+        self._pool = cfg.name  # stamped into domain metadata; scopes list_slots
         self._sync = ImageSync(cfg.image_cache_dir or None)
         self._backend_ref = cfg.image_ref or ""
         # Per-host ref last successfully synced, so sync_images is a cheap no-op
         # each tick until the configured ref actually changes.
         self._synced_ref: dict[str, str] = {}
         # Heavy staging (oras pull + scp to each host) runs off the reconcile
-        # thread; the tick only adopts a ready result (points each host's current
-        # image at the staged golden).
-        self._preparer = BackgroundImagePreparer(self._prepare_image)
+        # thread as a keyed op; the tick only adopts a ready result (points each
+        # host's current image at the staged golden).
+        self._ops = OpStore()
         self._hosts: dict[str, _HostConn] = {}
         for h in cfg.hosts:
             if h.gpu_pci_addresses and h.max_slots is not None:
@@ -269,6 +322,7 @@ class LibvirtBackend:
             created_at=created_at,
             unit=unit,
             image_digest=image_digest,
+            pool=self._pool,
         )
         dom.setMetadata(
             libvirt.VIR_DOMAIN_METADATA_ELEMENT, meta, "husk", lx.HUSK_NS, 0
@@ -318,14 +372,45 @@ class LibvirtBackend:
         return host_name, host, host.conn().lookupByUUIDString(dom_uuid)
 
     def _occupied(self) -> set[tuple[str, str]]:
+        # Units held by live domains, pool-blind ON PURPOSE: two pools can share a
+        # host, so a sibling pool's units (e.g. a GPU PCI address) must be seen here
+        # or placement/capacity would double-book them. But require a `pool` tag:
+        # current huskd always stamps one at create, so an UNtagged domain is a
+        # pre-upgrade legacy leftover (invisible to list_slots, GC'd by nothing) and
+        # must not silently consume a unit forever.
         return {
             (host_name, meta["unit"])
             for host_name, _dom, meta in self._list_raw()
-            if meta.get("unit")
+            if meta.get("unit") and meta.get("pool")
         }
 
+    def _host_ready(self, host: _HostConn) -> bool:
+        """Can this host back a NEW slot yet? In OCI mode the golden is staged
+        asynchronously (off the reconcile thread), so a host is ready only once its
+        image has landed (`image_digest` known); the manual/local-file path (a
+        literal `image_name`) is always ready. Gating capacity + placement on this
+        means the controller simply sees zero capacity while staging — it never
+        attempts a create (nor mints a wasted JIT runner) before the image is up."""
+        if host.cfg.image_ref or self._backend_ref:
+            return host.image_digest is not None
+        return True
+
+    def image_ready(self, slot: Slot) -> bool:
+        """Whether the host backing `slot` has its golden staged (same gate as
+        capacity uses for grows), so the controller can defer a rebuild instead of
+        erroring while staging. An unknown host ⇒ ready, so the rebuild proceeds
+        and surfaces the real unknown-host error rather than being silently held."""
+        host = self._hosts.get(slot.id.partition(":")[0])
+        return host is None or self._host_ready(host)
+
     def _host_units(self) -> list[lx.HostUnits]:
-        return [lx.HostUnits(name, h.units) for name, h in self._hosts.items()]
+        # Only hosts whose golden has finished staging contribute slot-units, so a
+        # not-yet-staged host reports no capacity rather than erroring on create.
+        return [
+            lx.HostUnits(name, h.units)
+            for name, h in self._hosts.items()
+            if self._host_ready(h)
+        ]
 
     # ----------------------------------------------------------- image sync
     def sync_images(self, cfg: BackendConfig | None = None) -> None:
@@ -355,28 +440,44 @@ class LibvirtBackend:
                 continue  # manual/local-file host — nothing to pull
             if self._synced_ref.get(name) == ref and host.image_digest:
                 continue  # already current
-            prepared = self._preparer.ready(ref)
-            if prepared is None:
-                continue  # still staging in the background — keep current golden
+            key = f"stage:{ref}"
+            view = self._ops.submit(
+                key, "host-stage", lambda report, r=ref: self._prepare_image(r, report)
+            )
+            if view.state != DONE:
+                continue  # still staging (or failed + backing off) — keep current
+            prepared = self._ops.result(key)
             host.image = prepared.golden
             host.image_digest = prepared.digest
             self._synced_ref[name] = ref
             log.info("host %s now serving %s (%s)", name, ref, prepared.golden)
         self._gc_goldens()
 
-    def _prepare_image(self, ref: str) -> _GoldenPrepared:
-        """Heavy staging (background thread): pull the OCI golden to the controller
-        cache and scp it into the pool of every host that uses this ref. Returns
-        what the tick adopts; it does NOT touch live host fields (only the tick
-        thread does, in sync_images)."""
-        resolved = self._sync.resolve(ref)
+    def staging_ops(self) -> list[OpView]:
+        """In-flight / recent image-staging ops, for the status board."""
+        return self._ops.views()
+
+    def _prepare_image(self, ref: str, report) -> _GoldenPrepared:
+        """Heavy staging (op worker): pull the OCI golden to the controller cache
+        and scp it into the pool of every host that uses this ref. Returns what the
+        tick adopts; it does NOT touch live host fields (only the tick thread does,
+        in sync_images)."""
+        report("pulling golden from registry")
+        resolved = self._sync.resolve(ref, report=report)
         golden = f"husk-golden-{resolved.short}.qcow2"
         for host in self._hosts.values():
             if (host.cfg.image_ref or self._backend_ref) == ref:
-                self._ensure_on_host(host, resolved.local_path, golden)
+                report(f"staging to host {host.cfg.name}")
+                self._ensure_on_host(host, resolved.local_path, golden, report)
+                # Mark this pool's current golden the moment it lands, BEFORE the
+                # tick adopts it — so another pool sharing this host's pool dir
+                # can't GC a freshly-staged golden in the pre-adopt window.
+                self._mark_current(host, golden)
         return _GoldenPrepared(digest=resolved.digest, golden=golden)
 
-    def _ensure_on_host(self, host: _HostConn, local_path: str, golden: str) -> None:
+    def _ensure_on_host(
+        self, host: _HostConn, local_path: str, golden: str, report=None
+    ) -> None:
         """Place `local_path` into the host pool as `golden`, if not already there.
 
         Idempotent (skip a present, non-empty file) and atomic (push to a temp
@@ -390,15 +491,44 @@ class LibvirtBackend:
         if present == b"y":
             log.debug("host %s already has %s", host.cfg.name, golden)
             return
+        # Stable tmp name within this process so a retried/resumed push reuses the
+        # same partial file rather than starting a fresh one each attempt.
         tmp = f"{remote}.tmp.{os.getpid()}"
-        log.info("pushing %s to host %s", golden, host.cfg.name)
+        try:
+            size: int | None = os.path.getsize(local_path)
+        except OSError:
+            size = None  # can't read the source → skip the size check below
+        log.info(
+            "staging %s%s to host %s",
+            golden,
+            f" ({size >> 20} MiB)" if size else "",
+            host.cfg.name,
+        )
         if host.cfg.ssh_target:
-            self._push_file(host, local_path, tmp)
+            self._push_file(host, local_path, tmp, report)
         else:  # local host: a plain copy within the same filesystem
             self._ssh(host, f"cp {shlex.quote(local_path)} {shlex.quote(tmp)}")
+        # Verify the whole file landed before publishing it — never `mv` a truncated
+        # transfer into place (an interrupted push retries/resumes next tick). A
+        # size mismatch raises, so the preparer records a failure and retries.
+        if size is not None:
+            got = int(
+                self._ssh(
+                    host, f"stat -c%s {shlex.quote(tmp)} 2>/dev/null || echo 0"
+                ).strip()
+                or b"0"
+            )
+            if got != size:
+                raise BackendError(
+                    f"golden {golden} transfer to {host.cfg.name} incomplete "
+                    f"({got}/{size} bytes); will resume"
+                )
         self._ssh(host, f"mv {shlex.quote(tmp)} {shlex.quote(remote)}")
+        log.info("staged %s on host %s", golden, host.cfg.name)
 
-    def _push_file(self, host: _HostConn, local_path: str, remote_path: str) -> None:
+    def _push_file(
+        self, host: _HostConn, local_path: str, remote_path: str, report=None
+    ) -> None:
         argv = [
             "scp",
             "-o",
@@ -408,24 +538,103 @@ class LibvirtBackend:
             local_path,
             f"{host.cfg.ssh_target}:{remote_path}",
         ]
+        # Log transfer progress so a multi-GB push isn't a silent multi-minute gap:
+        # a daemon thread polls the growing destination size against the source.
+        try:
+            total = os.path.getsize(local_path)
+        except OSError:
+            total = 0
+        stop = threading.Event()
+        if total:
+            threading.Thread(
+                target=self._log_push_progress,
+                args=(host, remote_path, total, stop, report),
+                name="husk-stage-progress",
+                daemon=True,
+            ).start()
         try:
             r = subprocess.run(argv, capture_output=True, timeout=_PUSH_TIMEOUT_S)
         except subprocess.TimeoutExpired as e:
             raise BackendError(
                 f"scp to host {host.cfg.name} timed out after {_PUSH_TIMEOUT_S}s"
             ) from e
+        finally:
+            stop.set()
         if r.returncode != 0:
             raise BackendError(
                 f"scp to host {host.cfg.name} failed ({r.returncode}): "
                 f"{r.stderr.decode(errors='replace')[:300]}"
             )
 
+    def _log_push_progress(
+        self,
+        host: _HostConn,
+        remote_path: str,
+        total: int,
+        stop: threading.Event,
+        report=None,
+    ) -> None:
+        """Poll the destination size every `_PROGRESS_INTERVAL_S` and log MiB/% so a
+        slow golden transfer is visible in the log; if given a `report` sink, push
+        the same line onto the op so the dashboard shows it live. Best-effort: a
+        failed probe is skipped, and it stops the moment the push finishes."""
+        while not stop.wait(_PROGRESS_INTERVAL_S):
+            try:
+                got = int(
+                    self._ssh(
+                        host,
+                        f"stat -c%s {shlex.quote(remote_path)} 2>/dev/null || echo 0",
+                    ).strip()
+                    or b"0"
+                )
+            except Exception:
+                continue
+            if got > 0:
+                line = (
+                    f"host {host.cfg.name}: {got >> 20}/{total >> 20} MiB "
+                    f"({100 * got // total}%)"
+                )
+                log.info("staging to %s", line)
+                if report is not None:
+                    report(line)
+
+    def _marker_path(self, host: _HostConn) -> str:
+        """On-host file recording THIS pool's current golden, so a pool sharing the
+        host's pool dir never GCs another pool's current image (`.husk-current-<pool>`)."""
+        tag = re.sub(r"[^A-Za-z0-9_.-]", "_", self._pool)
+        return f"{host.pool_dir()}/.husk-current-{tag}"
+
+    def _mark_current(self, host: _HostConn, golden: str) -> None:
+        try:
+            self._ssh(
+                host,
+                f"printf '%s\\n' {shlex.quote(golden)} > {shlex.quote(self._marker_path(host))}",
+            )
+        except Exception:
+            log.debug(
+                "could not write golden marker on %s", host.cfg.name, exc_info=True
+            )
+
+    def _marked_goldens(self, host: _HostConn) -> set[str]:
+        """Golden filenames every pool on this host has marked current (the union
+        of all `.husk-current-*` markers in the shared pool dir)."""
+        try:
+            out = self._ssh(
+                host,
+                f"cat {shlex.quote(host.pool_dir())}/.husk-current-* 2>/dev/null || true",
+            )
+        except Exception:
+            return set()
+        return set(out.decode(errors="replace").split())
+
     def _gc_goldens(self) -> None:
-        """Remove golden images on each host that no live slot (and not the host's
-        current image) references — the tail of a drain-on-ref-change. Best-effort
-        and conservative: it only deletes `husk-golden-<digest>.qcow2` files whose
-        digest is neither current nor stamped on any live slot, so a backing file
-        of a running overlay is never touched. A GC failure disturbs nothing."""
+        """Remove golden images on each host that no live slot references and that
+        no pool has marked current. Best-effort and conservative: it only deletes
+        `husk-golden-<digest>.qcow2` files, and keeps any that (a) back a live
+        overlay (across ALL pools on the host), (b) are this pool's current image,
+        or (c) are marked current by ANY pool sharing the host's pool dir — so two
+        libvirt pools on one host never GC each other's backing files. A GC failure
+        disturbs nothing."""
         try:
             raw = self._list_raw()
         except Exception:
@@ -434,11 +643,15 @@ class LibvirtBackend:
         for host_name, _dom, meta in raw:
             d = meta.get("image_digest")
             if d:
-                live.setdefault(host_name, set()).add(d.split(":", 1)[-1][:12])
+                fn = f"husk-golden-{d.split(':', 1)[-1][:12]}.qcow2"
+                live.setdefault(host_name, set()).add(fn)
         for name, host in self._hosts.items():
             keep = set(live.get(name, set()))
             if host.image_digest:
-                keep.add(host.image_digest.split(":", 1)[-1][:12])
+                keep.add(
+                    f"husk-golden-{host.image_digest.split(':', 1)[-1][:12]}.qcow2"
+                )
+            keep |= self._marked_goldens(host)  # every pool's current, durably
             if not keep:
                 continue  # don't GC a host we know nothing current about
             try:
@@ -450,9 +663,9 @@ class LibvirtBackend:
             except Exception:
                 continue
             for path in out.decode(errors="replace").split():
-                short = path.rsplit("husk-golden-", 1)[-1].removesuffix(".qcow2")
-                if short and short not in keep:
-                    log.info("GC stale golden %s on host %s", short, name)
+                base = path.rsplit("/", 1)[-1]
+                if base and base not in keep:
+                    log.info("GC stale golden %s on host %s", base, name)
                     self._ssh(host, f"rm -f {shlex.quote(path)}")
 
     # --------------------------------------------------------------- backend
@@ -461,9 +674,19 @@ class LibvirtBackend:
             raw = self._list_raw()
         except Exception as e:  # libvirt/SSH/network — MUST raise, never []
             raise ListSlotsError(f"list domains failed: {e}") from e
-        slots = [self._slot(hn, dom, meta) for hn, dom, meta in raw]
+        # Only this pool's domains (two pools can share a host). Placement/capacity
+        # still consider ALL husk domains on the host (see _occupied) so a GPU unit
+        # is never double-assigned across pools.
+        slots = [
+            self._slot(hn, dom, meta)
+            for hn, dom, meta in raw
+            if meta.get("pool") == self._pool
+        ]
         log.debug(
-            "listed %d managed slot(s) across %d host(s)", len(slots), len(self._hosts)
+            "listed %d managed slot(s) for pool %s across %d host(s)",
+            len(slots),
+            self._pool,
+            len(self._hosts),
         )
         return slots
 
@@ -472,12 +695,9 @@ class LibvirtBackend:
         if placed is None:
             raise BackendError("no free slot-units across host pool")
         host_name, unit = placed
+        # Placement only returns a host whose golden has staged (see _host_units /
+        # _host_ready), so the overlay always has a backing image here.
         host = self._hosts[host_name]
-        # In OCI mode the golden is staged asynchronously; until it lands the host
-        # has no current image to back an overlay. Fail clean (the controller logs
-        # and retries next tick) rather than building off a missing/old golden.
-        if (host.cfg.image_ref or self._backend_ref) and host.image_digest is None:
-            raise BackendError(f"host {host_name} image not staged yet; deferring")
         conn = host.conn()
 
         overlay = self._make_overlay(host, name)
@@ -490,6 +710,7 @@ class LibvirtBackend:
             created_at=now,
             unit=unit,
             image_digest=host.image_digest,
+            pool=self._pool,
         )
         xml = lx.domain_xml(
             name=name,

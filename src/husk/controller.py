@@ -25,7 +25,7 @@ from husk.backend import ListSlotsError
 from husk.cloudinit import render_cloud_init
 from husk.config import Config
 from husk.slot import Runner, Slot, SlotState, classify, match_runner
-from husk.snapshot import ControllerState, write_state
+from husk.snapshot import ControllerState
 from husk.timing import SlotTiming
 
 log = logging.getLogger("husk.controller")
@@ -359,25 +359,14 @@ class Controller:
             desired_total=desired,
             classified=classified,
             timing=self.timing,
+            ops=self._backend_ops(),
         )
         log.debug(
             "tick %d done: %s",
             self._generation,
             {k: v for k, v in self.snapshot.counts.items() if v},
         )
-        self._publish()
         return self.snapshot
-
-    def _publish(self) -> None:
-        """Write the snapshot so `huskctl status` renders huskd's exact view
-        rather than independently (and divergently) recomputing it."""
-        path = self.cfg.controller.state_path
-        if not path or self.snapshot is None:
-            return
-        try:
-            write_state(path, self.snapshot)
-        except Exception:
-            log.warning("could not publish state to %s", path, exc_info=True)
 
     def observe(self) -> ControllerState:
         """Read-only classification snapshot for `huskctl status` — no mutations.
@@ -401,6 +390,7 @@ class Controller:
             desired_total=desired,
             classified=classified,
             timing=self.timing,
+            ops=self._backend_ops(),
         )
         return self.snapshot
 
@@ -432,7 +422,28 @@ class Controller:
         return classified
 
     # ----------------------------------------------------------- remediation
+    def _backend_ops(self) -> list:
+        """The backend's in-flight/recent async ops (image staging) for the status
+        board. Optional — backends with no async delivery (fake) don't expose it."""
+        fn = getattr(self.backend, "staging_ops", None)
+        return fn() if fn else []
+
+    def _image_ready(self, slot: Slot) -> bool:
+        """Whether the backend can re-image this slot yet. Grows are already gated
+        by `capacity()` reporting zero while the golden stages; rebuilds need the
+        same gate so a NEEDS_RECYCLE/UNHEALTHY slot doesn't drive `rebuild_slot`
+        into a no-image error (and burn a JIT token) every tick during staging.
+        Optional on the backend — absent ⇒ ready (fake/manual paths)."""
+        fn = getattr(self.backend, "image_ready", None)
+        return fn(slot) if fn else True
+
     def _rebuild_then_start(self, slot: Slot, now: float) -> None:
+        if not self._image_ready(slot):
+            log.info(
+                "slot %s needs recycle but golden image still staging; deferring",
+                slot.id,
+            )
+            return
         cycle = self.cycle_counter.get(slot.id, slot.cycle) + 1
         name = runner_name(slot.name, cycle)
         try:
@@ -489,7 +500,7 @@ class Controller:
             self._create_one(now)
 
     def _create_one(self, now: float) -> None:
-        vm = vm_name("husk", next(self._namer))
+        vm = vm_name(self.cfg.backend.vm_prefix, next(self._namer))
         name = runner_name(vm, 0)
         log.debug("creating slot %s (runner %s)", vm, name)
         try:

@@ -117,6 +117,7 @@ def metadata_xml(
     created_at: float,
     unit: str,
     image_digest: str | None = None,
+    pool: str | None = None,
 ) -> str:
     """The `<husk:slot>` element stored under the domain `<metadata>` (durable
     state: the libvirt analog of Nova metadata). `unit` is the assigned slot-unit
@@ -124,10 +125,12 @@ def metadata_xml(
     golden image this slot was (re)built from — the controller drains a slot whose
     stamped digest no longer matches the host's current image (`image-pipeline.md`
     Phase C). Omitted (empty) in the manual/local-file path, where there is no
-    digest to track."""
+    digest to track. `pool` is the owning backend name, so two pools can share a
+    host without `list_slots` adopting each other's domains."""
     digest_el = (
         f"<image-digest>{escape(image_digest)}</image-digest>" if image_digest else ""
     )
+    pool_el = f"<pool>{escape(pool)}</pool>" if pool else ""
     return (
         f'<slot xmlns="{HUSK_NS}">'
         f"<managed-by>{MANAGED_BY}</managed-by>"
@@ -136,6 +139,7 @@ def metadata_xml(
         f"<created-at>{created_at:.0f}</created-at>"
         f"<unit>{escape(unit)}</unit>"
         f"{digest_el}"
+        f"{pool_el}"
         f"</slot>"
     )
 
@@ -169,6 +173,7 @@ def parse_metadata(xml: str | None) -> dict | None:
         "managed_by": MANAGED_BY,
         "unit": _text("unit"),
         "image_digest": _text("image-digest"),
+        "pool": _text("pool"),
     }
     for key, tag, cast in (
         ("cycle", "cycle", int),

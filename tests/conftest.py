@@ -1,7 +1,14 @@
-"""Shared test helpers: a controllable clock, slot/runner/config builders, and a
-controller factory wired to the in-memory fakes."""
+"""Shared test helpers: a controllable clock, slot/runner/config builders, a
+controller factory wired to the in-memory fakes, and a live Quart server."""
 
 from __future__ import annotations
+
+import asyncio
+import contextlib
+import socket
+import threading
+import time
+import urllib.request
 
 import pytest
 
@@ -104,3 +111,53 @@ def make_controller(
     backend: FakeBackend, github: FakeGitHub, config: Config, clock
 ) -> Controller:
     return Controller(backend, github, config, clock=clock)
+
+
+def _free_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+@contextlib.contextmanager
+def serve_in_thread(provider):
+    """Run the real Quart app over `provider` on a background event loop, yielding
+    its base URL. Mirrors how huskd serves it (reconcile on a thread, server on a
+    loop) but inverted for tests: here the server is on the side thread."""
+    from husk.web import make_app, serve_app
+
+    port = _free_port()
+    app = make_app(provider)
+    loop = asyncio.new_event_loop()
+    stop: asyncio.Event | None = None
+    ready = threading.Event()
+
+    def run():
+        nonlocal stop
+        asyncio.set_event_loop(loop)
+        stop = asyncio.Event()
+        ready.set()
+        loop.run_until_complete(
+            serve_app(app, "127.0.0.1", port, shutdown_trigger=stop.wait)
+        )
+        loop.close()
+
+    t = threading.Thread(target=run, name="test-web", daemon=True)
+    t.start()
+    ready.wait(timeout=5)
+    base = f"http://127.0.0.1:{port}"
+    # Wait until the listener accepts requests before handing the URL out.
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(base + "/status", timeout=1).read()
+            break
+        except Exception:
+            time.sleep(0.05)
+    try:
+        yield base
+    finally:
+        loop.call_soon_threadsafe(stop.set)
+        t.join(timeout=5)

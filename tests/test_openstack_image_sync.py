@@ -11,8 +11,9 @@ from __future__ import annotations
 import dataclasses
 
 from husk.config import BackendConfig
-from husk.image_sync import BackgroundImagePreparer, ResolvedImage
+from husk.image_sync import ResolvedImage
 from husk.openstack_backend import GLANCE_PREFIX, OpenStackBackend
+from husk.ops import OpStore
 
 CURR = "sha256:" + "c" * 64  # short cccccccccccc → husk-golden-cccccccccccc
 REF = "ghcr.io/acts-project/husk-base:v1"
@@ -23,7 +24,7 @@ class FakeSync:
         self.digest = digest
         self.calls = 0
 
-    def resolve(self, ref: str) -> ResolvedImage:
+    def resolve(self, ref: str, report=None) -> ResolvedImage:
         self.calls += 1
         return ResolvedImage(ref=ref, digest=self.digest, local_path="/cache/img.qcow2")
 
@@ -101,7 +102,7 @@ def _backend(ref: str = REF, servers=None) -> OpenStackBackend:
     b.image_id = None
     b._image_conn = b.conn  # upload via the same fake conn (no second connect)
     # Stage synchronously so a single sync_images() adopts (prod uses a thread).
-    b._preparer = BackgroundImagePreparer(b._prepare_image, spawn=lambda fn: fn())
+    b._ops = OpStore(spawn=lambda fn: fn())
     return b
 
 
@@ -154,6 +155,14 @@ def test_gc_removes_only_superseded_goldens():
     ]
     b._gc_glance()
     assert b.conn.image.deleted == ["img-orphan"]
+
+
+def test_capacity_zero_while_staging():
+    # OCI mode, image not uploaded to Glance yet → zero capacity, so no create is
+    # attempted (and no JIT runner minted) until the golden lands.
+    b = _backend()  # image_ref set, image_id None
+    cap = b.capacity()
+    assert cap.free_instances == 0 and not cap.can_create
 
 
 def test_slot_image_stale_only_in_oci_mode():

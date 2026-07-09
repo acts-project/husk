@@ -30,9 +30,8 @@ from dataclasses import dataclass
 
 log = logging.getLogger("husk.image")
 
-# A failed staging attempt is retried on the next tick that asks, but not before
-# this backoff — so a registry/Glance outage doesn't spin a tight retry loop.
-_PREPARE_RETRY_BACKOFF_S = 30.0
+# How often to log registry-pull progress (MiB pulled so far) during a slow pull.
+_PULL_PROGRESS_INTERVAL_S = 30.0
 
 # The layer mediaType the build pipeline stamps on the qcow2 (build-images.yml).
 _QCOW2_MEDIA_TYPE = "application/vnd.husk.qcow2"
@@ -103,15 +102,16 @@ class ImageSync:
             self._client = self._client_factory()
         return self._client
 
-    def resolve(self, ref: str) -> ResolvedImage:
+    def resolve(self, ref: str, report=None) -> ResolvedImage:
         """Ensure `ref` is present in the controller cache; return its concrete
         qcow2 digest + local path.
 
         Idempotent: a ref already cached at its current digest is reused without a
         re-pull. The manifest is read first to learn the qcow2 layer digest, so a
         moved tag re-pulls (new digest ⇒ new cache dir) while a stable tag/digest
-        is a no-op."""
-        digest = self._qcow2_digest(ref)
+        is a no-op. `report` (if given) receives a live "N/M MiB (P%)" line during
+        a slow pull, for the status board."""
+        digest, size = self._qcow2_layer(ref)
         dest = os.path.join(self.cache_dir, digest.replace(":", "-"))
         cached = self._qcow2_in(dest)
         if cached is not None:
@@ -122,6 +122,13 @@ class ImageSync:
         # Pull into a temp dir then atomically swap into place, so an interrupted
         # pull never leaves a half-written qcow2 that a later run treats as cached.
         tmp = tempfile.mkdtemp(prefix=".pull-", dir=self.cache_dir)
+        stop = threading.Event()
+        threading.Thread(
+            target=self._log_pull_progress,
+            args=(ref, tmp, stop, size, report),
+            name="husk-pull-progress",
+            daemon=True,
+        ).start()
         try:
             log.info("pulling image %s (%s) to controller cache", ref, digest[:19])
             # NB: don't pass allowed_media_type here — in oras-py that filters the
@@ -138,6 +145,7 @@ class ImageSync:
             os.replace(tmp, dest)
             tmp = None  # consumed by the rename; don't clean it up below
         finally:
+            stop.set()
             if tmp is not None:
                 shutil.rmtree(tmp, ignore_errors=True)
         local = self._qcow2_in(dest)
@@ -145,8 +153,37 @@ class ImageSync:
         log.info("image %s ready at %s", ref, local)
         return ResolvedImage(ref=ref, digest=digest, local_path=local)
 
-    def _qcow2_digest(self, ref: str) -> str:
-        """The digest of the artifact's qcow2 layer (its content hash)."""
+    def _log_pull_progress(
+        self, ref: str, tmp: str, stop, total: int = 0, report=None
+    ) -> None:
+        """Log how much has been pulled into the temp dir every
+        `_PULL_PROGRESS_INTERVAL_S`, so a slow multi-GB registry pull isn't a silent
+        gap; if given a `report` sink, push the same line onto the op. When the
+        manifest gave a layer `total`, report a percentage, else bytes so far.
+        Best-effort: it stops the moment the pull completes."""
+        while not stop.wait(_PULL_PROGRESS_INTERVAL_S):
+            try:
+                got = sum(
+                    os.path.getsize(os.path.join(dp, f))
+                    for dp, _dirs, files in os.walk(tmp)
+                    for f in files
+                )
+            except OSError:
+                continue
+            if got > 0:
+                line = (
+                    f"pulling golden: {got >> 20}/{total >> 20} MiB "
+                    f"({100 * got // total}%)"
+                    if total > 0
+                    else f"pulling golden: {got >> 20} MiB so far"
+                )
+                log.info("%s (%s)", line, ref)
+                if report is not None:
+                    report(line)
+
+    def _qcow2_layer(self, ref: str) -> tuple[str, int]:
+        """The (digest, size-in-bytes) of the artifact's qcow2 layer. `size` is 0
+        if the manifest omits it (then pull progress falls back to bytes-so-far)."""
         last: Exception | None = None
         for attempt in range(_MANIFEST_ATTEMPTS):
             try:
@@ -165,13 +202,13 @@ class ImageSync:
         # Prefer the husk qcow2 mediaType; fall back to the only layer / a .qcow2 title.
         for layer in layers:
             if layer.get("mediaType") == _QCOW2_MEDIA_TYPE and layer.get("digest"):
-                return layer["digest"]
+                return layer["digest"], int(layer.get("size") or 0)
         for layer in layers:
             title = (layer.get("annotations") or {}).get(
                 "org.opencontainers.image.title", ""
             )
             if title.endswith(".qcow2") and layer.get("digest"):
-                return layer["digest"]
+                return layer["digest"], int(layer.get("size") or 0)
         raise ImageSyncError(
             f"artifact {ref!r} has no {_QCOW2_MEDIA_TYPE} layer (layers: "
             f"{[layer.get('mediaType') for layer in layers]})"
@@ -187,69 +224,3 @@ class ImageSync:
             if name.endswith(".qcow2"):
                 return os.path.join(directory, name)
         return None
-
-
-class BackgroundImagePreparer:
-    """Runs slow image staging (registry pull + delivery to a backend's targets)
-    OFF the reconcile thread, so a multi-GB transfer never blocks a tick.
-
-    The controller calls `ready(ref)` once per tick: it returns the prepared
-    result as soon as staging for that ref has finished, or `None` while it's
-    still in flight (the first ask kicks off a background prepare). The backend
-    then adopts a non-None result instantly on the tick thread — so the live image
-    fields are only ever written by the single reconcile thread, never racing the
-    worker. Single-flight per ref; a failed prepare is retried on the next ask
-    after a backoff. `prepare(ref)` does the heavy, idempotent work and returns an
-    opaque result the backend knows how to adopt.
-
-    `spawn` runs the worker (default: a daemon thread); tests inject a synchronous
-    runner so a single `ready()` returns the result deterministically."""
-
-    def __init__(self, prepare, *, spawn=None) -> None:
-        self._prepare = prepare
-        self._spawn = spawn or self._thread_spawn
-        self._lock = threading.Lock()
-        self._ready: dict[str, object] = {}
-        self._inflight: set[str] = set()
-        self._failed_at: dict[str, float] = {}
-
-    @staticmethod
-    def _thread_spawn(fn) -> None:
-        threading.Thread(target=fn, name="husk-image-prepare", daemon=True).start()
-
-    def ready(self, ref: str):
-        """Return the staged result for `ref`, or None while staging is in flight
-        (kicking off a background prepare on the first ask / after a backoff)."""
-        with self._lock:
-            if ref in self._ready:
-                return self._ready[ref]
-            if ref in self._inflight:
-                return None
-            failed = self._failed_at.get(ref)
-            if (
-                failed is not None
-                and time.monotonic() - failed < _PREPARE_RETRY_BACKOFF_S
-            ):
-                return None  # recent failure — hold off before retrying
-            self._inflight.add(ref)
-        log.info("staging image %s in the background", ref)
-        self._spawn(lambda: self._run(ref))
-        with self._lock:
-            # Populated already iff `spawn` ran the worker inline (tests); a real
-            # daemon thread hasn't finished yet, so this returns None this tick.
-            return self._ready.get(ref)
-
-    def _run(self, ref: str) -> None:
-        try:
-            result = self._prepare(ref)
-        except BaseException as e:  # noqa: BLE001 - a worker must never escape
-            with self._lock:
-                self._inflight.discard(ref)
-                self._failed_at[ref] = time.monotonic()
-            log.warning("image staging for %s failed: %s", ref, e, exc_info=True)
-            return
-        with self._lock:
-            self._ready[ref] = result
-            self._inflight.discard(ref)
-            self._failed_at.pop(ref, None)
-        log.info("image %s staged and ready", ref)

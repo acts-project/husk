@@ -23,7 +23,8 @@ import openstack
 from husk.backend import ListSlotsError
 from husk.cloudinit import b64
 from husk.config import BackendConfig
-from husk.image_sync import BackgroundImagePreparer, ImageSync
+from husk.image_sync import ImageSync
+from husk.ops import DONE, OpStore, OpView
 from husk.slot import Capacity, Slot
 
 log = logging.getLogger("husk.openstack")
@@ -89,10 +90,10 @@ class OpenStackBackend:
         self._synced_ref = ""  # the ref behind the current image_id (sync no-op guard)
         self._image_digest: str | None = None
         self.image_id: str | None = None
-        # Heavy staging (oras pull + Glance upload) runs off the reconcile thread;
-        # the tick only adopts a ready result. A dedicated upload connection keeps
-        # the worker's Glance calls off the connection the tick uses for compute.
-        self._preparer = BackgroundImagePreparer(self._prepare_image)
+        # Heavy staging (oras pull + Glance upload) runs off the reconcile thread
+        # as a keyed op; the tick only adopts a ready result. A dedicated upload
+        # connection keeps the worker's Glance calls off the tick's compute conn.
+        self._ops = OpStore()
         self._image_conn = None
         if not self._backend_ref:
             if not cfg.image_name:
@@ -186,20 +187,29 @@ class OpenStackBackend:
             return  # legacy image_name mode — nothing to pull/upload
         if self._synced_ref == ref and self.image_id:
             return  # already current
-        prepared = self._preparer.ready(ref)
-        if prepared is None:
-            return  # still staging in the background — keep the current image
+        key = f"glance:{ref}"
+        view = self._ops.submit(
+            key, "glance-upload", lambda report: self._prepare_image(ref, report)
+        )
+        if view.state != DONE:
+            return  # still staging (or failed + backing off) — keep current image
+        prepared = self._ops.result(key)
         self.image_id = prepared.image_id
         self._image_digest = prepared.digest
         self._synced_ref = ref
         log.info("adopted Glance golden %s for %s", self.image_id, ref)
         self._gc_glance()
 
-    def _prepare_image(self, ref: str) -> _GlancePrepared:
-        """Heavy staging (background thread): pull the OCI golden to the controller
-        cache and ensure it's uploaded to Glance. Returns what the tick adopts."""
-        resolved = self._sync.resolve(ref)
-        image_id = self._ensure_in_glance(self._upload_conn(), resolved)
+    def staging_ops(self) -> list[OpView]:
+        """In-flight / recent image-staging ops, for the status board."""
+        return self._ops.views()
+
+    def _prepare_image(self, ref: str, report) -> _GlancePrepared:
+        """Heavy staging (op worker): pull the OCI golden to the controller cache
+        and ensure it's uploaded to Glance. Returns what the tick adopts."""
+        report("pulling golden from registry")
+        resolved = self._sync.resolve(ref, report=report)
+        image_id = self._ensure_in_glance(self._upload_conn(), resolved, report)
         return _GlancePrepared(digest=resolved.digest, image_id=image_id)
 
     def _upload_conn(self):
@@ -209,16 +219,22 @@ class OpenStackBackend:
             self._image_conn = openstack.connect(cloud=self.cfg.cloud)
         return self._image_conn
 
-    def _ensure_in_glance(self, conn, resolved) -> str:
+    def _ensure_in_glance(self, conn, resolved, report=None) -> str:
         """Return the Glance image id for a resolved OCI golden, uploading it once
         if absent. Idempotent + content-addressed: the image is named
         `husk-golden-<digest12>`, so a present image of the same digest is reused
-        and a moved tag uploads a new image rather than mutating one in use."""
+        and a moved tag uploads a new image rather than mutating one in use.
+
+        The "uploading" progress is reported only on an actual upload — a reused
+        image is a no-op, so a restart against an already-staged golden shows no
+        spurious upload activity."""
         name = f"{GLANCE_PREFIX}{resolved.short}"
         existing = conn.image.find_image(name)
         if existing is not None:
             log.debug("Glance already has golden %s (%s)", name, existing.id)
             return existing.id
+        if report is not None:
+            report("uploading golden to Glance")
         log.info("uploading golden %s to Glance (qcow2, may take a while)", name)
         # create_image streams the file and waits for the image to go active.
         # disk/container formats match a bare qcow2; the digest is stamped as an
@@ -255,6 +271,12 @@ class OpenStackBackend:
                     self.conn.image.delete_image(img.id, ignore_missing=True)
         except Exception:
             log.warning("Glance golden GC failed; leaving images", exc_info=True)
+
+    def image_ready(self, slot: Slot) -> bool:
+        """OCI mode: ready once the golden has been adopted into Glance
+        (`image_id` set). Legacy image_name mode resolves the id at init, so it is
+        always ready. Mirrors the `capacity()` gate, for rebuilds."""
+        return bool(self.image_id) or not self._backend_ref
 
     def _require_image(self) -> str:
         """The current Glance image id, or a clear error if an OCI sync hasn't
@@ -350,6 +372,13 @@ class OpenStackBackend:
         self.conn.compute.delete_server(slot.id, ignore_missing=True)
 
     def capacity(self) -> Capacity:
+        # OCI mode: while the golden is still staging (oras pull + Glance upload),
+        # there is no image to boot — report zero so the controller doesn't attempt
+        # a create (and mint a wasted JIT runner) until it lands. Legacy image_name
+        # mode resolves the id at init, so this never trips there.
+        if self._backend_ref and not self.image_id:
+            log.debug("image not staged yet; reporting zero capacity")
+            return Capacity(can_create=False, free_instances=0)
         try:
             limits = self.conn.compute.get_limits().absolute
             max_instances = getattr(limits, "instances", None) or getattr(
