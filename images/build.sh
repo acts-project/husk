@@ -104,6 +104,8 @@ ARGS=(
   --copy-in "$FILES/husk-docker-sock.conf:/etc/tmpfiles.d/"
   --copy-in "$FILES/husk-runner.service:/etc/systemd/system/"
   --copy-in "$FILES/husk-poweroff.service:/etc/systemd/system/"
+  # Boot-timing report to the serial console; NOT enabled (cloud-init starts it).
+  --copy-in "$FILES/husk-bootreport.service:/etc/systemd/system/"
   --copy-in "$FILES/90-husk-datasource.cfg:/etc/cloud/cloud.cfg.d/"
 
   # Bake the runner binary + its native deps so recycle doesn't reinstall them.

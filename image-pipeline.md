@@ -70,6 +70,10 @@ per-slot, per-job, or meant to change without a rebuild.
   `/etc/containers/nodocker`, the `husk-docker-sock` tmpfiles rule.
 - The `runner` user (uid 1000) + `husk-runner.service` / `husk-poweroff.service`
   unit files (static; **not** enabled for boot — cloud-init still starts them).
+- `husk-bootreport.service` — a oneshot that dumps `systemd-analyze` +
+  `cloud-init analyze blame` to the serial console after the runner starts, so
+  recycle timing is observable without SSH (static; started by cloud-init, like
+  the runner unit). Reads only timestamps already recorded, so it's always-on.
 - `nftables` package + service (the firewall *engine*, not the ruleset).
 - **GPU variant only:** NVIDIA driver + `nvidia-container-toolkit`, plus the
   CDI-on-first-boot oneshot (`husk-cdi.service`). CDI generation stays first-boot
@@ -84,7 +88,7 @@ per-slot, per-job, or meant to change without a rebuild.
   later (`plan.md` "Network policy rollout").
 - The NoCloud seed / instance-id (rotates so cloud-init re-runs).
 - Start orchestration: `systemctl start husk-runner.service` (sole boot
-  orchestrator, as today).
+  orchestrator, as today), then a non-blocking `systemctl start husk-bootreport`.
 - Wall-clock backstop (`shutdown -h +N`).
 
 > **Side effect of baking the packages:** the reason the firewall is applied at

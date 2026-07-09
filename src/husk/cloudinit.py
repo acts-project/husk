@@ -310,6 +310,11 @@ runcmd:
   # cycle once the fresh JIT config is in place (Type=simple returns immediately).
   - systemctl daemon-reload
   - systemctl start husk-runner.service
+  # Boot-timing report to the serial console (baked oneshot, ordered After the
+  # runner so it never delays registration). Always-on: it only reads timestamps
+  # systemd/cloud-init already record. `--no-block` so a slow analyze can't hold
+  # up the final stage. `|| true` — diagnostics must never fail the boot.
+  - systemctl start --no-block husk-bootreport.service || true
   # Belt-and-suspenders wall-clock cap (runner is unprivileged -> real net).
   - shutdown -h +360
 """
