@@ -21,6 +21,8 @@ from husk.lock import LockHeld, SingleControllerLock
 from husk.multipool import MultiPoolController
 from husk.snapshot import ControllerState
 
+log = logging.getLogger("husk.cli")
+
 huskd_app = typer.Typer(help="Husk controller daemon", add_completion=False)
 huskctl_app = typer.Typer(help="Husk operator CLI", add_completion=False)
 
@@ -427,6 +429,8 @@ async def _serve(facade: MultiPoolController, http_addr: str) -> None:
     thread.start()
     try:
         host, port = parse_addr(http_addr)
+        display_host = "127.0.0.1" if host == "0.0.0.0" else host
+        log.info("dashboard: http://%s:%d/", display_host, port)
         await serve_app(
             make_app(facade.snapshots, shutdown=stop),
             host,
