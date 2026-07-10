@@ -54,12 +54,12 @@ function poolHtml(p) {
           <td class="num">${secs(v.recycle_seconds)}</td>
           <td class="num">${pct(v.live_fraction)}</td>
         </tr>`).join("");
-    body = `<table><thead><tr>
+    body = `<div class="tablewrap"><table><thead><tr>
         <th>ID</th><th>NAME</th><th>STATE</th><th>NOVA</th><th>TASK</th>
         <th>RUNNER</th><th>RUNNER ST</th><th>BUSY</th>
         <th class="num">CYCLE</th><th class="num">CLOUD_INIT</th>
         <th class="num">RECYCLE</th><th class="num">LIVE%</th>
-      </tr></thead><tbody>${rows}</tbody></table>`;
+      </tr></thead><tbody>${rows}</tbody></table></div>`;
   }
   return `<section class="pool"><div class="head">
       <span class="name">${esc(p.backend)}</span>
