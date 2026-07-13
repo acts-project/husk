@@ -80,6 +80,21 @@ class Backend(Protocol):
         """Best-effort free capacity. The controller also clamps to max_total."""
         ...
 
+    def console_output(self, slot: Slot, *, lines: int | None = None) -> str | None:
+        """Best-effort serial-console log of the slot — for the boot report.
+
+        `lines` tails the last N lines; None (default) returns the whole captured
+        log. Full-log is the default deliberately: the husk-bootreport block is
+        emitted late in boot but cloud-init keeps printing after it, so a small
+        tail can miss it — the parser picks the last complete block out of the full
+        text cheaply.
+
+        Returns None when unavailable (backend can't read it, transient error, or
+        not yet supported). Unlike `list_slots`, this NEVER raises: boot-timing is
+        an observability nicety and must not abort a reconcile tick.
+        """
+        ...
+
     def image_ready(self, slot: Slot) -> bool:
         """Whether this slot can be (re)imaged now — i.e. the configured golden has
         finished staging for it. `capacity()` already gates *grows* on this; the

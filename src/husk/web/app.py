@@ -103,6 +103,21 @@ def render_prometheus(s: ControllerState) -> str:
         for v in s.slots
         if v.live_fraction is not None
     ]
+    out += [
+        "# HELP husk_slot_boot_seconds systemd-analyze boot phase durations (husk-bootreport)",
+        "# TYPE husk_slot_boot_seconds gauge",
+    ]
+    out += [
+        f'husk_slot_boot_seconds{{backend="{b}",slot="{v.name}",phase="{phase}"}} {val}'
+        for v in s.slots
+        for phase, val in (
+            ("kernel", v.boot_kernel_seconds),
+            ("initrd", v.boot_initrd_seconds),
+            ("userspace", v.boot_userspace_seconds),
+            ("total", v.boot_total_seconds),
+        )
+        if val is not None
+    ]
     return "\n".join(out) + "\n"
 
 

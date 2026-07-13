@@ -802,6 +802,13 @@ class LibvirtBackend:
             f"{shlex.quote(pool + '/' + name + '-console.log')}",
         )
 
+    def console_output(self, slot: Slot, *, lines: int | None = None) -> str | None:
+        # Deferred (observability Phase O1 is OpenStack-only): the domain runs an
+        # interactive pty console with no captured serial-log file. Enabling this
+        # needs console_log_path set in the domain XML plus the host-side serial-log
+        # ownership/relabel fix (see the console_log_path note in _define / build).
+        return None
+
     def capacity(self) -> Capacity:
         try:
             free = lx.free_unit_count(self._host_units(), self._occupied())

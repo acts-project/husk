@@ -22,6 +22,7 @@ import time
 from typing import Callable
 
 from husk.backend import ListSlotsError
+from husk.bootreport import parse_bootreport
 from husk.cloudinit import render_cloud_init
 from husk.config import Config
 from husk.slot import Runner, Slot, SlotState, classify, match_runner
@@ -29,6 +30,11 @@ from husk.snapshot import ControllerState
 from husk.timing import SlotTiming
 
 log = logging.getLogger("husk.controller")
+
+# Max serial-console reads per bring-up while chasing a slot's husk-bootreport
+# block (the block flushes shortly after the runner registers). At a ~30s poll
+# this is ~5 min of retry before giving up — bounds Nova console-API calls.
+BOOTREPORT_MAX_ATTEMPTS = 10
 
 # Config knobs that are safe to change while the loop runs: the controller reads
 # each of these fresh from self.cfg on every tick, so swapping them between ticks
@@ -93,6 +99,10 @@ class Controller:
         self.pending_start: set[str] = set()
         self.cycle_counter: dict[str, int] = {}
         self.timing: dict[str, SlotTiming] = {}
+        # Boot-report (husk-bootreport) capture state, per bring-up:
+        self.bootreport_captured: set[str] = set()  # got a fresh block → stop polling
+        self.bootreport_attempts: dict[str, int] = {}  # console reads this bring-up
+        self.bootreport_last_ts: dict[str, str] = {}  # last accepted marker ts (dedup)
 
         self._known: set[str] = set()
         self._last_tick: float | None = None
@@ -253,6 +263,7 @@ class Controller:
         classified = self._classify_all(slots, runners, now)
         busy = sum(1 for _, _, st in classified if st is SlotState.BUSY)
         self._track_runner_presence(classified, now)
+        self._capture_bootreports(classified, now)
 
         # 3-prep. POOL SIZING — computed BEFORE remediation so an excess slot can
         # be retired at its natural poweroff point (NEEDS_RECYCLE) instead of being
@@ -464,6 +475,11 @@ class Controller:
         t = self.timing.get(slot.id)
         if t is not None:
             t.on_issued(now)
+        # New bring-up on a stable id: re-arm boot-report capture. Keep
+        # bootreport_last_ts — it rejects the previous cycle's block, still present
+        # in the console ring buffer until this cycle's report flushes.
+        self.bootreport_captured.discard(slot.id)
+        self.bootreport_attempts.pop(slot.id, None)
         log.info("rebuilt slot %s as runner %s (cycle %d)", slot.id, name, cycle)
 
     def _drain_pending_start(self, slot: Slot, now: float) -> None:
@@ -601,6 +617,71 @@ class Controller:
                         "slot %s runner gone while ACTIVE; draining (grace reset)", s.id
                     )
 
+    def _capture_bootreports(self, classified, now: float) -> None:
+        """Read the husk-bootreport block off each online slot's serial console and
+        fold the systemd-analyze phase durations into its SlotTiming.
+
+        Layer-1 (control-plane) observability: the boot-timing report is a fact the
+        controller reads over the host-side console API, not scraped from the VM. It
+        is best-effort — `console_output` never raises and a parse miss just retries
+        — so it can never disturb reconciliation. At most one successful capture per
+        bring-up; bounded retries chase the block, which flushes to the console
+        shortly after the runner registers."""
+        for s, runner, _state in classified:
+            if runner is None or not runner.online:
+                continue
+            if s.id in self.bootreport_captured:
+                continue
+            if self.bootreport_attempts.get(s.id, 0) >= BOOTREPORT_MAX_ATTEMPTS:
+                continue
+            attempt = self.bootreport_attempts.get(s.id, 0) + 1
+            self.bootreport_attempts[s.id] = attempt
+            try:
+                text = self.backend.console_output(s)
+            except Exception:  # defensive: the seam promises not to raise
+                log.warning("console_output %s failed", s.id, exc_info=True)
+                continue
+            if not text:
+                log.debug("bootreport %s: empty console (attempt %d)", s.id, attempt)
+                continue
+            report = parse_bootreport(text)
+            if report is None:
+                log.debug(
+                    "bootreport %s: no complete block in %d chars (attempt %d)",
+                    s.id,
+                    len(text),
+                    attempt,
+                )
+                continue  # no complete block yet — flushing; retry next tick
+            if report.timestamp == self.bootreport_last_ts.get(s.id):
+                log.debug(
+                    "bootreport %s: stale block ts=%s (attempt %d)",
+                    s.id,
+                    report.timestamp,
+                    attempt,
+                )
+                continue  # stale: previous cycle's block still in the ring buffer
+            self.bootreport_last_ts[s.id] = report.timestamp
+            self.bootreport_captured.add(s.id)
+            t = self.timing.get(s.id)
+            if t is not None:
+                t.on_bootreport(
+                    kernel=report.kernel_seconds,
+                    initrd=report.initrd_seconds,
+                    userspace=report.userspace_seconds,
+                    total=report.total_seconds,
+                    units=list(report.systemd_units),
+                    stages=list(report.cloudinit_stages),
+                )
+            log.info(
+                "slot %s boot report: kernel=%s initrd=%s userspace=%s total=%s",
+                s.id,
+                _fmt(report.kernel_seconds),
+                _fmt(report.initrd_seconds),
+                _fmt(report.userspace_seconds),
+                _fmt(report.total_seconds),
+            )
+
     def _note_active_transition(self, slot: Slot, now: float) -> None:
         """Restart the startup-grace clock when a slot first reaches ACTIVE.
 
@@ -633,12 +714,15 @@ class Controller:
             self.prev_status,
             self.cycle_counter,
             self.timing,
+            self.bootreport_attempts,
+            self.bootreport_last_ts,
         ):
             for k in list(d):
                 if k not in live:
                     del d[k]
         self.pending_start &= live
         self.runner_present &= live
+        self.bootreport_captured &= live
         self._known &= live
 
     def _forget(self, slot_id: str) -> None:
@@ -647,8 +731,11 @@ class Controller:
         self.prev_status.pop(slot_id, None)
         self.cycle_counter.pop(slot_id, None)
         self.timing.pop(slot_id, None)
+        self.bootreport_attempts.pop(slot_id, None)
+        self.bootreport_last_ts.pop(slot_id, None)
         self.pending_start.discard(slot_id)
         self.runner_present.discard(slot_id)
+        self.bootreport_captured.discard(slot_id)
         self._known.discard(slot_id)
 
     def _provision_age(self, slot_id: str, now: float) -> float | None:

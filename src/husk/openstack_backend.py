@@ -371,6 +371,17 @@ class OpenStackBackend:
         log.info("destroying slot %s (reason=%s)", slot.id, reason)
         self.conn.compute.delete_server(slot.id, ignore_missing=True)
 
+    def console_output(self, slot: Slot, *, lines: int | None = None) -> str | None:
+        try:
+            out = self.conn.compute.get_server_console_output(slot.id, length=lines)
+        except Exception:
+            log.warning("console output for %s unavailable", slot.id, exc_info=True)
+            return None
+        text = (
+            out.get("output") if isinstance(out, dict) else getattr(out, "output", None)
+        )
+        return text or None
+
     def capacity(self) -> Capacity:
         # OCI mode: while the golden is still staging (oras pull + Glance upload),
         # there is no image to boot — report zero so the controller doesn't attempt

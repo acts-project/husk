@@ -1,0 +1,91 @@
+[   10.095756] cloud-init[1130]: Cloud-init v. 24.4-7.el10 running 'modules:config' at Fri, 10 Jul 2026 15:14:43 +0000. Up 10.06 seconds.
+[[0;32m  OK  [0m] Finished [0;1;39mcloud-config.service[0m - Cloud-init: Config Stage.
+         Starting [0;1;39mcloud-final.service[0m - Cloud-init: Final Stage...
+[   10.409680] cloud-init[1135]: Cloud-init v. 24.4-7.el10 running 'modules:final' at Fri, 10 Jul 2026 15:14:44 +0000. Up 10.37 seconds.
+[   10.709112] systemd-rc-local-generator[1176]: /etc/rc.d/rc.local is not marked executable, skipping.
+         Starting [0;1;39mhusk-runner.service[0m - Husk GitHub Actions ephemeral runner...
+[[0;32m  OK  [0m] Started [0;1;39mhusk-runner.service[0m - Husk GitHub Actions ephemeral runner.
+         Starting [0;1;39mhusk-bootreport.service[0m -���loud-init) to the serial console...
+[   10.740293] cloud-init[1135]: Shutdown scheduled for Fri 2026-07-10 21:14:44 UTC, use 'shutdown -c' to cancel.
+[   10.746092] sh[1198]: ===== husk-bootreport 2026-07-10T15:14:44Z =====
+ci-info: +++++++++++++++++++++++++++++++Authorized keys from /home/almalinux/.ssh/authorized_keys for user almalinux++++++++++++++++++++++++++++++++
+ci-info: +---------+-------------------------------------------------------------------------------------------------+---------+-------------------+
+ci-info: | Keytype |                                       Fingerprint (sha256)                                      | Options |      Comment      |
+ci-info: +---------+-------------------------------------------------------------------------------------------------+---------+-------------------+
+ci-info: | ssh-rsa | 7c:3f:78:c1:f6:f2:55:26:56:fe:3e:22:b0:22:a9:b2:6a:0d:d0:e4:3b:5f:d1:27:af:f0:b5:62:d0:31:3b:79 |    -    | Generated-by-Nova |
+ci-info: +---------+-------------------------------------------------------------------------------------------------+---------+-------------------+
+<14>Jul 10 15:14:44 cloud-init: #############################################################
+<14>Jul 10 15:14:44 cloud-init: -----BEGIN SSH HOST KEY FINGERPRINTS-----
+<14>Jul 10 15:14:44 cloud-init: 256 SHA256:VHq7LLuiKp9QdykFlUc2sN6nZcL9AuwgmotjW30fCWo root@husk-1781682384-3.cern.ch (ECDSA)
+<14>Jul 10 15:14:44 cloud-init: 256 SHA256:MBHuZyUvknp74VDpqPVSi7pZYWEIsJ3pV6iE37pmFoM root@husk-1781682384-3.cern.ch (ED25519)
+<14>Jul 10 15:14:44 cloud-init: 3072 SHA256:NeUBX4FRRHvC5C8FtXSvoieQTkru+AVEBVJc0zhXIwc root@husk-1781682384-3.cern.ch (RSA)
+<14>Jul 10 15:14:44 cloud-init: -----END SSH HOST KEY FINGERPRINTS-----
+<14>Jul 10 15:14:44 cloud-init: #############################################################
+-----BEGIN SSH HOST KEY KEYS-----
+ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBJ48sr0HTQBmj9qYFdBHYbrCgEuaIH7ZXDRQywsAA93NcBlk536uMsCsCWYSyxxnI80rEDx9LSlgz+/qUikUj+A= root@husk-1781682384-3.cern.ch
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILCuSr37yxcmOPx4t5LAzFuVmqoe5U13RAYLxZ8zzoXq root@husk-1781682384-3.cern.ch
+ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCnjSByaE74m2Rc0NOsPqG3gQOvQzktDlnmhxCPUJ3YAHQU8K3JwyhoF2in+U83KvBgaDFzDN7DnmZIu2Vfc532T6odEQKEDSUlU5SqJc/1AKcVEcrKOBrY++Ka4rb8SNjb/prfDbE+b90NHp74zyC+uUpy6O/8PgiO/FZ2wO7egGIj2aBwQCZgwB9bvNxi+4xAncpLMvYb1VwdFdl1FHuT7Vj6l+cRLawflY1l99VIbt4f0pA6leHEUlrYMhUUFbdDXFJEftP8CVqXXmaqJ5Yql5PrI1o5ZhVJ7o30nj+g+mJyPCvALYz5ZUDSC2JUAl8QvzM+zQZloSAzCwu9KmK0PqJ1sF5vcFRTqgriel5onFmcNHu/6jj8EqY6ypthbU9EKmIX2Q5xLJ7OME14n/DvCSABjhLEVm5ul3KtdJ1pCJxwtJZuVFbnCCUeN30/PR40xMniUESuQGnr7pZGe1Bn2r53FgBNK1bQahlTDioVXUNBP/1vIPHJAp6C/MXjIw8= root@husk-1781682384-3.cern.ch
+-----END SSH HOST KEY KEYS-----
+[   10.865068] cloud-init[1135]: Cloud-init v. 24.4-7.el10 finished at Fri, 10 Jul 2026 15:14:44 +0000. Datasource DataSourceOpenStackLocal [net,ver=2].  Up 10.84 seconds
+[[0;32m  OK  [0m] Finished [0;1;39mcloud-final.service[0m - Cloud-init: Final Stage.
+[[0;32m  OK  [0m] Reached target [0;1;39mcloud-init.target[0m - Cloud-init target.
+[   11.845845] sh[1232]: 2.923s cloud-init-local.service
+[   11.846409] sh[1232]: 2.376s dev-ttyS2.device
+[   11.846793] sh[1232]: 2.376s sys-devices-platform-serial8250-serial8250:0-serial8250:0.2-tty-ttyS2.device
+[   11.847546] sh[1232]: 2.370s sys-module-configfs.device
+[   11.847980] sh[1232]: 2.368s dev-ttyS0.device
+[   11.848368] sh[1232]: 2.368s sys-devices-pnp0-00:00-00:00:0-00:00:0.0-tty-ttyS0.device
+[   11.848987] sh[1232]: 2.366s dev-ttyS3.device
+[   11.849501] sh[1232]: 2.366s sys-devices-platform-serial8250-serial8250:0-serial8250:0.3-tty-ttyS3.device
+[   11.850270] sh[1232]: 2.364s dev-ttyS1.device
+[   11.850642] sh[1232]: 2.364s sys-devices-platform-serial8250-serial8250:0-serial8250:0.1-tty-ttyS1.device
+[   11.851389] sh[1232]: 2.212s dev-vda.device
+[   11.853050] sh[1232]: 2.212s sys-devices-pci0000:00-0000:00:04.0-virtio2-block-vda.device
+[   11.853749] sh[1232]: 2.212s dev-disk-by\x2dpath-pci\x2d0000:00:04.0.device
+[   11.854329] sh[1232]: 2.212s dev-disk-by\x2dpath-virtio\x2dpci\x2d0000:00:04.0.device
+[   11.854960] sh[1232]: 2.212s dev-disk-by\x2ddiskseq-1.device
+[   11.855691] sh[1232]: 2.208s dev-disk-by\x2dpartlabel-biosboot.device
+[   11.857400] sh[1232]: 2.208s dev-disk-by\x2dpath-pci\x2d0000:00:04.0\x2dpart-by\x2dpartnum-1.device
+[   11.858142] sh[1232]: 2.208s dev-vda1.device
+[   11.858514] sh[1232]: 2.208s dev-disk-by\x2dpath-pci\x2d0000:00:04.0\x2dpart-by\x2dpartuuid-ff11eb94\x2d853b\x2d4d2d\x2d910e\x2d0dffa0426b3e.device
+[   11.859546] sh[1232]: 2.208s dev-disk-by\x2dpath-virtio\x2dpci\x2d0000:00:04.0\x2dpart1.device
+[   12.172216] cloud-init[1244]: -- Boot Record 01 --
+[   12.175073] cloud-init[1244]:      02.26400s (init-local/search-OpenStackLocal)
+[   12.175723] cloud-init[1244]:      00.31600s (modules-final/config-scripts_user)
+[   12.176336] cloud-init[1244]:      00.10900s (init-network/config-ssh)
+[   12.176861] cloud-init[1244]:      00.07800s (modules-final/config-keys_to_console)
+[   12.177477] cloud-init[1244]:      00.03300s (init-network/config-users_groups)
+[   12.178070] cloud-init[1244]:      00.03300s (init-network/config-growpart)
+[   12.178626] cloud-init[1244]:      00.02600s (init-network/check-cache)
+[   12.179162] cloud-init[1244]:      00.02100s (modules-final/config-ssh_authkey_fingerprints)
+[   12.180587] cloud-init[1244]:      00.02000s (modules-final/config-final_message)
+[   12.181240] cloud-init[1244]:      00.01300s (init-network/config-mounts)
+[   12.181789] cloud-init[1244]:      00.01000s (init-network/config-set_passwords)
+[   12.182413] cloud-init[1244]:      00.00800s (init-network/consume-user-data)
+[   12.182973] cloud-init[1244]:      00.00500s (modules-final/config-install_hotplug)
+[   12.183595] cloud-init[1244]:      00.00400s (init-network/config-write_files)
+[   12.184185] cloud-init[1244]:      00.00400s (init-network/config-resizefs)
+[   12.184735] cloud-init[1244]:      00.00300s (modules-config/config-locale)
+[   12.185296] cloud-init[1244]:      00.00100s (modules-final/config-write_files_deferred)
+[   12.185927] cloud-init[1244]:      00.00100s (modules-final/config-scripts_vendor)
+[   12.186536] cloud-init[1244]:      00.00100s (modules-final/config-reset_rmc)
+[   12.187128] cloud-init[1244]:      00.00100s (modules-config/config-runcmd)
+[   12.187682] cloud-init[1244]:      00.00100s (init-network/config-update_hostname)
+[   12.189124] cloud-init[1244]:      00.00100s (init-network/config-set_hostname)
+[   12.189731] cloud-init[1244]:      00.00100s (init-network/activate-datasource)
+[   12.190331] cloud-init[1244]:      00.00000s (modules-final/config-scripts_per_once)
+[   12.190938] cloud-init[1244]:      00.00000s (modules-final/config-scripts_per_instance)
+[   12.191581] cloud-init[1244]:      00.00000s (modules-final/config-scripts_per_boot)
+[   12.192202] cloud-init[1244]:      00.00000s (init-network/setup-datasource)
+[   12.192761] cloud-init[1244]:      00.00000s (init-network/consume-vendor-data2)
+[   12.193359] cloud-init[1244]:      00.00000s (init-network/consume-vendor-data)
+[   12.194021] cloud-init[1244]:      00.00000s (init-network/config-seed_random)
+[   12.195043] cloud-init[1244]:      00.00000s (init-local/check-cache)
+[   12.195597] cloud-init[1244]: 1 boot records analyzed
+[   12.243571] sh[1247]: ===== husk-bootreport end =====
+[[0;32m  OK  [0m] Finished [0;1;39mhusk-bootreport.service[0m -��� cloud-init) to the serial console.
+[!p]104[?7h[6n[32766;32766H[6n[!p]104[?7h[6n[32766;32766H[6n
+AlmaLinux 10.2 (Lavender Lion)
+Kernel 6.12.0-211.7.3.el10_2.x86_64 on an x86_64
+
+husk-1781682384-3 login:

@@ -56,6 +56,37 @@ def test_render_prometheus():
     assert "husk_last_reconcile_timestamp_seconds" in text
 
 
+def test_render_prometheus_boot_seconds():
+    from husk.timing import SlotTiming
+
+    t = SlotTiming(first_seen=0.0)
+    t.on_bootreport(kernel=2.1, initrd=None, userspace=8.9, total=15.6)
+    classified = [
+        (
+            make_slot(id="vm-1", name="husk-a-1", status="ACTIVE"),
+            make_runner(name="husk-a-1-c0", status="online"),
+            SlotState.IDLE,
+        )
+    ]
+    state = ControllerState.from_classified(
+        generation=1,
+        backend="pool-a",
+        min_ready=1,
+        max_total=4,
+        desired_total=1,
+        classified=classified,
+        timing={"vm-1": t},
+    )
+    text = render_prometheus(state)
+    assert (
+        'husk_slot_boot_seconds{backend="pool-a",slot="husk-a-1",phase="total"} 15.6'
+        in text
+    )
+    assert 'phase="kernel"} 2.1' in text
+    # initrd was None -> the series is omitted, not emitted as 0.
+    assert 'phase="initrd"' not in text
+
+
 # --------------------------------------------------------------- Quart routes
 def _client_get(app, path):
     async def go():

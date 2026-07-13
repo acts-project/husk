@@ -11,6 +11,36 @@ const secs = v => v==null ? "-" : Math.round(v)+"s";
 const pct = v => v==null ? "-" : Math.round(v*100)+"%";
 const esc = s => (s==null ? "" : ""+s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 
+// A nested breakdown of the recycle (issue→online) duration, shown on hover.
+// The controller splits recycle into spawn + cloud-init (its own clock); the
+// husk-bootreport then sub-breaks the guest boot *within* cloud-init (guest
+// clock — so it doesn't sum to recycle, hence the derived remainder line).
+function recycleTip(v) {
+  if (v.recycle_seconds == null) return "";
+  const L = [`recycle ${secs(v.recycle_seconds)}`];
+  if (v.boot_seconds != null)      L.push(`  spawn        ${secs(v.boot_seconds)}`);
+  if (v.cloudinit_seconds != null) L.push(`  cloud-init   ${secs(v.cloudinit_seconds)}`);
+  if (v.boot_total_seconds != null) {
+    const p = [];
+    if (v.boot_kernel_seconds != null)    p.push(`kernel ${v.boot_kernel_seconds}s`);
+    if (v.boot_initrd_seconds != null)    p.push(`initrd ${v.boot_initrd_seconds}s`);
+    if (v.boot_userspace_seconds != null) p.push(`userspace ${v.boot_userspace_seconds}s`);
+    L.push(`    guest boot ${secs(v.boot_total_seconds)}` + (p.length ? `  (${p.join(" + ")})` : ""));
+    if (v.cloudinit_seconds != null)
+      L.push(`    runner+register+detect ${secs(v.cloudinit_seconds - v.boot_total_seconds)}`);
+  }
+  // Slowest-piece drill-down from the blame sections (systemd + cloud-init).
+  if (v.boot_units && v.boot_units.length) {
+    L.push("  slowest units:");
+    v.boot_units.forEach(u => L.push(`    ${u[1]}s ${u[0]}`));
+  }
+  if (v.boot_cloudinit_stages && v.boot_cloudinit_stages.length) {
+    L.push("  slowest cloud-init stages:");
+    v.boot_cloudinit_stages.forEach(u => L.push(`    ${u[1]}s ${u[0]}`));
+  }
+  return L.join("\n");
+}
+
 function opsHtml(ops) {
   if (!ops || !ops.length) return "";
   // Newest first; show in-flight before recently-done.
@@ -39,7 +69,11 @@ function poolHtml(p) {
   } else {
     const rows = p.slots.slice()
       .sort((a,b) => (a.name+a.id).localeCompare(b.name+b.id))
-      .map(v => `
+      .map(v => {
+        const rec = v.recycle_seconds == null
+          ? `<td class="num">-</td>`
+          : `<td class="num"><span class="tip" title="${esc(recycleTip(v))}">${secs(v.recycle_seconds)}</span></td>`;
+        return `
         <tr>
           <td>${esc(v.id)}</td><td>${esc(v.name)}</td>
           <td class="s-${v.state}">${esc(v.state)}</td>
@@ -50,14 +84,14 @@ function poolHtml(p) {
                 : '<span class="dim">'+esc(v.runner_status)+'</span>') : "-"}</td>
           <td>${v.busy ? '<span class="s-busy">yes</span>' : "-"}</td>
           <td class="num">${v.cycle}</td>
-          <td class="num">${secs(v.cloudinit_seconds)}</td>
-          <td class="num">${secs(v.recycle_seconds)}</td>
+          ${rec}
           <td class="num">${pct(v.live_fraction)}</td>
-        </tr>`).join("");
+        </tr>`;
+      }).join("");
     body = `<div class="tablewrap"><table><thead><tr>
         <th>ID</th><th>NAME</th><th>STATE</th><th>NOVA</th><th>TASK</th>
         <th>RUNNER</th><th>RUNNER ST</th><th>BUSY</th>
-        <th class="num">CYCLE</th><th class="num">CLOUD_INIT</th>
+        <th class="num">CYCLE</th>
         <th class="num">RECYCLE</th><th class="num">LIVE%</th>
       </tr></thead><tbody>${rows}</tbody></table></div>`;
   }
