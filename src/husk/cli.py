@@ -409,14 +409,22 @@ def run(
             if not shared.http_addr:
                 typer.echo("controller.http_addr must be set", err=True)
                 raise typer.Exit(code=1)
-            # libvirt host → metrics-proxy map for the /sd/targets discovery route.
-            host_proxy = {
-                h.name: h.metrics_proxy
+            # libvirt guests are private to their hypervisor, so huskd bridges the
+            # last hop of a metrics scrape over the SSH channel it already holds to
+            # each host. (pool, host) → ssh_target; "" means the host is local.
+            ssh_targets = {
+                (cfg.backend.name, h.name): h.ssh_target
                 for cfg in cfgs
                 for h in cfg.backend.hosts
-                if h.metrics_proxy
             }
-            asyncio.run(_serve(facade, shared.http_addr, host_proxy=host_proxy))
+            asyncio.run(
+                _serve(
+                    facade,
+                    shared.http_addr,
+                    ssh_targets=ssh_targets,
+                    advertise_addr=shared.advertise_addr or shared.http_addr,
+                )
+            )
     finally:
         lock.release()
 
@@ -425,11 +433,13 @@ async def _serve(
     facade: MultiPoolController,
     http_addr: str,
     *,
-    host_proxy: dict[str, str] | None = None,
+    ssh_targets: dict[tuple[str, str], str] | None = None,
+    advertise_addr: str = "",
 ) -> None:
     """Run the reconcile loop on a background thread while Quart serves every
     endpoint on this event loop. SIGINT/SIGTERM trip the shutdown event, which
     stops hypercorn (via `shutdown_trigger`) and then the reconcile loop."""
+    from husk.guest_scrape import GuestScraper
     from husk.web import make_app, parse_addr, serve_app
 
     stop = asyncio.Event()
@@ -437,6 +447,7 @@ async def _serve(
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
 
+    scraper = GuestScraper(ssh_targets) if ssh_targets else None
     thread = threading.Thread(target=facade.run, name="husk-reconcile", daemon=True)
     thread.start()
     try:
@@ -444,7 +455,12 @@ async def _serve(
         display_host = "127.0.0.1" if host == "0.0.0.0" else host
         log.info("dashboard: http://%s:%d/", display_host, port)
         await serve_app(
-            make_app(facade.snapshots, shutdown=stop, host_proxy=host_proxy),
+            make_app(
+                facade.snapshots,
+                shutdown=stop,
+                scraper=scraper,
+                advertise_addr=advertise_addr,
+            ),
             host,
             port,
             shutdown_trigger=stop.wait,
@@ -452,6 +468,8 @@ async def _serve(
     finally:
         facade.stop()
         thread.join(timeout=5)
+        if scraper is not None:
+            scraper.close()  # drop the multiplexed SSH control sockets
 
 
 # ------------------------------------------------------------------- huskctl

@@ -170,22 +170,47 @@ def test_sd_targets_openstack_direct():
     ]
 
 
-def test_sd_targets_libvirt_via_proxy():
-    snap = _snap_of(
+class _FakeScraper:
+    """Stands in for the SSH-backed GuestScraper."""
+
+    def __init__(self, body=b"node_cpu_seconds_total 1\n", exc=None):
+        self.body, self.exc, self.calls = body, exc, []
+
+    async def fetch(self, backend, host, ip):
+        self.calls.append((backend, host, ip))
+        if self.exc:
+            raise self.exc
+        return self.body
+
+
+def _libvirt_snap(**kw):
+    return _snap_of(
         (
-            make_slot(name="husk-g-1", host="gpu-1"),  # no ip on libvirt
-            make_runner(status="online"),
+            make_slot(
+                name=kw.get("name", "husk-g-1"),
+                host=kw.get("host", "gpu-1"),
+                ip=kw.get("ip", "192.168.122.57"),
+            ),
+            make_runner(status=kw.get("status", "online")),
             SlotState.IDLE,
         ),
         backend="pool-gpu",
     )
-    app = make_app(lambda: [snap], host_proxy={"gpu-1": "gpu-1.internal:9101"})
-    groups = _sd_get(app)
-    assert groups == [
+
+
+def test_sd_targets_libvirt_points_back_at_huskd():
+    # The guest is private to its hypervisor, so Prometheus is sent back to huskd,
+    # which bridges the last hop over SSH.
+    app = make_app(
+        lambda: [_libvirt_snap()],
+        scraper=_FakeScraper(),
+        advertise_addr="huskd.internal:9100",
+    )
+    assert _sd_get(app) == [
         {
-            "targets": ["gpu-1.internal:9101"],
+            "targets": ["huskd.internal:9100"],
             "labels": {
-                "__metrics_path__": "/husk-g-1/metrics",
+                "__metrics_path__": "/slot/pool-gpu/husk-g-1/metrics",
                 "backend": "pool-gpu",
                 "slot": "husk-g-1",
             },
@@ -193,21 +218,64 @@ def test_sd_targets_libvirt_via_proxy():
     ]
 
 
-def test_sd_targets_skips_offline_and_unrouted():
+def test_sd_targets_libvirt_never_scraped_directly():
+    # A libvirt slot HAS an ip, but it is not routable from Prometheus. With no way
+    # to bridge it, it must be dropped — never emitted as a direct 192.168.x target.
+    app = make_app(lambda: [_libvirt_snap()])  # no scraper, no advertise_addr
+    assert _sd_get(app) == []
+
+
+def test_sd_targets_skips_offline_and_ipless():
     snap = _snap_of(
         (  # offline runner — not scrapeable yet
             make_slot(name="offline", ip="10.0.0.1"),
             make_runner(status="offline"),
             SlotState.STARTING,
         ),
-        (  # online but no ip and host has no configured proxy — no route
-            make_slot(name="noroute", host="gpu-x"),
+        (  # online but no DHCP lease yet — nothing to route to
+            make_slot(name="noip", host="gpu-1"),
             make_runner(status="online"),
             SlotState.IDLE,
         ),
     )
-    groups = _sd_get(make_app(lambda: [snap]))  # empty host_proxy
-    assert groups == []
+    app = make_app(lambda: [snap], scraper=_FakeScraper(), advertise_addr="h:9100")
+    assert _sd_get(app) == []
+
+
+def test_slot_metrics_bridges_to_the_guest():
+    sc = _FakeScraper(body=b"node_memory_MemFree_bytes 42\n")
+    app = make_app(lambda: [_libvirt_snap()], scraper=sc, advertise_addr="h:9100")
+    code, body = _client_get(app, "/slot/pool-gpu/husk-g-1/metrics")
+    assert code == 200
+    assert b"node_memory_MemFree_bytes 42" in body
+    # It routed to the right hypervisor + guest IP.
+    assert sc.calls == [("pool-gpu", "gpu-1", "192.168.122.57")]
+
+
+def test_slot_metrics_is_not_an_open_relay():
+    # The slot must be resolved from huskd's OWN snapshot, never trusted from the
+    # URL — so an unknown slot is a 404, not an attempt to reach something.
+    sc = _FakeScraper()
+    app = make_app(lambda: [_libvirt_snap()], scraper=sc, advertise_addr="h:9100")
+    assert _client_get(app, "/slot/pool-gpu/not-a-slot/metrics")[0] == 404
+    assert _client_get(app, "/slot/other-pool/husk-g-1/metrics")[0] == 404
+    assert sc.calls == []  # never even attempted a fetch
+
+
+def test_slot_metrics_reports_a_failed_scrape_as_5xx():
+    # Prometheus turns a 5xx into up==0, which is the honest signal for "this guest
+    # is unreachable" — better than serving stale or empty metrics as a 200.
+    from husk.guest_scrape import GuestScrapeError
+
+    sc = _FakeScraper(exc=GuestScrapeError("host unreachable"))
+    app = make_app(lambda: [_libvirt_snap()], scraper=sc, advertise_addr="h:9100")
+    assert _client_get(app, "/slot/pool-gpu/husk-g-1/metrics")[0] == 502
+
+
+def test_slot_metrics_503_when_lease_missing():
+    snap = _libvirt_snap(ip=None)
+    app = make_app(lambda: [snap], scraper=_FakeScraper(), advertise_addr="h:9100")
+    assert _client_get(app, "/slot/pool-gpu/husk-g-1/metrics")[0] == 503
 
 
 def test_metrics_concats_pools():

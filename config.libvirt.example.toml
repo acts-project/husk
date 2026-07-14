@@ -26,10 +26,11 @@ runner_group_id = 1
 # In-guest metrics (observability.md). Opens :9100 (node_exporter, baked into the
 # golden) to this source ONLY — it has no TLS/auth, so the allowlist IS the access
 # control. Requires prebaked; unset = fail-closed (no rule, no exporter running).
-# On libvirt the guest has no reachable IP: Prometheus scrapes the host's
-# metrics_proxy, which opens its own connection over the libvirt bridge. So the
-# bridge — not Prometheus — is the only client the guest ever sees. 192.168.122.1
-# is the default libvirt network's bridge.
+# On libvirt the guest sits on a private net only its hypervisor can reach, so
+# huskd bridges the scrape over the SSH channel it already has to the host. The
+# connection is issued FROM the host, so the libvirt bridge — not Prometheus — is
+# the only client the guest ever sees. 192.168.122.1 is the default net's bridge.
+# Nothing to install on the hypervisor.
 # scrape_cidr = "192.168.122.1/32"
 
 [pool.backend]
@@ -61,11 +62,8 @@ network = "default"
 memory_mb = 8192
 vcpus = 8
 gpu_pci_addresses = ["0000:01:00.0"]   # → one slot, GPU passed through via <hostdev>
-# This host's stateless metrics proxy: central Prometheus scrapes
-# <metrics_proxy>/<slot>/metrics and it forwards to the guest's :9100 on the private
-# net. huskd publishes exactly that target on /sd/targets. Unset = this host's
-# guests aren't published. Deploying the proxy is the per-host half (Phase O4).
-# metrics_proxy = "fedora-gpu-01.internal:9101"
+# NB: no metrics knob here. huskd reaches this host's guests over ssh_target, so
+# adding a hypervisor requires no per-host metrics setup.
 
 # --- A CPU-only host would look like this instead (no GPU required): ---
 # [[pool.backend.hosts]]

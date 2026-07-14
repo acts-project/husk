@@ -20,6 +20,11 @@ repo = "acts-project/husk-test"
 lock_path = "/tmp/huskd.lock"
 http_addr = "127.0.0.1:9100"           # dashboard + /status /metrics /healthz /events; "0.0.0.0:9100" to expose
 shrink_ticks = 3                       # sustained-surplus ticks before ramp-down
+# Where central Prometheus reaches THIS huskd. /sd/targets hands it out as the
+# address of the libvirt targets, whose guests are private and so are scraped back
+# through huskd. Defaults to http_addr; set it only if huskd is reached on a
+# different address than it binds (behind a NAT, k8s Service, or ingress).
+# advertise_addr = "huskd.cern.ch:9100"
 
 # ───────────────────────────── pool 1: OpenStack CPU ─────────────────────────
 # `name` is the pool identity: it becomes the backend name AND the default
@@ -77,11 +82,12 @@ labels = ["self-hosted", "linux", "x64", "gpu"]   # jobs route here via "gpu"
 runner_group_id = 1
 gpu = true                             # activate the NVIDIA driver (modprobe + CDI) each boot
 prebaked = true                        # husk-gpu golden: skip install (version must match the image)
-# In-guest metrics (observability.md). On libvirt the guest has no reachable IP:
-# Prometheus scrapes the host's metrics_proxy (below), which opens its own
-# connection over the libvirt bridge. So the bridge — NOT Prometheus — is the only
-# client the guest ever sees, and it is what :9100 is opened to. 192.168.122.1 is
-# the default libvirt network's bridge address.
+# In-guest metrics (observability.md). On libvirt the guest is on a private net
+# that only its hypervisor can reach, so huskd bridges the scrape: it SSHes to the
+# host (the channel it already holds) and curls the guest. The connection therefore
+# originates from the libvirt BRIDGE, not from Prometheus — so the bridge is what
+# :9100 is opened to. 192.168.122.1 is the default libvirt network's bridge.
+# Nothing to deploy on the host for this.
 scrape_cidr = "192.168.122.1/32"
 
 [pool.backend]
@@ -102,12 +108,8 @@ network = "default"
 memory_mb = 8192
 vcpus = 8
 gpu_pci_addresses = ["0000:01:00.0"]   # → one slot, GPU passed through via <hostdev>
-# This host's stateless metrics proxy: central Prometheus scrapes
-# <metrics_proxy>/<slot>/metrics and the proxy forwards to the guest's :9100 on the
-# private net. huskd publishes exactly that target on /sd/targets. Unset = this
-# host's guests are not published as metrics targets. (Deploying the proxy is the
-# per-host half — observability.md Phase O4.)
-# metrics_proxy = "fedora-gpu-01.internal:9101"
+# NB: nothing here for metrics. huskd reaches this host's guests over ssh_target
+# (above), so adding a hypervisor needs no per-host metrics setup at all.
 
 [pool.timeouts]
 poll_interval_sec = 30

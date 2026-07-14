@@ -171,8 +171,8 @@ def test_gc_keeps_marker_protected_golden():
 
 
 class _FakeDom:
-    def __init__(self, uuid: str, name: str) -> None:
-        self._uuid, self._name = uuid, name
+    def __init__(self, uuid: str, name: str, *, ip_raises: bool = False) -> None:
+        self._uuid, self._name, self._ip_raises = uuid, name, ip_raises
 
     def state(self):
         return (1, 0)  # VIR_DOMAIN_RUNNING → ACTIVE
@@ -182,6 +182,14 @@ class _FakeDom:
 
     def name(self):
         return self._name
+
+    def isActive(self):  # noqa: N802 (libvirt API)
+        return True
+
+    def interfaceAddresses(self, src, flags):  # noqa: N802 (libvirt API)
+        if self._ip_raises:
+            raise RuntimeError("libvirt hiccup")
+        return {}
 
 
 def test_list_slots_filters_by_pool():
@@ -193,6 +201,24 @@ def test_list_slots_filters_by_pool():
     ]
     slots = b.list_slots()
     assert [s.name for s in slots] == ["husk-lv-1"]  # only this pool's domain
+
+
+def test_guest_ip_failure_never_breaks_list_slots():
+    # The guest-IP lookup is a metrics nicety that runs inside list_slots. If it
+    # could raise, a libvirt hiccup would abort the reconcile tick — i.e. husk would
+    # stop managing runners because it couldn't collect metrics. It must degrade to
+    # "no ip" (slot simply isn't scraped), never take the tick down.
+    b = _backend()
+    b._list_raw = lambda: [
+        (
+            "h1",
+            _FakeDom("u1", "husk-lv-1", ip_raises=True),
+            {"pool": "lv", "unit": "cpu0"},
+        ),
+    ]
+    slots = b.list_slots()
+    assert [s.name for s in slots] == ["husk-lv-1"]  # tick survives
+    assert slots[0].ip is None  # just no metrics target this tick
 
 
 def test_push_rejects_truncated_transfer(tmp_path):

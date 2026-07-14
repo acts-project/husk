@@ -339,6 +339,38 @@ class LibvirtBackend:
                 out.append((host_name, dom, meta))
         return out
 
+    def _guest_ip(self, dom) -> str | None:
+        """The guest's IPv4 on the private libvirt net, read from the network's DHCP
+        leases. Lease source (not the guest agent): the golden image runs no
+        qemu-guest-agent, and the lease is authoritative for the NAT network anyway.
+
+        Only huskd resolves this — it already holds a connection to every host, which
+        is what lets each host's metrics proxy stay dumb (it forwards to an IP it is
+        handed, and never talks to libvirt). The mapping is stable across a recycle:
+        `rebuild_slot` wipes the disk but does NOT redefine the domain, so the MAC —
+        and therefore the lease — survives.
+
+        None when the domain is off or the lease hasn't appeared yet; the slot is
+        then simply not published as a metrics target.
+
+        NOTHING here may raise. This runs inside `list_slots`, so an exception would
+        surface as `ListSlotsError` and abort the whole reconcile tick — i.e. an
+        observability nicety could stop husk from managing runners. Metrics are
+        strictly best-effort: on any failure we return None and the slot just isn't
+        scraped this tick."""
+        try:
+            if not dom.isActive():
+                return None
+            src = libvirt.VIR_DOMAIN_INTERFACE_ADDRESSES_SRC_LEASE
+            ifaces = dom.interfaceAddresses(src, 0) or {}
+            for iface in ifaces.values():
+                for addr in (iface or {}).get("addrs") or []:
+                    if addr.get("type") == libvirt.VIR_IP_ADDR_TYPE_IPV4:
+                        return addr.get("addr")
+        except Exception as e:  # no lease yet, no DHCP on the net, libvirt hiccup...
+            log.debug("no guest ip for %s: %s", getattr(dom, "name", lambda: "?")(), e)
+        return None
+
     def _slot(self, host_name: str, dom, meta: dict) -> Slot:
         state, _reason = dom.state()
         status, task = lx.domain_status(state)
@@ -362,7 +394,11 @@ class LibvirtBackend:
             provisioned_at=meta.get("provisioned_at"),
             fault=None,
             image_stale=stale,
-            host=host_name,  # metrics route through this host's proxy (no guest IP)
+            # Metrics routing: the guest is only reachable from the host, so scrapes
+            # go through that host's proxy — but huskd resolves the guest IP here so
+            # the proxy needs no libvirt access of its own (see _guest_ip).
+            host=host_name,
+            ip=self._guest_ip(dom),
         )
 
     def _resolve(self, slot: Slot):

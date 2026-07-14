@@ -48,8 +48,9 @@ class RunnerConfig:
     prebaked: bool = False  # golden-image pools: skip the install steps (baked in)
     # Source allowed to scrape the slot's node_exporter on :9100 — the sole access
     # control for it (no TLS/auth). Per-pool because the client differs by backend:
-    # OpenStack = central Prometheus (which scrapes the guest directly); libvirt =
-    # the host's bridge, since the host proxy is the only client the guest sees.
+    # OpenStack = central Prometheus, which scrapes the guest directly; libvirt =
+    # the host's bridge, because the scrape is issued FROM the hypervisor (huskd
+    # SSHes in and curls the guest), so the bridge is the only client it ever sees.
     # Empty (default) = no ingress rule, exporter not started — fail-closed, so a
     # pool whose scraper source isn't known yet just leaves it unset.
     scrape_cidr: str = ""
@@ -82,10 +83,6 @@ class HostConfig:
     max_slots: int | None = None  # CPU host capacity; None → 1 (and GPU forbids it)
     image_name: str | None = None  # per-host override of the backend golden image
     image_ref: str | None = None  # per-host override of the backend OCI image ref
-    # "addr:port" of this host's stateless metrics proxy (observability). Central
-    # Prometheus scrapes guests via it (guests have no reachable IP). Empty → the
-    # host's guests aren't published as metrics targets.
-    metrics_proxy: str = ""
 
 
 @dataclass(frozen=True)
@@ -131,6 +128,11 @@ class ControllerConfig:
     # Always on (the only way huskctl reads state); must be set.
     http_addr: str = "127.0.0.1:9100"
     shrink_ticks: int = 3
+    # Where central Prometheus reaches THIS huskd. `/sd/targets` hands it out as the
+    # address of the proxied libvirt targets (their guests are private, so the scrape
+    # comes back through huskd). Empty → falls back to http_addr, which is right
+    # unless huskd sits behind a NAT/ingress and is reached on a different address.
+    advertise_addr: str = ""
 
 
 @dataclass(frozen=True)
@@ -197,7 +199,6 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         max_slots: int | None = None
         image_name: str | None = None
         image_ref: str | None = None
-        metrics_proxy: str = ""
 
     class _Backend(BaseModel):
         name: str = ""  # defaults to the pool name
@@ -233,6 +234,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         lock_path: str = "/tmp/huskd.lock"
         http_addr: str = "127.0.0.1:9100"
         shrink_ticks: int = 3
+        advertise_addr: str = ""
 
     class _Settings(BaseSettings):
         model_config = SettingsConfigDict(
@@ -307,6 +309,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         lock_path=s.controller.lock_path,
         http_addr=s.controller.http_addr,
         shrink_ticks=s.controller.shrink_ticks,
+        advertise_addr=s.controller.advertise_addr,
     )
 
     configs = [_pool_config(p, github, controller) for p in s.pool]
@@ -362,7 +365,6 @@ def _pool_config(p, github: GithubConfig, controller: ControllerConfig) -> Confi
                 max_slots=h.max_slots,
                 image_name=h.image_name,
                 image_ref=h.image_ref,
-                metrics_proxy=h.metrics_proxy,
             )
             for h in b.hosts
         ),

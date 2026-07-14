@@ -5,9 +5,12 @@ libvirt hosts) and the ephemeral, single-use runner slots. Companion to
 `plan.md` and `image-pipeline.md`; this document defines the metrics story those
 left open.
 
-> **Status (2026-07-14):** **O1, O2 and O3 are built.** What remains is **O4**
-> (the libvirt host proxy — a per-host deploy, not in-repo code) and the optional
-> **O5**.
+> **Status (2026-07-14):** **O1–O4 are built.** Only the optional **O5** remains.
+>
+> **O4 changed shape:** there is **no per-host proxy**. huskd bridges the last hop
+> to a libvirt guest over the SSH channel it already holds to the hypervisor, so
+> **nothing is deployed on any host** — see Phase O4 below for why, and what it
+> costs. Sections below that describe a "dumb host proxy" are superseded by that.
 >
 > - **O1 ✅** boot-timing exfil: huskd reads the `husk-bootreport` block off the
 >   serial console and exposes `husk_slot_boot_*`.
@@ -17,10 +20,14 @@ left open.
 >   image rebuild** (`just rebuild-all` + republish).
 > - **O3 ✅** discovery + join: `GET /sd/targets` (Prometheus `http_sd`, one feed,
 >   both backends) and the `husk_slot_info` join table on `/metrics`.
+> - **O4 ✅** libvirt guest bridge **inside huskd** (`GET /slot/<pool>/<slot>/metrics`
+>   → SSH → `guest:9100`). No per-host component.
 >
-> So **OpenStack is complete end-to-end** once the image is rebuilt and
-> `scrape_cidr` is set. **libvirt is complete except the host proxy (O4)**: huskd
-> already emits the proxy-routed target, but nothing answers on it yet.
+> **Both backends are code-complete.** What's left is operational, not code:
+> **rebuild + republish the golden image** (O2 only lands on a rebuild), and **set
+> `scrape_cidr`** per pool — known for libvirt (`192.168.122.1/32`, the bridge),
+> still unknown for OpenStack (see open questions: it depends on where central
+> Prometheus lives, and it's fail-closed until set).
 >
 > The pre-existing controller `/metrics` endpoint (`src/husk/web/app.py`,
 > `render_prometheus`) continues to expose the state-derived per-pool / per-slot
@@ -46,8 +53,11 @@ left open.
 
 ### Non-goals
 
-- huskd proxying/relaying node_exporter scrapes (explicitly rejected — see
-  "The two layers").
+- huskd proxying/relaying node_exporter scrapes. **Amended in O4:** still true for
+  OpenStack (routable guests, scraped directly), but **knowingly violated for
+  libvirt**, whose guests are unreachable except through their hypervisor. Paying a
+  per-host proxy + a new network path per host to preserve the principle was judged
+  not worth it at this fleet size. See "Why huskd bridges, and not a per-host proxy".
 - Scraping boot-timing off ephemeral VMs by pull (anti-pattern; it's a
   control-plane fact the controller already half-owns).
 - Managing the central Prometheus / long-term storage — that's existing infra;
@@ -70,10 +80,18 @@ Conflating them is the main design trap.
 | huskd's role | **produce the metric** | **produce discovery + a join table**, not the metric |
 
 The consequence: **the controller is a metrics *source* for layer 1 and a
-*discovery/label service* for layer 2 — never a metrics proxy for layer 2.**
-Relaying guest metrics through huskd would add a bottleneck, a failure mode, and
-lose node_exporter's native `up`/staleness semantics, all for zero benefit on a
-per-instant signal.
+*discovery/label service* for layer 2 — and, wherever it can be avoided, not a
+metrics proxy for layer 2.** Relaying guest metrics through huskd adds a
+bottleneck, a failure mode, and loses node_exporter's native `up`/staleness
+semantics.
+
+> **Amended in O4.** This holds for OpenStack, whose guests are routable and are
+> scraped directly. It does **not** hold for libvirt: those guests are reachable
+> only from their hypervisor, so *something* has to bridge, and the alternatives all
+> put a component + a new network path on every host. huskd bridges them over the
+> SSH channel it already has. We pay exactly the costs named above (a huskd outage
+> gaps libvirt metrics; `up` conflates guest-sick with huskd-sick) and judged them
+> cheaper than per-host infrastructure at this fleet size.
 
 Why direct scraping is fine for the ephemeral slots here: jobs are 10min+, so a
 slot lives long enough for dozens of 15s scrapes. (This is exactly why boot-timing
@@ -141,62 +159,63 @@ inside (or is routed into) the CERN network.
   discovery of *new* slots (http_sd keeps the last target list on a failed refresh)
   but never interrupts scraping of existing ones — huskd is not in the metrics path.
 
-### libvirt — in-guest node_exporter, reached through a dumb host proxy
+### libvirt — in-guest node_exporter, bridged by huskd over SSH
 
-Guests sit on a **private libvirt net**: only the host can reach `slot:9100`. So
-the host must bridge — but it should be a **dumb, stateless proxy, not a metrics
-system**. No agent, no local TSDB, no push credentials. The baked node_exporter
-(same image as OpenStack) is the primary source here too, because we need
-filesystem fill:
+Guests sit on a **private libvirt net**: only the hypervisor can reach
+`slot:9100`. Something must bridge that last hop. **huskd does it, in-process**,
+over the SSH channel it *already* holds to every host (the one
+`libvirt_backend._ssh` uses for qemu-img/genisoimage). The baked node_exporter
+(same image as OpenStack) is the source here too, because we need filesystem fill:
 
 ```
-[central Prometheus] ──scrape──▶ [path-routing proxy on host] ──forward──▶ slot:9100 (node_exporter)
-        │  target from huskd http_sd:  __address__=host:PORT, __metrics_path__=/<slot>/metrics
-        │  proxy is locked to guest-subnet:9100 only — no secrets, no state, no TSDB
+[central Prometheus] ──scrape──▶ [huskd] ──ssh──▶ hypervisor ──▶ slot:9100 (node_exporter)
+        │  target from huskd http_sd:  __address__=<advertise_addr>,
+        │                              __metrics_path__=/slot/<pool>/<slot>/metrics
+        │  NOTHING is deployed on the hypervisor
         └── join: node_* × husk_slot_info (from huskd /metrics)
 ```
 
 - **Primary source — in-guest node_exporter** (baked, same image). Full guest view:
   **filesystem fill**, load, CPU-mode split, fine memory, plus CPU/disk/net.
-- **Transport — a stateless path-routing reverse proxy on the host.** Central
-  scrapes `host:PORT/<slot>/metrics`; the proxy forwards to `slot:9100` on the
-  private net. It is **pull** (central → host), so the host holds **no
-  reach-central credential**; it is stateless (no TSDB); and it's locked to
-  forward only to the guest subnet on `:9100` (no open relay). Off-the-shelf
-  `tinyproxy` or ~40 lines of Python. This deliberately replaces the heavier
-  options (a `vmagent` remote_write agent needs a push secret on every host; a
-  per-host Prometheus + `/federate` adds a TSDB and is lossy for raw per-job
-  series) — see "Why a proxy, not an agent."
-- **Discovery — huskd `http_sd`, the same endpoint as OpenStack.** Because
-  `__address__` and `__metrics_path__` are per-target relabelable, one `http_sd`
-  feed serves both backends: OpenStack targets point at the guest directly;
-  libvirt targets point at `host:PORT/<slot>/metrics`. huskd owns the slot→host
-  mapping, so it emits the target already routed through the right host proxy.
-  (`proxy_url` + a CONNECT tunnel is the alternative but is per-scrape-job, forcing
-  one job per host — the path-routing proxy keeps it to a single feed.)
-- **`:9100` ingress rule on the guest** — scoped to the host proxy's source
-  (the libvirt-bridge address), rendered by huskd into the cloud-init ruleset.
+- **Transport — huskd, over its existing SSH channel.** Central scrapes
+  `huskd/slot/<pool>/<slot>/metrics`; huskd SSHes to the host and curls the guest.
+  Because the request is issued *from the hypervisor*, the guest sees the **libvirt
+  bridge** as the client — which is exactly what the `:9100` allowlist admits.
+- **Discovery — huskd `http_sd`, the same endpoint as OpenStack.** One feed serves
+  both backends via per-target routing: OpenStack targets point at the guest
+  directly; libvirt targets point back at huskd.
+- **`:9100` ingress rule on the guest** — scoped to the libvirt-bridge address
+  (`scrape_cidr`), rendered by huskd into the cloud-init ruleset.
 - **Optional secondary — `prometheus-libvirt-exporter` on the host** for a
-  hypervisor-view cross-check (per-domain CPU/disk/net when a guest's agent is
-  down). Not required.
+  hypervisor-view cross-check. Not required (O5).
 
-### Why a proxy, not an agent (remote_write / federation)
+### Why huskd bridges, and not a per-host proxy / agent
 
-The host has to bridge; the question was *what*. We rejected the two heavier
-options on their costs:
+The hypervisor has to be traversed; the question was *by what*. The original plan
+here was a stateless path-routing proxy on each host. **We rejected it — along with
+the heavier agent options — on operational cost:**
 
-| | **Path-routing proxy** (chosen) | vmagent `remote_write` | Prometheus + `/federate` |
-|---|---|---|---|
-| Host holds a reach-central secret | **no** (pull) | yes (push credential per host) | no (pull) |
-| Host footprint | stateless proxy | agent + disk buffer | full TSDB + query |
-| Raw per-job series | ✅ live passthrough | ✅ | ⚠️ aggregate-oriented, lossy at scrape edges |
-| huskd discovery | single `http_sd` (per-target routing) | per-host `file_sd` | per-host `file_sd` |
+| | **huskd SSH bridge** (chosen) | per-host proxy | vmagent `remote_write` | Prometheus + `/federate` |
+|---|---|---|---|---|
+| Deployed on each hypervisor | **nothing** | a proxy + unit | agent + disk buffer | full TSDB |
+| New network path to open, per host | **none** (reuses SSH) | yes: central → host:9101 | none (push) | yes |
+| Host holds a reach-central secret | no (pull) | no (pull) | **yes** | no |
+| huskd in the metrics data path | **yes** (libvirt only) | no | no | no |
+| `up` distinguishes guest-sick from infra-sick | **no** | yes | yes | yes |
 
-The decider was **no secret orchestration on the hosts** (write credentials on
-every hypervisor are admin overhead and a needless spread) plus **no TSDB
-footprint** for what is a simple pull. The proxy gives both: central pulls, the
-host holds nothing. Only if central *cannot* reach the hosts (pull impossible)
-would remote_write come back into play.
+The decider was that a per-host proxy needs a **new Prometheus → hypervisor network
+path opened on every host, forever**, plus a component to install and upgrade
+there — recurring network-admin and orchestration overhead. Prometheus **already**
+scrapes huskd, so that path is proven and free.
+
+**The honest cost:** this contradicts the "keep the controller out of the metrics
+hot path" principle above — for libvirt. We take it knowingly, because the fleet is
+small enough that the bottleneck argument is theoretical, and because the two real
+costs are bounded: a huskd outage gaps libvirt guest metrics, and `up` for those
+targets no longer separates "the guest is sick" from "huskd/SSH is sick".
+**OpenStack keeps the pure design** — routable guests, scraped directly, huskd
+nowhere near the data path. Revisit if the libvirt fleet grows enough that one
+process fanning out N SSH scrapes every 15s becomes a real bottleneck.
 
 ### Summary
 
@@ -204,11 +223,12 @@ would remote_write come back into play.
 |---|---|---|
 | Own the hypervisor? | no (tenant) | yes |
 | Primary per-VM source | **in-guest node_exporter** | **in-guest node_exporter** (same baked image) |
-| Guest reachability | CERN-routable IP, direct | host-only (private net) → dumb host proxy |
-| Scrape transport | central → `slot:9100` | central → `host:PORT/<slot>/metrics` → `slot:9100` |
+| Guest reachability | CERN-routable IP, direct | host-only (private net) → bridged by huskd over SSH |
+| Scrape transport | central → `slot:9100` | central → `huskd/slot/<pool>/<slot>/metrics` → ssh → `slot:9100` |
 | Discovery | huskd `http_sd` (single feed, per-target routing) | huskd `http_sd` (same feed) |
-| Host component | none | stateless path-routing proxy (no secret, no TSDB) |
-| Access control | nftables `:9100` allow (Prometheus source) | nftables `:9100` allow (host-proxy source) + proxy locked to subnet |
+| Host component | none | **none** (huskd reuses its existing SSH channel) |
+| huskd in the data path | no | yes (accepted trade — see above) |
+| Access control | nftables `:9100` allow (Prometheus source) | nftables `:9100` allow (libvirt-bridge source — the scrape is issued from the host) |
 
 -----
 
@@ -272,28 +292,25 @@ Static capability, per the image/cloud-init boundary (`image-pipeline.md`):
 7. **(GPU variant) the DCGM/nvidia metrics exporter** if we want GPU utilization —
    deferred; note it here so the boundary is explicit.
 
-### Per-node setup (once per libvirt host — possibly automated later)
+### Per-node setup (once per libvirt host)
 
-Static machine state that isn't a VM image. Today this is manual; automating it is
-tracked as **deferred Ansible host provisioning** (`plan.md` / memory) and this
-plan does **not** un-defer it — it just enumerates what belongs there:
+**Metrics need NO per-node setup.** This section originally carried a host metrics
+proxy; O4 removed the need for it (huskd bridges over its existing SSH channel), so
+what remains here is unrelated to metrics collection:
 
-9. **A dumb metrics proxy on each libvirt host** — a stateless path-routing reverse
-   proxy (`tinyproxy`, or ~40 lines of Python) that forwards
-   `host:PORT/<slot>/metrics` → `guest:9100` and is **locked to the guest subnet on
-   `:9100`** (no open relay). No secret, no state, no TSDB. Central pulls through
-   it. Optionally also run `prometheus-libvirt-exporter` for a hypervisor cross-check.
-10. **The serial-log file ownership/relabel fix** so libvirt/qemu can write the
-    per-domain console log that huskd's boot-timing exfil (item 2) reads — the exact
-    thing the `libvirt_backend.py:724` comment defers to host setup. (Independent of
-    the proxy; needed for boot-timing on libvirt regardless.)
-11. **Network path** so central Prometheus can reach the host proxy (pull), and L2
-    isolation between sibling slots on the shared libvirt bridge (see Security).
+9. **The serial-log file ownership/relabel fix** so libvirt/qemu can write the
+   per-domain console log that huskd's boot-timing exfil (item 2) reads — the thing
+   the `libvirt_backend.py` `console_log_path` comment defers to host setup. Needed
+   for boot-timing on libvirt regardless.
+10. **L2 isolation between sibling slots** on the shared libvirt bridge (see
+    Security) — per-slot isolated networks or bridge port isolation. This protects
+    slot↔slot and is the assumption the `:9100` allowlist rests on.
+11. **(Optional, O5)** `prometheus-libvirt-exporter` for a hypervisor-view
+    cross-check.
 
-> When the deferred host-provisioning work lands, items 9–11 become Ansible roles.
-> Until then they're a documented per-host checklist. **Nothing in 9–11 blocks the
-> OpenStack path**, which needs no per-node setup at all (direct scrape + baked
-> image + huskd discovery).
+> Automating these is tracked as **deferred Ansible host provisioning** (`plan.md` /
+> memory); this plan does not un-defer it. **Nothing here blocks either backend's
+> per-VM metrics** — that path is complete without any host setup.
 
 ### At-a-glance
 
@@ -302,10 +319,10 @@ plan does **not** un-defer it — it just enumerates what belongs there:
 | Boot-timing metrics | ✅ parse + expose | — | serial-log fix (libvirt only) |
 | `husk_slot_info` join | ✅ | — | — |
 | Discovery (`http_sd`, single feed) | ✅ | — | — |
-| `:9100` ingress rule | ✅ (cloud-init) | — | — |
+| `:9100` ingress rule | ✅ (cloud-init, `scrape_cidr`) | — | — |
 | node_exporter (no TLS/auth) | — | ✅ baked (primary per-VM source, both backends) | — |
-| Metrics proxy (libvirt) | emits proxy-routed target | — | ✅ stateless path-routing proxy (no secret/TSDB) |
-| Scrape transport | — | — | central → host proxy → guest (libvirt); direct pull (OpenStack) |
+| Guest bridge (libvirt) | ✅ `/slot/<pool>/<slot>/metrics` over its existing SSH channel | — | **nothing** |
+| Scrape transport | — | — | central → huskd → ssh → guest (libvirt); direct pull (OpenStack) |
 | Optional per-domain metrics | — | — | optional `prometheus-libvirt-exporter` |
 
 -----
@@ -390,10 +407,31 @@ Independent tracks; ship in any order.
   table. `Slot`/`SlotView` carry `ip` (OpenStack) and `host` (libvirt), plus a
   per-host `metrics_proxy` config knob. Pure huskd; OpenStack goes fully direct
   after this. Only runner-online slots are published (no scrape-`down` edge noise).
-- **Phase O4 — libvirt host proxy.** Deploy the stateless path-routing proxy on
-  each host (`tinyproxy` or ~40 lines of Python), locked to the guest subnet on
-  `:9100`. This completes the libvirt per-VM path — no agent, no secret, no TSDB.
-  Per-node-setup track; folds into the deferred Ansible host-provisioning work.
+- **Phase O4 ✅ — libvirt guest bridge, in huskd (NOT a per-host proxy).** Central
+  Prometheus scrapes `huskd/slot/<pool>/<slot>/metrics`; huskd fetches the guest's
+  node_exporter over the SSH channel it **already holds** to the hypervisor (the one
+  `libvirt_backend._ssh` uses for qemu-img). **Nothing is deployed on any
+  hypervisor** — adding a host stays a pure config change.
+  - **Why this and not the per-host proxy originally planned here:** the proxy
+    needed a *new* network path (Prometheus → hypervisor:9101) opened on every host,
+    forever. Prometheus already scrapes huskd, so that path is proven and free. The
+    network-admin + orchestration overhead of the per-host component was judged to
+    outweigh its architectural tidiness.
+  - **The trade, stated plainly:** this puts huskd in the metrics *data* path for
+    libvirt, which the "two layers" section above rejects as a general principle. We
+    accept it *for libvirt only*, because the fleet is small (the bottleneck argument
+    is theoretical at this size). **OpenStack is unaffected** — those guests are
+    routable and still scraped directly; huskd is never in their data path.
+  - **What it costs:** a huskd outage gaps libvirt guest metrics (whereas discovery
+    alone degrades gracefully), and `up` for those targets folds together "the guest
+    is sick" with "huskd/SSH is sick". Losing that distinction is the real price.
+  - **Implementation guards:** the scrape is an async subprocess, hard-bounded by a
+    timeout, so a wedged host degrades one scrape and never the control plane; the
+    SSH connection is multiplexed (`ControlMaster`/`ControlPersist`) so a 15s scrape
+    interval doesn't mean a TCP+auth handshake every 15s; and the slot is resolved
+    from huskd's own snapshot, never from the URL, so the route is not a general
+    relay. The guest-IP lookup inside `list_slots` cannot raise — a metrics nicety
+    must never abort a reconcile tick.
 - **Phase O5 (optional) — libvirt hypervisor cross-check.** Add
   `prometheus-libvirt-exporter` on the host for per-domain CPU/disk/net independent
   of the guest agent. Not required.
