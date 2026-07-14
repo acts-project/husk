@@ -34,6 +34,14 @@ labels = ["self-hosted", "linux", "x64", "husk-cpu"]   # jobs route here via the
 runner_group_id = 1
 # prebaked = true  # set ONLY when image_ref points at a husk golden: cloud-init then
 #                  # skips the runner/podman install and `version` must match the image.
+# In-guest metrics (observability.md). Opens :9100 (node_exporter, baked into the
+# golden) to this source ONLY — it has no TLS/auth, so this allowlist IS the access
+# control. Requires prebaked. Unset (default) = fail-closed: no rule, no exporter.
+# On OpenStack the scraper is central Prometheus, which hits the guest directly —
+# so this is Prometheus's own source range. If it runs in k8s, that is the WORKER
+# NODE subnet, not the pod CIDR: pods egressing out of the cluster are SNAT'd to
+# the node, so the guest never sees a pod IP. Confirm empirically before setting.
+# scrape_cidr = "137.138.0.0/16"
 
 [pool.backend]
 type = "openstack"
@@ -69,6 +77,12 @@ labels = ["self-hosted", "linux", "x64", "gpu"]   # jobs route here via "gpu"
 runner_group_id = 1
 gpu = true                             # activate the NVIDIA driver (modprobe + CDI) each boot
 prebaked = true                        # husk-gpu golden: skip install (version must match the image)
+# In-guest metrics (observability.md). On libvirt the guest has no reachable IP:
+# Prometheus scrapes the host's metrics_proxy (below), which opens its own
+# connection over the libvirt bridge. So the bridge — NOT Prometheus — is the only
+# client the guest ever sees, and it is what :9100 is opened to. 192.168.122.1 is
+# the default libvirt network's bridge address.
+scrape_cidr = "192.168.122.1/32"
 
 [pool.backend]
 type = "libvirt"
@@ -88,6 +102,12 @@ network = "default"
 memory_mb = 8192
 vcpus = 8
 gpu_pci_addresses = ["0000:01:00.0"]   # → one slot, GPU passed through via <hostdev>
+# This host's stateless metrics proxy: central Prometheus scrapes
+# <metrics_proxy>/<slot>/metrics and the proxy forwards to the guest's :9100 on the
+# private net. huskd publishes exactly that target on /sd/targets. Unset = this
+# host's guests are not published as metrics targets. (Deploying the proxy is the
+# per-host half — observability.md Phase O4.)
+# metrics_proxy = "fedora-gpu-01.internal:9101"
 
 [pool.timeouts]
 poll_interval_sec = 30

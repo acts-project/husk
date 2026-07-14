@@ -69,9 +69,11 @@ def test_prebaked_gpu_keeps_runtime_skips_install():
 
 def test_prebaked_false_is_unchanged_full_path():
     # The non-prebaked path is the validated template, GPU still installs+activates.
+    # No scrape_cidr → the metrics ingress placeholder resolves away to nothing.
     assert render_cloud_init("J", "U") == (
         RUNNER_CLOUD_INIT.replace("@@JIT@@", "J")
         .replace("@@RUNNER_URL@@", "U")
+        .replace("@@METRICS_INGRESS@@", "")
         .encode()
     )
     gpu = render_cloud_init("J", "U", gpu=True).decode()
