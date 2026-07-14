@@ -37,6 +37,8 @@ class SlotView:
     runner_status: str | None  # "online" | "offline" | None
     busy: bool  # runner currently running a job
     cycle: int  # recycle cycle (durable husk-cycle)
+    ip: str | None = None  # guest fixed IP (OpenStack) — metrics http_sd target
+    host: str | None = None  # libvirt host name — metrics routes via its proxy
     cloudinit_seconds: float | None = (
         None  # last ACTIVE→runner-online (cloud-init step)
     )
@@ -113,6 +115,8 @@ class ControllerState:
                     runner_status=runner.status if runner else None,
                     busy=runner.busy if runner else False,
                     cycle=slot.cycle,
+                    ip=slot.ip,
+                    host=slot.host,
                     cloudinit_seconds=(
                         round(t.last_cloudinit_seconds, 1)
                         if t is not None and t.last_cloudinit_seconds is not None

@@ -362,6 +362,7 @@ class LibvirtBackend:
             provisioned_at=meta.get("provisioned_at"),
             fault=None,
             image_stale=stale,
+            host=host_name,  # metrics route through this host's proxy (no guest IP)
         )
 
     def _resolve(self, slot: Slot):

@@ -67,6 +67,19 @@ def _ref_id(value) -> str:
     return str(value or "")
 
 
+def _fixed_ip(server) -> str | None:
+    """The guest's fixed IPv4, for metrics discovery (already on the detailed
+    server object — no extra API call). `addresses` is {net_name: [port, ...]}."""
+    addresses = getattr(server, "addresses", None) or {}
+    for ports in addresses.values():
+        for port in ports or []:
+            if not isinstance(port, dict):
+                continue
+            if port.get("version") == 4 and port.get("OS-EXT-IPS:type") == "fixed":
+                return port.get("addr")
+    return None
+
+
 class OpenStackBackend:
     def __init__(self, cfg: BackendConfig) -> None:
         self.cfg = cfg
@@ -142,6 +155,7 @@ class OpenStackBackend:
             provisioned_at=provisioned_at,
             fault=getattr(server, "fault", None),
             image_stale=stale,
+            ip=_fixed_ip(server),
         )
 
     # --------------------------------------------------------------- backend

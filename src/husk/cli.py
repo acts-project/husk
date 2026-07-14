@@ -409,12 +409,24 @@ def run(
             if not shared.http_addr:
                 typer.echo("controller.http_addr must be set", err=True)
                 raise typer.Exit(code=1)
-            asyncio.run(_serve(facade, shared.http_addr))
+            # libvirt host → metrics-proxy map for the /sd/targets discovery route.
+            host_proxy = {
+                h.name: h.metrics_proxy
+                for cfg in cfgs
+                for h in cfg.backend.hosts
+                if h.metrics_proxy
+            }
+            asyncio.run(_serve(facade, shared.http_addr, host_proxy=host_proxy))
     finally:
         lock.release()
 
 
-async def _serve(facade: MultiPoolController, http_addr: str) -> None:
+async def _serve(
+    facade: MultiPoolController,
+    http_addr: str,
+    *,
+    host_proxy: dict[str, str] | None = None,
+) -> None:
     """Run the reconcile loop on a background thread while Quart serves every
     endpoint on this event loop. SIGINT/SIGTERM trip the shutdown event, which
     stops hypercorn (via `shutdown_trigger`) and then the reconcile loop."""
@@ -432,7 +444,7 @@ async def _serve(facade: MultiPoolController, http_addr: str) -> None:
         display_host = "127.0.0.1" if host == "0.0.0.0" else host
         log.info("dashboard: http://%s:%d/", display_host, port)
         await serve_app(
-            make_app(facade.snapshots, shutdown=stop),
+            make_app(facade.snapshots, shutdown=stop, host_proxy=host_proxy),
             host,
             port,
             shutdown_trigger=stop.wait,

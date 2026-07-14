@@ -75,6 +75,10 @@ class HostConfig:
     max_slots: int | None = None  # CPU host capacity; None → 1 (and GPU forbids it)
     image_name: str | None = None  # per-host override of the backend golden image
     image_ref: str | None = None  # per-host override of the backend OCI image ref
+    # "addr:port" of this host's stateless metrics proxy (observability). Central
+    # Prometheus scrapes guests via it (guests have no reachable IP). Empty → the
+    # host's guests aren't published as metrics targets.
+    metrics_proxy: str = ""
 
 
 @dataclass(frozen=True)
@@ -185,6 +189,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         max_slots: int | None = None
         image_name: str | None = None
         image_ref: str | None = None
+        metrics_proxy: str = ""
 
     class _Backend(BaseModel):
         name: str = ""  # defaults to the pool name
@@ -340,6 +345,7 @@ def _pool_config(p, github: GithubConfig, controller: ControllerConfig) -> Confi
                 max_slots=h.max_slots,
                 image_name=h.image_name,
                 image_ref=h.image_ref,
+                metrics_proxy=h.metrics_proxy,
             )
             for h in b.hosts
         ),

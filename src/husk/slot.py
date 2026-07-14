@@ -46,6 +46,11 @@ class Slot:
     # drains such a slot onto the new image. Always False for backends with no
     # image-versioning concept (OpenStack/fake), so the drain rule is inert there.
     image_stale: bool = False
+    # Metrics-discovery hints (observability http_sd). OpenStack: the guest fixed
+    # IP (directly scrapeable). libvirt: no guest IP (never contacted) — carries the
+    # host name instead, and scraping routes through that host's metrics proxy.
+    ip: str | None = None
+    host: str | None = None
 
 
 @dataclass(frozen=True)

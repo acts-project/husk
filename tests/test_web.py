@@ -117,6 +117,99 @@ def test_metrics_endpoint():
     assert b'husk_slots_desired{backend="pool-a"}' in body
 
 
+def _snap_of(*classified, backend="pool-a"):
+    return ControllerState.from_classified(
+        generation=1,
+        backend=backend,
+        min_ready=1,
+        max_total=4,
+        desired_total=1,
+        classified=list(classified),
+    )
+
+
+def test_render_prometheus_slot_info():
+    snap = _snap_of(
+        (
+            make_slot(id="vm-1", name="husk-a-1", cycle=2, ip="10.1.2.3"),
+            make_runner(name="run-x", status="online"),
+            SlotState.IDLE,
+        )
+    )
+    text = render_prometheus(snap)
+    assert (
+        'husk_slot_info{backend="pool-a",slot="husk-a-1",ip="10.1.2.3",'
+        'host="",runner="run-x",cycle="2"} 1' in text
+    )
+
+
+def _sd_get(app):
+    code, body = _client_get(app, "/sd/targets")
+    assert code == 200
+    return json.loads(body)
+
+
+def test_sd_targets_openstack_direct():
+    snap = _snap_of(
+        (
+            make_slot(name="husk-a-1", ip="10.1.2.3"),
+            make_runner(status="online"),
+            SlotState.IDLE,
+        )
+    )
+    groups = _sd_get(make_app(lambda: [snap]))
+    assert groups == [
+        {
+            "targets": ["10.1.2.3:9100"],
+            "labels": {
+                "__metrics_path__": "/metrics",
+                "backend": "pool-a",
+                "slot": "husk-a-1",
+            },
+        }
+    ]
+
+
+def test_sd_targets_libvirt_via_proxy():
+    snap = _snap_of(
+        (
+            make_slot(name="husk-g-1", host="gpu-1"),  # no ip on libvirt
+            make_runner(status="online"),
+            SlotState.IDLE,
+        ),
+        backend="pool-gpu",
+    )
+    app = make_app(lambda: [snap], host_proxy={"gpu-1": "gpu-1.internal:9101"})
+    groups = _sd_get(app)
+    assert groups == [
+        {
+            "targets": ["gpu-1.internal:9101"],
+            "labels": {
+                "__metrics_path__": "/husk-g-1/metrics",
+                "backend": "pool-gpu",
+                "slot": "husk-g-1",
+            },
+        }
+    ]
+
+
+def test_sd_targets_skips_offline_and_unrouted():
+    snap = _snap_of(
+        (  # offline runner — not scrapeable yet
+            make_slot(name="offline", ip="10.0.0.1"),
+            make_runner(status="offline"),
+            SlotState.STARTING,
+        ),
+        (  # online but no ip and host has no configured proxy — no route
+            make_slot(name="noroute", host="gpu-x"),
+            make_runner(status="online"),
+            SlotState.IDLE,
+        ),
+    )
+    groups = _sd_get(make_app(lambda: [snap]))  # empty host_proxy
+    assert groups == []
+
+
 def test_metrics_concats_pools():
     snaps = [_snap("pool-a"), _snap("pool-b")]
     code, body = _client_get(make_app(lambda: snaps), "/metrics")
