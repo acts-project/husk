@@ -32,7 +32,7 @@ so branches never publish by accident). Pin the release tag with the `version`
 input:
 
 ```sh
-gh workflow run build-images.yml -f version=v3
+just publish v3        # → gh workflow run build-images.yml -f version=v3
 ```
 
 Each variant is pushed to `ghcr.io/<org>/husk-{base,gpu}`, tagged with both
@@ -50,15 +50,16 @@ or GPU — CDI generation for the GPU variant is deferred to first boot. Install
 `guestfs-tools` + `qemu-utils`, then:
 
 ```sh
-# CPU variant → husk-base.qcow2
-images/build.sh --variant base
+just rebuild            # CPU variant → husk-base.qcow2
+just rebuild gpu        # GPU variant → husk-gpu.qcow2
+just rebuild-all        # both
 
-# GPU variant → husk-gpu.qcow2
-images/build.sh --variant gpu
-
-# override the pinned runner version / base image / disk size if needed:
-images/build.sh --variant base --runner-version 2.334.0 --out /tmp/husk-base.qcow2
+# extra flags pass through to build.sh:
+just rebuild base --runner-version 2.334.0 --out /tmp/husk-base.qcow2
 ```
+
+(These wrap [`images/build.sh`](images/build.sh) directly — run it by hand if you
+don't have [`just`](https://github.com/casey/just).)
 
 Handy flags: `--out FILE`, `--runner-version V`, `--base-url URL`,
 `--disk-size SIZE` (defaults per variant come from `versions.env`). To publish a
