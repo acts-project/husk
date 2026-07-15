@@ -82,6 +82,28 @@ def _short_image(ref: str | None) -> str | None:
     return ref[:12]
 
 
+def _ref_tag(ref: str) -> str:
+    """The human tag from a configured image ref (`…/husk-gpu:v4` → `v4`). Empty for
+    a digest-pinned ref (`…@sha256:…`), a bare Glance name, or a tagless ref — the
+    `:` in a `registry:port` host is not mistaken for a tag."""
+    if not ref:
+        return ""
+    ref = ref.split("@", 1)[0]  # drop any @sha256:... digest pin
+    last = ref.rsplit("/", 1)[-1]  # only the final path segment can carry the tag
+    return last.rsplit(":", 1)[-1] if ":" in last else ""
+
+
+def _slot_image_label(active_image: str | None, stale: bool, tag: str) -> str | None:
+    """What to show in the dashboard IMAGE cell. A slot that is NOT stale is running
+    the pool's current target, so we can name its tag (`v4`) — the useful signal
+    during a rollout. A stale slot's tag isn't recorded anywhere (only its digest
+    is baked in), so it falls back to the short digest, flagged stale by the caller.
+    A tagless/manual pool just shows the short id."""
+    if not stale and tag:
+        return tag
+    return _short_image(active_image)
+
+
 @dataclass(frozen=True)
 class ControllerState:
     """Immutable snapshot the loop swaps in atomically each tick."""
@@ -93,6 +115,7 @@ class ControllerState:
     max_total: int
     desired_total: int
     counts: dict[str, int]  # SlotState.value -> count
+    image_ref: str = ""  # pool's configured target image ref (for the header + tags)
     slots: list[SlotView] = field(default_factory=list)
     ops: list[OpView] = field(default_factory=list)  # in-flight/recent staging ops
 
@@ -108,8 +131,10 @@ class ControllerState:
         classified: list[tuple],  # list of (Slot, Runner|None, SlotState)
         timing: dict | None = None,  # slot_id -> SlotTiming (optional)
         ops: list[OpView] | None = None,  # backend async ops (image staging)
+        image_ref: str = "",  # pool's configured target ref → per-slot tag labels
     ) -> "ControllerState":
         timing = timing or {}
+        tag = _ref_tag(image_ref)
         counts = {st.value: 0 for st in SlotState}
         views: list[SlotView] = []
         for slot, runner, state in classified:
@@ -129,7 +154,7 @@ class ControllerState:
                     cycle=slot.cycle,
                     ip=slot.ip,
                     host=slot.host,
-                    image=_short_image(slot.active_image),
+                    image=_slot_image_label(slot.active_image, slot.image_stale, tag),
                     image_stale=slot.image_stale,
                     cloudinit_seconds=(
                         round(t.last_cloudinit_seconds, 1)
@@ -173,6 +198,7 @@ class ControllerState:
             max_total=max_total,
             desired_total=desired_total,
             counts=counts,
+            image_ref=image_ref,
             slots=views,
             ops=list(ops or []),
         )
@@ -187,6 +213,7 @@ class ControllerState:
             "max_total": self.max_total,
             "desired_total": self.desired_total,
             "counts": dict(self.counts),
+            "image_ref": self.image_ref,
             "slots": [vars(v) for v in self.slots],
             "ops": [vars(o) for o in self.ops],
         }
@@ -201,6 +228,7 @@ class ControllerState:
             max_total=d["max_total"],
             desired_total=d["desired_total"],
             counts=dict(d["counts"]),
+            image_ref=d.get("image_ref", ""),
             slots=[SlotView(**sv) for sv in d["slots"]],
             ops=[OpView(**o) for o in d.get("ops", [])],
         )

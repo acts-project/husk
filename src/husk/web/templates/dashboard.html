@@ -105,7 +105,7 @@ function poolHtml(p) {
   }
   return `<section class="pool"><div class="head">
       <span class="name">${esc(p.backend)}</span>
-      <span class="meta">desired=${p.desired_total} min_ready=${p.min_ready} max_total=${p.max_total}</span>
+      <span class="meta">desired=${p.desired_total} min_ready=${p.min_ready} max_total=${p.max_total}${p.image_ref ? " · image " + esc(p.image_ref.split("/").pop()) : ""}</span>
       <span class="meta ${stale ? "stale" : ""}">updated ${ago(p.last_reconcile_epoch)}${stale ? " — stale?" : ""} · gen ${p.generation}</span>
       <span class="counts">${counts}</span>
     </div>${opsHtml(p.ops)}${body}</section>`;

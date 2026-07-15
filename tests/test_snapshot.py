@@ -44,11 +44,51 @@ def test_slotview_no_runner():
 
 
 def test_slotview_surfaces_active_image_shortened():
-    # A content digest is shown as a scannable 12-char id, sans sha256: prefix.
+    # With no configured ref (tag unknown), fall back to the 12-char digest.
     slot = make_slot(active_image="sha256:" + "c" * 64, image_stale=False)
     v = _snap([(slot, None, SlotState.IDLE)]).slots[0]
     assert v.image == "cccccccccccc"
     assert v.image_stale is False
+
+
+def _snap_ref(classified, image_ref):
+    return ControllerState.from_classified(
+        generation=1,
+        backend="libvirt-gpu",
+        min_ready=1,
+        max_total=2,
+        desired_total=1,
+        classified=classified,
+        image_ref=image_ref,
+    )
+
+
+def test_current_slot_shows_the_configured_tag():
+    # A non-stale slot is on the pool's target, so name its tag — the rollout signal.
+    slot = make_slot(active_image="sha256:" + "e" * 64, image_stale=False)
+    snap = _snap_ref([(slot, None, SlotState.IDLE)], "ghcr.io/acts/husk-gpu:v4")
+    assert snap.image_ref == "ghcr.io/acts/husk-gpu:v4"
+    assert snap.slots[0].image == "v4"
+
+
+def test_stale_slot_shows_digest_not_tag():
+    # A stale slot is NOT on the target tag, and its own tag isn't recorded — so it
+    # must not be mislabeled "v4"; show the digest, flagged stale.
+    slot = make_slot(active_image="sha256:" + "a" * 64, image_stale=True)
+    snap = _snap_ref([(slot, None, SlotState.IDLE)], "ghcr.io/acts/husk-gpu:v4")
+    assert snap.slots[0].image == "aaaaaaaaaaaa"
+    assert snap.slots[0].image_stale is True
+
+
+def test_ref_tag_parsing():
+    from husk.snapshot import _ref_tag
+
+    assert _ref_tag("ghcr.io/acts-project/husk-gpu:v4") == "v4"
+    assert _ref_tag("registry:5000/o/husk-base:v2") == "v2"  # not fooled by host:port
+    assert _ref_tag("ghcr.io/o/husk-gpu@sha256:" + "d" * 64) == ""  # digest-pinned
+    assert _ref_tag("ghcr.io/o/husk-gpu") == ""  # tagless
+    assert _ref_tag("husk-gpu-golden.qcow2") == ""  # manual/local name
+    assert _ref_tag("") == ""
 
 
 def test_slotview_flags_stale_image():

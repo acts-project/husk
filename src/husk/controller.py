@@ -371,6 +371,7 @@ class Controller:
             classified=classified,
             timing=self.timing,
             ops=self._backend_ops(),
+            image_ref=self.cfg.backend.image_ref,
         )
         log.debug(
             "tick %d done: %s",
@@ -402,6 +403,7 @@ class Controller:
             classified=classified,
             timing=self.timing,
             ops=self._backend_ops(),
+            image_ref=self.cfg.backend.image_ref,
         )
         return self.snapshot
 
