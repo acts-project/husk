@@ -37,11 +37,30 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 import tempfile
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+# A unix-domain socket path (ControlPath after %C expansion) must fit the kernel's
+# sun_path limit — 104 bytes on macOS, 108 on Linux. ssh appends a 40-char %C hash
+# to our dir, so the DIR must stay short. macOS's default $TMPDIR
+# (/var/folders/.../T/, ~50 chars) blows the budget on its own, so we anchor the
+# control sockets under a deliberately short base instead of tempfile's default.
+_SUN_PATH_MAX = 104  # the smaller of the two, so it's safe on both
+_CONTROL_HASH_LEN = 43  # %C is a 40-char hex hash; a few bytes of headroom
+
+
+def _short_tmp_base() -> str:
+    """Shortest writable temp dir for SSH control sockets. Prefer /tmp (5 chars)
+    over $TMPDIR, which on macOS is far too long for a sun_path (see above)."""
+    for base in ("/tmp", tempfile.gettempdir()):
+        if os.path.isdir(base) and os.access(base, os.W_OK):
+            return base
+    return tempfile.gettempdir()
+
 
 EXPORTER_PORT = (
     9100  # node_exporter in the guest (images/files/husk-node-exporter.service)
@@ -73,10 +92,24 @@ class GuestScraper:
     ) -> None:
         self._ssh_targets = ssh_targets
         self._timeout = timeout
-        # Multiplexed-connection sockets. Private dir: the control socket grants use
-        # of an authenticated SSH connection to a hypervisor, so it must not be
-        # world-accessible. Cleaned up in close().
-        self._control_dir = tempfile.mkdtemp(prefix="husk-scrape-")
+        # Multiplexed-connection sockets. Private dir (mkdtemp is 0700): the control
+        # socket grants use of an authenticated SSH connection to a hypervisor, so it
+        # must not be world-accessible. Anchored under a SHORT base so the socket
+        # path stays within the sun_path limit (see _short_tmp_base). Cleaned up in
+        # close().
+        self._control_dir = tempfile.mkdtemp(prefix="hsk-", dir=_short_tmp_base())
+        # Guard: if even the short path can't fit ssh's %C socket name, multiplexing
+        # is impossible on this box. Degrade to a fresh connection per scrape rather
+        # than fail every scrape — correctness over the handshake saving.
+        self._multiplex = (
+            len(self._control_dir) + 1 + _CONTROL_HASH_LEN <= _SUN_PATH_MAX
+        )
+        if not self._multiplex:
+            log.warning(
+                "ssh control path %r too long for socket multiplexing; scraping "
+                "without connection reuse",
+                self._control_dir,
+            )
 
     def knows(self, backend: str, host: str) -> bool:
         return (backend, host) in self._ssh_targets
@@ -100,16 +133,18 @@ class GuestScraper:
                 "BatchMode=yes",
                 "-o",
                 f"ConnectTimeout={_CONNECT_TIMEOUT_S}",
-                # Reuse one authenticated connection per host across scrapes.
-                "-o",
-                "ControlMaster=auto",
-                "-o",
-                f"ControlPath={self._control_dir}/%C",
-                "-o",
-                f"ControlPersist={_PERSIST}",
-                target,
-                remote,
             ]
+            if self._multiplex:
+                # Reuse one authenticated connection per host across scrapes.
+                argv += [
+                    "-o",
+                    "ControlMaster=auto",
+                    "-o",
+                    f"ControlPath={self._control_dir}/%C",
+                    "-o",
+                    f"ControlPersist={_PERSIST}",
+                ]
+            argv += [target, remote]
         else:
             argv = ["bash", "-c", remote]  # local hypervisor
 

@@ -90,3 +90,31 @@ def test_close_removes_the_control_socket_dir():
     assert d.is_dir()
     sc.close()
     assert not d.exists()
+
+
+def test_control_socket_path_fits_sun_path_limit():
+    # Regression: on macOS $TMPDIR (/var/folders/.../T/) is long enough that
+    # <controldir>/%C overran the ~104-byte unix-socket limit and every scrape
+    # failed with "ControlPath too long". The control dir must leave room for
+    # ssh's 40-char %C hash under that limit — and multiplexing must be ON when it
+    # fits (i.e. we didn't "fix" it by silently dropping connection reuse).
+    from husk.guest_scrape import _CONTROL_HASH_LEN, _SUN_PATH_MAX
+
+    sc = GuestScraper({("p", "h"): "user@host"})
+    try:
+        socket_len = len(str(sc.control_dir)) + 1 + _CONTROL_HASH_LEN
+        assert socket_len <= _SUN_PATH_MAX, f"{socket_len} bytes: {sc.control_dir}"
+        assert sc._multiplex  # short path → multiplexing stays enabled
+    finally:
+        sc.close()
+
+
+def test_degrades_gracefully_if_multiplex_impossible(monkeypatch):
+    # If the control path somehow can't fit (a pathologically long temp base), we
+    # scrape WITHOUT connection reuse rather than fail every scrape.
+    monkeypatch.setattr("husk.guest_scrape._SUN_PATH_MAX", 1)
+    sc = GuestScraper({("p", "h"): "user@host"})
+    try:
+        assert sc._multiplex is False
+    finally:
+        sc.close()
