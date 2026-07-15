@@ -232,6 +232,70 @@ process fanning out N SSH scrapes every 15s becomes a real bottleneck.
 
 -----
 
+## Configuring Prometheus (the consumer side)
+
+Everything above defines huskd's *contract*; this is how central Prometheus
+consumes it. **Two scrape jobs, matching the two layers** — deliberately not one.
+
+```yaml
+scrape_configs:
+  # ── Layer 1: the controller ────────────────────────────────────────────────
+  # huskd's own state-derived gauges: husk_slots*, husk_slot_boot_*, and the
+  # husk_slot_info join table. ONE static target that never changes.
+  - job_name: huskd
+    static_configs:
+      - targets: ["huskd.internal:9100"]      # → GET /metrics
+
+  # ── Layer 2: the runner slots ──────────────────────────────────────────────
+  # Per-slot in-guest node_exporter, discovered live. ONE feed, BOTH backends:
+  # per-target routing means OpenStack targets resolve to <guest-ip>:9100 (direct)
+  # and libvirt targets resolve back to huskd, which bridges the scrape over SSH.
+  - job_name: husk-slots
+    http_sd_configs:
+      - url: http://huskd.internal:9100/sd/targets
+        refresh_interval: 30s
+    # __address__ and __metrics_path__ arrive already set by huskd; the `backend`
+    # and `slot` labels come through as-is and are the join key below.
+```
+
+**Why two jobs, not one** (i.e. why huskd does *not* advertise itself through
+`/sd/targets`): Prometheus must already know huskd's URL to call `/sd/targets` at
+all, so self-advertising is circular — it can only restate what the `http_sd_config`
+already hardcodes. And the two layers *want* to differ: the controller job is
+pool-scoped (no `slot` label) and fine at a slow interval; the slots job is
+per-slot and wants a tight one. Folding them into one feed just forces relabeling
+to pull back apart a distinction you erased for nothing. The same `huskd.internal`
+address legitimately appears in both — that redundancy is the whole reason
+self-advertising buys nothing.
+
+### The join: making a `node_*` spike legible as pool / job
+
+`node_*` series are keyed only by the target's minimal identity (`backend`,
+`slot`) — cardinality is kept low on purpose (see Division of labor #4). The rich
+attribution (`ip`, `host`, `runner`, `cycle`, and later `job_id`) lives on the
+`husk_slot_info` gauge from layer 1. Join them at query time on `(backend, slot)`:
+
+```promql
+# "show me each running slot's root-fs fill, labelled by pool + runner"
+node_filesystem_avail_bytes{mountpoint="/"}
+  * on(backend, slot) group_left(host, runner, cycle)
+    husk_slot_info
+```
+
+`group_left(...)` copies the named `husk_slot_info` labels onto every matching
+`node_*` series; `on(backend, slot)` is the shared key. Any `node_*` metric joins
+the same way — this is the whole point of emitting `husk_slot_info` rather than
+stamping pool/job onto every guest series (which would inflate cardinality and
+churn it on every recycle).
+
+> **`up` semantics differ by backend, and it matters when alerting.** An OpenStack
+> target's `up == 0` means the guest is unreachable. A libvirt target's `up == 0`
+> means the guest *or* huskd *or* the SSH hop is unreachable (huskd is in that data
+> path — see "Why huskd bridges"). Don't page on a raw libvirt `up == 0` as though
+> it were guest-specific; correlate with the `huskd` job being up first.
+
+-----
+
 ## Division of labor: huskd-orchestrated vs. per-node setup
 
 This is the crux question. The line: **anything that is per-cycle, dynamic, or a
