@@ -1,14 +1,95 @@
-"""`huskctl recycle` target selection + stop semantics (the _recycle helper)."""
+"""`huskctl recycle` target selection + stop semantics (the _recycle helper),
+plus the CLI's pool fan-out (--all across every pool)."""
 
 from __future__ import annotations
 
+from typer.testing import CliRunner
+
 from conftest import make_runner, make_slot
-from husk.cli import _recycle
+from husk.cli import _recycle, huskctl_app
 from husk.fake_backend import FakeBackend, FakeGitHub
 
 
 def _names(slots):
     return sorted(s.name for s in slots)
+
+
+_cli = CliRunner()
+
+_TWO_POOLS = """
+[github]
+repo = "acts-project/husk-test"
+[[pool]]
+name = "openstack-cpu"
+[pool.runner]
+version = "2.334.0"
+labels = ["self-hosted", "cpu"]
+[pool.backend]
+type = "openstack"
+[[pool]]
+name = "libvirt-gpu"
+[pool.runner]
+version = "2.334.0"
+labels = ["self-hosted", "gpu"]
+[pool.backend]
+type = "libvirt"
+"""
+
+
+def _two_pool_cli(tmp_path, monkeypatch):
+    """Write a 2-pool config and stub _build so each pool gets its own fake
+    backend (one ACTIVE slot each). Returns (config_path, {pool: backend})."""
+    monkeypatch.setenv("GH_TOKEN", "ghp_x")
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(_TWO_POOLS)
+    backends = {
+        "openstack-cpu": FakeBackend(
+            slots=[make_slot(id="o-1", name="husk-openstack-cpu-1", status="ACTIVE")]
+        ),
+        "libvirt-gpu": FakeBackend(
+            slots=[make_slot(id="l-1", name="husk-libvirt-gpu-1", status="ACTIVE")]
+        ),
+    }
+    monkeypatch.setattr(
+        "husk.cli._build", lambda c: (backends[c.backend.name], FakeGitHub())
+    )
+    return str(cfg), backends
+
+
+def test_all_with_no_pool_recycles_every_pool(tmp_path, monkeypatch):
+    cfg, backends = _two_pool_cli(tmp_path, monkeypatch)
+    result = _cli.invoke(huskctl_app, ["recycle", "--all", "-c", cfg])
+    assert result.exit_code == 0, result.output
+    # every pool's slot was stopped → SHUTOFF (the NEEDS_RECYCLE trigger)
+    assert backends["openstack-cpu"].ops() == ["stop"]
+    assert backends["libvirt-gpu"].ops() == ["stop"]
+    assert "stopped 2 slot(s)" in result.output
+
+
+def test_all_with_pool_scopes_to_one(tmp_path, monkeypatch):
+    cfg, backends = _two_pool_cli(tmp_path, monkeypatch)
+    result = _cli.invoke(
+        huskctl_app, ["recycle", "--all", "-c", cfg, "--pool", "libvirt-gpu"]
+    )
+    assert result.exit_code == 0, result.output
+    assert backends["libvirt-gpu"].ops() == ["stop"]
+    assert backends["openstack-cpu"].ops() == []  # untouched
+
+
+def test_one_pool_failure_does_not_abort_the_others(tmp_path, monkeypatch):
+    cfg, backends = _two_pool_cli(tmp_path, monkeypatch)
+    backends["openstack-cpu"].raise_on_list = True  # wedged pool
+    result = _cli.invoke(huskctl_app, ["recycle", "--all", "-c", cfg])
+    assert result.exit_code == 1  # surfaced as failure...
+    assert "recycle failed for openstack-cpu" in result.output
+    assert backends["libvirt-gpu"].ops() == ["stop"]  # ...but the healthy pool ran
+
+
+def test_named_slot_still_needs_pool_when_multipool(tmp_path, monkeypatch):
+    cfg, _ = _two_pool_cli(tmp_path, monkeypatch)
+    result = _cli.invoke(huskctl_app, ["recycle", "husk-openstack-cpu-1", "-c", cfg])
+    assert result.exit_code == 2
+    assert "pass --pool" in result.output
 
 
 def test_all_stops_idle_active_slots():

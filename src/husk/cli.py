@@ -638,7 +638,10 @@ def recycle(
     ] = False,
     pool: Annotated[
         Optional[str],
-        typer.Option("--pool", help="Which pool to recycle in (required if >1 pool)"),
+        typer.Option(
+            "--pool",
+            help="Which pool to recycle in. With --all, omit to recycle EVERY pool",
+        ),
     ] = None,
 ) -> None:
     """Stop slots so huskd rebuilds them on its next tick.
@@ -647,7 +650,11 @@ def recycle(
     NEEDS_RECYCLE and rebuilds with freshly rendered cloud-init — the way to roll
     out a new image or firewall onto already-running slots. huskd must be running
     for the rebuild to follow; this command only issues the stop. Busy and
-    non-ACTIVE slots are skipped unless --force."""
+    non-ACTIVE slots are skipped unless --force.
+
+    `--all` with no `--pool` recycles every pool (the whole-fleet roll). A named
+    slot still needs `--pool` when more than one pool is configured, since the name
+    alone is ambiguous."""
     _setup_logging(log_level)
     if all_slots and names:
         typer.echo("--all takes no slot arguments", err=True)
@@ -657,37 +664,50 @@ def recycle(
         raise typer.Exit(code=2)
 
     cfgs = _load_all(config, secrets_dir)
-    cfg = _select_pool(cfgs, pool)
-    backend, github = _build(cfg)
-    try:
-        acted, skipped, unknown = _recycle(
-            backend,
-            github,
-            names=names or [],
-            all_slots=all_slots,
-            force=force,
-            dry_run=dry_run,
-        )
-    except Exception as e:
-        typer.echo(f"recycle failed: {e}", err=True)
-        raise typer.Exit(code=1)
+    # --all + no --pool → fan out over every pool. A named slot keeps requiring an
+    # unambiguous pool (via _select_pool) when more than one is configured.
+    pools = cfgs if (all_slots and pool is None) else [_select_pool(cfgs, pool)]
+    multi = len(pools) > 1
 
-    verb = "would recycle" if dry_run else "recycling"
-    for s in acted:
-        typer.echo(f"{verb}: {s.name} ({s.id}) cycle={s.cycle}")
-    for s, why in skipped:
-        typer.echo(f"skipped {s.name} ({s.id}): {why}", err=True)
-    for tok in unknown:
-        typer.echo(f"not found (managed-by=husk): {tok}", err=True)
+    total_acted, any_unknown, any_err = 0, False, False
+    for cfg in pools:
+        backend, github = _build(cfg)
+        if multi:
+            typer.echo(f"── {cfg.backend.name} ──")
+        try:
+            acted, skipped, unknown = _recycle(
+                backend,
+                github,
+                names=names or [],
+                all_slots=all_slots,
+                force=force,
+                dry_run=dry_run,
+            )
+        except Exception as e:
+            # One pool failing (e.g. a wedged libvirt host) must not abort the
+            # rest of a fleet-wide recycle; report and keep going.
+            typer.echo(f"recycle failed for {cfg.backend.name}: {e}", err=True)
+            any_err = True
+            continue
 
-    if not acted and not skipped and not unknown:
-        typer.echo("no matching slots")
-    elif acted and not dry_run:
+        verb = "would recycle" if dry_run else "recycling"
+        for s in acted:
+            typer.echo(f"{verb}: {s.name} ({s.id}) cycle={s.cycle}")
+        for s, why in skipped:
+            typer.echo(f"skipped {s.name} ({s.id}): {why}", err=True)
+        for tok in unknown:
+            typer.echo(f"not found (managed-by=husk): {tok}", err=True)
+        if not acted and not skipped and not unknown:
+            typer.echo("no matching slots")
+        total_acted += len(acted)
+        any_unknown = any_unknown or bool(unknown)
+
+    if total_acted and not dry_run:
         typer.echo(
-            f"\nstopped {len(acted)} slot(s) → SHUTOFF; huskd will rebuild them "
+            f"\nstopped {total_acted} slot(s) → SHUTOFF; huskd will rebuild them "
             "with fresh cloud-init on the next tick (watch: huskctl status -w)."
         )
-    if unknown:
+    if any_unknown or any_err:
         raise typer.Exit(code=1)
 
 
