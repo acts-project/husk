@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from conftest import make_runner, make_slot
 from husk.cli import _print_status, _table
 from husk.slot import SlotState
@@ -39,6 +41,33 @@ def test_slotview_no_runner():
 
     v = snap.slots[0]
     assert v.runner is None and v.runner_status is None and v.busy is False
+
+
+def test_slotview_surfaces_active_image_shortened():
+    # A content digest is shown as a scannable 12-char id, sans sha256: prefix.
+    slot = make_slot(active_image="sha256:" + "c" * 64, image_stale=False)
+    v = _snap([(slot, None, SlotState.IDLE)]).slots[0]
+    assert v.image == "cccccccccccc"
+    assert v.image_stale is False
+
+
+def test_slotview_flags_stale_image():
+    slot = make_slot(active_image="sha256:" + "d" * 64, image_stale=True)
+    v = _snap([(slot, None, SlotState.IDLE)]).slots[0]
+    assert v.image == "dddddddddddd" and v.image_stale is True
+
+
+def test_slotview_image_none_when_backend_cant_report():
+    v = _snap([(make_slot(), None, SlotState.IDLE)]).slots[0]
+    assert v.image is None  # active_image unset → no image shown, not a crash
+
+
+def test_image_fields_round_trip():
+    slot = make_slot(active_image="sha256:" + "a" * 64, image_stale=True)
+    snap = _snap([(slot, None, SlotState.IDLE)])
+    back = ControllerState.from_dict(json.loads(json.dumps(snap.to_dict())))
+    assert back.slots[0].image == "aaaaaaaaaaaa"
+    assert back.slots[0].image_stale is True
 
 
 def test_to_dict_includes_detail():

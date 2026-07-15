@@ -46,6 +46,12 @@ class Slot:
     # drains such a slot onto the new image. Always False for backends with no
     # image-versioning concept (OpenStack/fake), so the drain rule is inert there.
     image_stale: bool = False
+    # Identity of the image this slot is ACTUALLY running — distinct from image_id,
+    # which for libvirt is the host's *current* golden (not what a stale slot booted
+    # from). libvirt: the baked content digest (husk-image-digest metadata);
+    # OpenStack: the booted Glance image id. Surfaced on the dashboard so a rollout
+    # is visible per slot. None when the backend can't report it.
+    active_image: str | None = None
     # Metrics-discovery hints (observability http_sd). OpenStack: the guest fixed
     # IP (directly scrapeable). libvirt: no guest IP (never contacted) — carries the
     # host name instead, and scraping routes through that host's metrics proxy.

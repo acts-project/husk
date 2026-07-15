@@ -155,6 +155,7 @@ class OpenStackBackend:
             provisioned_at=provisioned_at,
             fault=getattr(server, "fault", None),
             image_stale=stale,
+            active_image=image_id,  # the Glance image this server booted from
             ip=_fixed_ip(server),
         )
 

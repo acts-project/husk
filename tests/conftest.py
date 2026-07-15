@@ -83,6 +83,7 @@ def make_slot(
     image_stale: bool = False,
     ip: str | None = None,
     host: str | None = None,
+    active_image: str | None = None,
 ) -> Slot:
     return Slot(
         id=id,
@@ -97,6 +98,7 @@ def make_slot(
         image_stale=image_stale,
         ip=ip,
         host=host,
+        active_image=active_image,
     )
 
 

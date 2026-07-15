@@ -394,6 +394,7 @@ class LibvirtBackend:
             provisioned_at=meta.get("provisioned_at"),
             fault=None,
             image_stale=stale,
+            active_image=slot_digest,  # what THIS slot booted from (may lag host.image)
             # Metrics routing: the guest is only reachable from the host, so scrapes
             # go through that host's proxy — but huskd resolves the guest IP here so
             # the proxy needs no libvirt access of its own (see _guest_ip).

@@ -73,6 +73,12 @@ function poolHtml(p) {
         const rec = v.recycle_seconds == null
           ? `<td class="num">-</td>`
           : `<td class="num"><span class="tip" title="${esc(recycleTip(v))}">${secs(v.recycle_seconds)}</span></td>`;
+        const imgTitle = v.image_stale
+          ? "stale — older than the pool current golden; will drain onto it"
+          : "current image";
+        const img = !v.image
+          ? `<td>-</td>`
+          : `<td><span class="${v.image_stale ? "stale" : "dim"}" title="${imgTitle}">${esc(v.image)}${v.image_stale ? " ⚠" : ""}</span></td>`;
         return `
         <tr>
           <td>${esc(v.id)}</td><td>${esc(v.name)}</td>
@@ -84,6 +90,7 @@ function poolHtml(p) {
                 : '<span class="dim">'+esc(v.runner_status)+'</span>') : "-"}</td>
           <td>${v.busy ? '<span class="s-busy">yes</span>' : "-"}</td>
           <td class="num">${v.cycle}</td>
+          ${img}
           ${rec}
           <td class="num">${pct(v.live_fraction)}</td>
         </tr>`;
@@ -92,6 +99,7 @@ function poolHtml(p) {
         <th>ID</th><th>NAME</th><th>STATE</th><th>NOVA</th><th>TASK</th>
         <th>RUNNER</th><th>RUNNER ST</th><th>BUSY</th>
         <th class="num">CYCLE</th>
+        <th>IMAGE</th>
         <th class="num">RECYCLE</th><th class="num">LIVE%</th>
       </tr></thead><tbody>${rows}</tbody></table></div>`;
   }

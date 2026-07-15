@@ -39,6 +39,8 @@ class SlotView:
     cycle: int  # recycle cycle (durable husk-cycle)
     ip: str | None = None  # guest fixed IP (OpenStack) — metrics http_sd target
     host: str | None = None  # libvirt host name — metrics routes via its proxy
+    image: str | None = None  # short id of the slot's ACTIVE image (digest / glance id)
+    image_stale: bool = False  # active image differs from the pool's current target
     cloudinit_seconds: float | None = (
         None  # last ACTIVE→runner-online (cloud-init step)
     )
@@ -68,6 +70,16 @@ class SlotView:
 
 def _as_pairs(pairs) -> tuple[tuple[str, float], ...]:
     return tuple((name, sec) for name, sec in pairs)
+
+
+def _short_image(ref: str | None) -> str | None:
+    """A compact, human-scannable id for the dashboard: the leading 12 chars of a
+    content digest (sans the `sha256:` prefix) or a Glance uuid. None stays None."""
+    if not ref:
+        return None
+    if ref.startswith("sha256:"):
+        ref = ref[len("sha256:") :]
+    return ref[:12]
 
 
 @dataclass(frozen=True)
@@ -117,6 +129,8 @@ class ControllerState:
                     cycle=slot.cycle,
                     ip=slot.ip,
                     host=slot.host,
+                    image=_short_image(slot.active_image),
+                    image_stale=slot.image_stale,
                     cloudinit_seconds=(
                         round(t.last_cloudinit_seconds, 1)
                         if t is not None and t.last_cloudinit_seconds is not None
