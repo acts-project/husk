@@ -67,6 +67,19 @@ def _ref_id(value) -> str:
     return str(value or "")
 
 
+def _fixed_ip(server) -> str | None:
+    """The guest's fixed IPv4, for metrics discovery (already on the detailed
+    server object — no extra API call). `addresses` is {net_name: [port, ...]}."""
+    addresses = getattr(server, "addresses", None) or {}
+    for ports in addresses.values():
+        for port in ports or []:
+            if not isinstance(port, dict):
+                continue
+            if port.get("version") == 4 and port.get("OS-EXT-IPS:type") == "fixed":
+                return port.get("addr")
+    return None
+
+
 class OpenStackBackend:
     def __init__(self, cfg: BackendConfig) -> None:
         self.cfg = cfg
@@ -142,6 +155,7 @@ class OpenStackBackend:
             provisioned_at=provisioned_at,
             fault=getattr(server, "fault", None),
             image_stale=stale,
+            ip=_fixed_ip(server),
         )
 
     # --------------------------------------------------------------- backend
@@ -370,6 +384,17 @@ class OpenStackBackend:
     def destroy_slot(self, slot: Slot, *, reason: str) -> None:
         log.info("destroying slot %s (reason=%s)", slot.id, reason)
         self.conn.compute.delete_server(slot.id, ignore_missing=True)
+
+    def console_output(self, slot: Slot, *, lines: int | None = None) -> str | None:
+        try:
+            out = self.conn.compute.get_server_console_output(slot.id, length=lines)
+        except Exception:
+            log.warning("console output for %s unavailable", slot.id, exc_info=True)
+            return None
+        text = (
+            out.get("output") if isinstance(out, dict) else getattr(out, "output", None)
+        )
+        return text or None
 
     def capacity(self) -> Capacity:
         # OCI mode: while the golden is still staging (oras pull + Glance upload),

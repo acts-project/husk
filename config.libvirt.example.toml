@@ -23,6 +23,15 @@ runner_group_id = 1
 #                  # the install steps (podman, runner, driver — all baked). In
 #                  # prebaked mode the baked runner version is authoritative, so
 #                  # `version` above must match the image's husk.runner.version.
+# In-guest metrics (observability.md). Opens :9100 (node_exporter, baked into the
+# golden) to this source ONLY — it has no TLS/auth, so the allowlist IS the access
+# control. Requires prebaked; unset = fail-closed (no rule, no exporter running).
+# On libvirt the guest sits on a private net only its hypervisor can reach, so
+# huskd bridges the scrape over the SSH channel it already has to the host. The
+# connection is issued FROM the host, so the libvirt bridge — not Prometheus — is
+# the only client the guest ever sees. 192.168.122.1 is the default net's bridge.
+# Nothing to install on the hypervisor.
+# scrape_cidr = "192.168.122.1/32"
 
 [pool.backend]
 type = "libvirt"
@@ -53,6 +62,8 @@ network = "default"
 memory_mb = 8192
 vcpus = 8
 gpu_pci_addresses = ["0000:01:00.0"]   # → one slot, GPU passed through via <hostdev>
+# NB: no metrics knob here. huskd reaches this host's guests over ssh_target, so
+# adding a hypervisor requires no per-host metrics setup.
 
 # --- A CPU-only host would look like this instead (no GPU required): ---
 # [[pool.backend.hosts]]

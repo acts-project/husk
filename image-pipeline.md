@@ -75,6 +75,12 @@ per-slot, per-job, or meant to change without a rebuild.
   recycle timing is observable without SSH (static; started by cloud-init, like
   the runner unit). Reads only timestamps already recorded, so it's always-on.
 - `nftables` package + service (the firewall *engine*, not the ruleset).
+- `node_exporter` (pinned + checksummed in `versions.env`) + `husk-node-exporter
+  .service` — the in-guest per-VM metrics source (`observability.md`). Runs as its
+  own unprivileged user, never `runner`; **no TLS, no auth** (access control is the
+  `:9100` nftables allowlist, which is *policy* and therefore cloud-init's). Static
+  capability, so it's baked; **not** enabled for boot — cloud-init starts it only
+  when the pool sets `scrape_cidr`, and only after the ruleset lands.
 - **GPU variant only:** NVIDIA driver + `nvidia-container-toolkit`, plus the
   CDI-on-first-boot oneshot (`husk-cdi.service`). CDI generation stays first-boot
   — it needs the driver loaded against a present GPU, which an offline build
@@ -85,10 +91,14 @@ per-slot, per-job, or meant to change without a rebuild.
 - The JIT config blob (`/var/lib/husk/jitconfig`) — fresh per cycle.
 - The **firewall ruleset** (`husk-egress.nft`) + `nft -f` apply — the tunable
   policy. Same conceptual rule across backends; rendered from `husk-policy`
-  later (`plan.md` "Network policy rollout").
+  later (`plan.md` "Network policy rollout"). This now includes the **`:9100`
+  metrics ingress allowlist** (per-pool `scrape_cidr`): it's policy, and its value
+  differs per backend, so it must be changeable without an image rebuild.
 - The NoCloud seed / instance-id (rotates so cloud-init re-runs).
-- Start orchestration: `systemctl start husk-runner.service` (sole boot
-  orchestrator, as today), then a non-blocking `systemctl start husk-bootreport`.
+- Start orchestration: the (baked, not-enabled) units, in this order —
+  `husk-node-exporter.service` if `scrape_cidr` is set (after the ruleset, so
+  `:9100` is never briefly open), then `systemctl start husk-runner.service` (the
+  sole boot orchestrator, as today), then a non-blocking `husk-bootreport`.
 - Wall-clock backstop (`shutdown -h +N`).
 
 > **Side effect of baking the packages:** the reason the firewall is applied at

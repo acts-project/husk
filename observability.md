@@ -5,15 +5,34 @@ libvirt hosts) and the ephemeral, single-use runner slots. Companion to
 `plan.md` and `image-pipeline.md`; this document defines the metrics story those
 left open.
 
-> **Status (2026-07-10):** Design. Nothing here is built yet **except** the
-> controller `/metrics` endpoint, which already exists (`src/husk/web/app.py`,
-> `render_prometheus`) and exposes state-derived per-pool / per-slot gauges
-> (`husk_slots*`, `husk_slot_last_cloudinit_seconds`,
-> `husk_slot_last_recycle_seconds`, `husk_slot_live_fraction`). This plan extends
-> that surface and adds two new capabilities: **(1)** in-guest resource metrics
-> (node_exporter) scraped per running slot, and **(2)** boot-timing exfil from the
-> serial console (`husk-bootreport`, baked but currently write-only). The two are
-> independent and separately useful.
+> **Status (2026-07-14):** **O1–O4 are built.** Only the optional **O5** remains.
+>
+> **O4 changed shape:** there is **no per-host proxy**. huskd bridges the last hop
+> to a libvirt guest over the SSH channel it already holds to the hypervisor, so
+> **nothing is deployed on any host** — see Phase O4 below for why, and what it
+> costs. Sections below that describe a "dumb host proxy" are superseded by that.
+>
+> - **O1 ✅** boot-timing exfil: huskd reads the `husk-bootreport` block off the
+>   serial console and exposes `husk_slot_boot_*`.
+> - **O2 ✅** node_exporter is baked into both golden variants
+>   (`images/build.sh`, `husk-node-exporter.service`, no TLS/auth) and cloud-init
+>   opens `:9100` to the pool's `scrape_cidr` and starts it. **Takes effect on an
+>   image rebuild** (`just rebuild-all` + republish).
+> - **O3 ✅** discovery + join: `GET /sd/targets` (Prometheus `http_sd`, one feed,
+>   both backends) and the `husk_slot_info` join table on `/metrics`.
+> - **O4 ✅** libvirt guest bridge **inside huskd** (`GET /slot/<pool>/<slot>/metrics`
+>   → SSH → `guest:9100`). No per-host component.
+>
+> **Both backends are code-complete.** What's left is operational, not code:
+> **rebuild + republish the golden image** (O2 only lands on a rebuild), and **set
+> `scrape_cidr`** per pool — known for libvirt (`192.168.122.1/32`, the bridge),
+> still unknown for OpenStack (see open questions: it depends on where central
+> Prometheus lives, and it's fail-closed until set).
+>
+> The pre-existing controller `/metrics` endpoint (`src/husk/web/app.py`,
+> `render_prometheus`) continues to expose the state-derived per-pool / per-slot
+> gauges (`husk_slots*`, `husk_slot_last_cloudinit_seconds`,
+> `husk_slot_last_recycle_seconds`, `husk_slot_live_fraction`).
 
 -----
 
@@ -34,8 +53,11 @@ left open.
 
 ### Non-goals
 
-- huskd proxying/relaying node_exporter scrapes (explicitly rejected — see
-  "The two layers").
+- huskd proxying/relaying node_exporter scrapes. **Amended in O4:** still true for
+  OpenStack (routable guests, scraped directly), but **knowingly violated for
+  libvirt**, whose guests are unreachable except through their hypervisor. Paying a
+  per-host proxy + a new network path per host to preserve the principle was judged
+  not worth it at this fleet size. See "Why huskd bridges, and not a per-host proxy".
 - Scraping boot-timing off ephemeral VMs by pull (anti-pattern; it's a
   control-plane fact the controller already half-owns).
 - Managing the central Prometheus / long-term storage — that's existing infra;
@@ -58,24 +80,34 @@ Conflating them is the main design trap.
 | huskd's role | **produce the metric** | **produce discovery + a join table**, not the metric |
 
 The consequence: **the controller is a metrics *source* for layer 1 and a
-*discovery/label service* for layer 2 — never a metrics proxy for layer 2.**
-Relaying guest metrics through huskd would add a bottleneck, a failure mode, and
-lose node_exporter's native `up`/staleness semantics, all for zero benefit on a
-per-instant signal.
+*discovery/label service* for layer 2 — and, wherever it can be avoided, not a
+metrics proxy for layer 2.** Relaying guest metrics through huskd adds a
+bottleneck, a failure mode, and loses node_exporter's native `up`/staleness
+semantics.
+
+> **Amended in O4.** This holds for OpenStack, whose guests are routable and are
+> scraped directly. It does **not** hold for libvirt: those guests are reachable
+> only from their hypervisor, so *something* has to bridge, and the alternatives all
+> put a component + a new network path on every host. huskd bridges them over the
+> SSH channel it already has. We pay exactly the costs named above (a huskd outage
+> gaps libvirt metrics; `up` conflates guest-sick with huskd-sick) and judged them
+> cheaper than per-host infrastructure at this fleet size.
 
 Why direct scraping is fine for the ephemeral slots here: jobs are 10min+, so a
 slot lives long enough for dozens of 15s scrapes. (This is exactly why boot-timing
 is *not* scraped this way — a one-shot value known only at end-of-boot on a
 short-lived target is the ephemeral-scrape anti-pattern, so it stays in layer 1.)
 
-**Layer-2 refinement — where we own the hypervisor, prefer the hypervisor view.**
-"Scrape the guest directly" is the pattern when the guest is the *only* source. But
-CPU/disk/net per VM is also visible from the hypervisor, and on **libvirt we own
-the host**, so `prometheus-libvirt-exporter` supplies those with no in-guest agent
-at all (details per-backend below). It can't see guest-internal state
-(filesystem fill, load, CPU-mode split, fine memory), so the in-guest node_exporter
-remains the fallback when those matter — and the **only** option on OpenStack,
-where we don't own the hypervisor.
+**Layer-2 refinement — in-guest node_exporter is the uniform per-VM source; only
+transport differs.** The hypervisor view (`prometheus-libvirt-exporter`, available
+on libvirt because we own the host) can supply per-VM CPU/disk/net with no in-guest
+agent — but it **cannot** see guest-internal state: **filesystem fill**, load
+average, CPU-mode split, fine memory. We need filesystem fill, so the in-guest
+node_exporter is required on both backends and is the **primary** per-VM source
+everywhere. What changes by backend is *reachability*, hence transport + discovery
+(details below), not the source. The host-side libvirt-exporter is kept only as an
+optional secondary on libvirt (a hypervisor-view cross-check, and per-domain data
+when a guest's agent is down); it is not the primary path.
 
 -----
 
@@ -102,8 +134,9 @@ Runner VMs have CERN-internal-routable IPs, reachable from a Prometheus that sit
 inside (or is routed into) the CERN network.
 
 ```
-[central Prometheus] ──HTTP scrape──▶ slot:9100  (node_exporter, TLS + basic-auth)
+[central Prometheus] ──HTTP scrape──▶ slot:9100  (node_exporter, no TLS/auth)
         │  discovery via huskd http_sd (native OpenStack SD = fallback)
+        │  access control = nftables :9100 allow, scoped to the Prometheus source
         └── join: node_* × husk_slot_info (from huskd /metrics)
 ```
 
@@ -126,51 +159,140 @@ inside (or is routed into) the CERN network.
   discovery of *new* slots (http_sd keeps the last target list on a failed refresh)
   but never interrupts scraping of existing ones — huskd is not in the metrics path.
 
-### libvirt — host-side exporter (preferred), guest scrape optional
+### libvirt — in-guest node_exporter, bridged by huskd over SSH
 
-We **own the libvirt host**, so we get per-domain metrics from the *hypervisor's
-view* with no in-guest agent and no per-guest reachability at all:
+Guests sit on a **private libvirt net**: only the hypervisor can reach
+`slot:9100`. Something must bridge that last hop. **huskd does it, in-process**,
+over the SSH channel it *already* holds to every host (the one
+`libvirt_backend._ssh` uses for qemu-img/genisoimage). The baked node_exporter
+(same image as OpenStack) is the source here too, because we need filesystem fill:
 
 ```
-[central Prometheus] ◀──remote_write── [vmagent on libvirt host]
-                                              ├─ [libvirt-exporter]  per-domain CPU/disk/net
-                                              └─ [node_exporter]     host-level metrics
-                                        (optional, only if guest-internal metrics needed:)
-                                              └─ scrape host-local slot:9100
+[central Prometheus] ──scrape──▶ [huskd] ──ssh──▶ hypervisor ──▶ slot:9100 (node_exporter)
+        │  target from huskd http_sd:  __address__=<advertise_addr>,
+        │                              __metrics_path__=/slot/<pool>/<slot>/metrics
+        │  NOTHING is deployed on the hypervisor
+        └── join: node_* × husk_slot_info (from huskd /metrics)
 ```
 
-- **Primary path — `prometheus-libvirt-exporter` on the host.** It scrapes libvirtd
-  and emits per-domain **CPU time, block I/O, network I/O** (and memory *if* the
-  guest balloon/memstat is enabled). For the resource-**shape** question (is a build
-  CPU/disk/net-bound) this is sufficient, and it deletes the entire in-guest scrape
-  apparatus: **no baked node_exporter dependency, no `:9100` firewall hole, no
-  per-guest `file_sd` discovery, no secret** on the libvirt side. It's just another
-  exporter on the host next to `node_exporter`.
-- **What the hypervisor view can't give** (accept, or fall back to the guest
-  scrape): **filesystem fill, load average, CPU-mode breakdown** (user/system/
-  iowait/steal), and fine memory. These need an in-guest agent.
-- **Optional guest scrape (fallback, only if the above matters).** The host can
-  reach its own guests on the private libvirt net, so the same host `vmagent` can
-  additionally scrape `slot:9100` (node_exporter, baked in the shared image). This
-  re-introduces per-guest `file_sd` discovery (huskd writes the targets file over
-  its existing SSH channel) — enable it only when host-view metrics are
-  insufficient.
-- **Transport = host `vmagent` `remote_write`.** Central Prometheus never reaches
-  the guests; huskd is never in the metrics path (it only writes `file_sd` if the
-  optional guest scrape is on).
+- **Primary source — in-guest node_exporter** (baked, same image). Full guest view:
+  **filesystem fill**, load, CPU-mode split, fine memory, plus CPU/disk/net.
+- **Transport — huskd, over its existing SSH channel.** Central scrapes
+  `huskd/slot/<pool>/<slot>/metrics`; huskd SSHes to the host and curls the guest.
+  Because the request is issued *from the hypervisor*, the guest sees the **libvirt
+  bridge** as the client — which is exactly what the `:9100` allowlist admits.
+- **Discovery — huskd `http_sd`, the same endpoint as OpenStack.** One feed serves
+  both backends via per-target routing: OpenStack targets point at the guest
+  directly; libvirt targets point back at huskd.
+- **`:9100` ingress rule on the guest** — scoped to the libvirt-bridge address
+  (`scrape_cidr`), rendered by huskd into the cloud-init ruleset.
+- **Optional secondary — `prometheus-libvirt-exporter` on the host** for a
+  hypervisor-view cross-check. Not required (O5).
+
+### Why huskd bridges, and not a per-host proxy / agent
+
+The hypervisor has to be traversed; the question was *by what*. The original plan
+here was a stateless path-routing proxy on each host. **We rejected it — along with
+the heavier agent options — on operational cost:**
+
+| | **huskd SSH bridge** (chosen) | per-host proxy | vmagent `remote_write` | Prometheus + `/federate` |
+|---|---|---|---|---|
+| Deployed on each hypervisor | **nothing** | a proxy + unit | agent + disk buffer | full TSDB |
+| New network path to open, per host | **none** (reuses SSH) | yes: central → host:9101 | none (push) | yes |
+| Host holds a reach-central secret | no (pull) | no (pull) | **yes** | no |
+| huskd in the metrics data path | **yes** (libvirt only) | no | no | no |
+| `up` distinguishes guest-sick from infra-sick | **no** | yes | yes | yes |
+
+The decider was that a per-host proxy needs a **new Prometheus → hypervisor network
+path opened on every host, forever**, plus a component to install and upgrade
+there — recurring network-admin and orchestration overhead. Prometheus **already**
+scrapes huskd, so that path is proven and free.
+
+**The honest cost:** this contradicts the "keep the controller out of the metrics
+hot path" principle above — for libvirt. We take it knowingly, because the fleet is
+small enough that the bottleneck argument is theoretical, and because the two real
+costs are bounded: a huskd outage gaps libvirt guest metrics, and `up` for those
+targets no longer separates "the guest is sick" from "huskd/SSH is sick".
+**OpenStack keeps the pure design** — routable guests, scraped directly, huskd
+nowhere near the data path. Revisit if the libvirt fleet grows enough that one
+process fanning out N SSH scrapes every 15s becomes a real bottleneck.
 
 ### Summary
 
 | | OpenStack | libvirt |
 |---|---|---|
 | Own the hypervisor? | no (tenant) | yes |
-| Primary per-VM source | **in-guest node_exporter** (no host-side option) | **host-side libvirt-exporter** (no in-guest agent) |
-| Guest reachability | CERN-routable IP, direct | host-only (private net) |
-| Scrape transport | central Prometheus → `slot:9100` | host vmagent → libvirt-exporter, remote_write up |
-| Discovery | huskd `http_sd` (native OpenStack SD = fallback) | none for host exporters; `file_sd` only if guest scrape is enabled |
-| Guest scrape needed? | yes | **optional** — only for fs/load/CPU-mode/fine-mem |
-| Host-level metrics | n/a (not our hypervisors) | node_exporter + libvirt-exporter on the host |
-| `:9100` exposure | CERN-internal — restrict source + auth | none (host-side path) / host-private if guest scrape on |
+| Primary per-VM source | **in-guest node_exporter** | **in-guest node_exporter** (same baked image) |
+| Guest reachability | CERN-routable IP, direct | host-only (private net) → bridged by huskd over SSH |
+| Scrape transport | central → `slot:9100` | central → `huskd/slot/<pool>/<slot>/metrics` → ssh → `slot:9100` |
+| Discovery | huskd `http_sd` (single feed, per-target routing) | huskd `http_sd` (same feed) |
+| Host component | none | **none** (huskd reuses its existing SSH channel) |
+| huskd in the data path | no | yes (accepted trade — see above) |
+| Access control | nftables `:9100` allow (Prometheus source) | nftables `:9100` allow (libvirt-bridge source — the scrape is issued from the host) |
+
+-----
+
+## Configuring Prometheus (the consumer side)
+
+Everything above defines huskd's *contract*; this is how central Prometheus
+consumes it. **Two scrape jobs, matching the two layers** — deliberately not one.
+
+```yaml
+scrape_configs:
+  # ── Layer 1: the controller ────────────────────────────────────────────────
+  # huskd's own state-derived gauges: husk_slots*, husk_slot_boot_*, and the
+  # husk_slot_info join table. ONE static target that never changes.
+  - job_name: huskd
+    static_configs:
+      - targets: ["huskd.internal:9100"]      # → GET /metrics
+
+  # ── Layer 2: the runner slots ──────────────────────────────────────────────
+  # Per-slot in-guest node_exporter, discovered live. ONE feed, BOTH backends:
+  # per-target routing means OpenStack targets resolve to <guest-ip>:9100 (direct)
+  # and libvirt targets resolve back to huskd, which bridges the scrape over SSH.
+  - job_name: husk-slots
+    http_sd_configs:
+      - url: http://huskd.internal:9100/sd/targets
+        refresh_interval: 30s
+    # __address__ and __metrics_path__ arrive already set by huskd; the `backend`
+    # and `slot` labels come through as-is and are the join key below.
+```
+
+**Why two jobs, not one** (i.e. why huskd does *not* advertise itself through
+`/sd/targets`): Prometheus must already know huskd's URL to call `/sd/targets` at
+all, so self-advertising is circular — it can only restate what the `http_sd_config`
+already hardcodes. And the two layers *want* to differ: the controller job is
+pool-scoped (no `slot` label) and fine at a slow interval; the slots job is
+per-slot and wants a tight one. Folding them into one feed just forces relabeling
+to pull back apart a distinction you erased for nothing. The same `huskd.internal`
+address legitimately appears in both — that redundancy is the whole reason
+self-advertising buys nothing.
+
+### The join: making a `node_*` spike legible as pool / job
+
+`node_*` series are keyed only by the target's minimal identity (`backend`,
+`slot`) — cardinality is kept low on purpose (see Division of labor #4). The rich
+attribution (`ip`, `host`, `runner`, `cycle`, and later `job_id`) lives on the
+`husk_slot_info` gauge from layer 1. Join them at query time on `(backend, slot)`:
+
+```promql
+# "show me each running slot's root-fs fill, labelled by pool + runner"
+node_filesystem_avail_bytes{mountpoint="/"}
+  * on(backend, slot) group_left(host, runner, cycle)
+    husk_slot_info
+```
+
+`group_left(...)` copies the named `husk_slot_info` labels onto every matching
+`node_*` series; `on(backend, slot)` is the shared key. Any `node_*` metric joins
+the same way — this is the whole point of emitting `husk_slot_info` rather than
+stamping pool/job onto every guest series (which would inflate cardinality and
+churn it on every recycle).
+
+> **`up` semantics differ by backend, and it matters when alerting.** An OpenStack
+> target's `up == 0` means the guest is unreachable. A libvirt target's `up == 0`
+> means the guest *or* huskd *or* the SSH hop is unreachable (huskd is in that data
+> path — see "Why huskd bridges"). Don't page on a raw libvirt `up == 0` as though
+> it were guest-specific; correlate with the `huskd` job being up first.
 
 -----
 
@@ -202,24 +324,23 @@ image or set up once per host.**
    ```
    This is what makes `node_*` (keyed by IP) legible as pool/job. huskd already
    owns every one of these labels.
-4. **Discovery endpoints.**
-   - `http_sd`: a Quart route (e.g. `GET /sd/targets`) returning live
-     `{targets, labels}` JSON for running slots — the single discovery source
-     Prometheus (OpenStack) and host vmagents can both consume. **Preferred over
-     native OpenStack SD** (removes Nova creds from Prometheus, reuses the existing
-     Prometheus→huskd connection, carries huskd-native labels, emits only
-     runner-online slots). Keep **target labels minimal** (identity to join —
-     `slot`, `ip`); leave rich attribution (`job_id`, `cycle`) to `husk_slot_info`
-     so per-recycle churn doesn't inflate `node_*` series cardinality.
-   - `file_sd` writer (libvirt): **only needed if the optional guest scrape is
-     enabled** (the default libvirt path uses host-side libvirt-exporter and needs
-     no per-guest discovery). Renders the same target list to a file on each host
-     over the existing SSH channel, for host-local vmagents.
-5. **The dynamic firewall ingress rule.** The `:9100`-from-Prometheus allow is
+4. **Discovery — a single `http_sd` endpoint** (a Quart route, `GET /sd/targets`)
+   returning live `{targets, labels}` JSON for running slots, serving **both**
+   backends. Per-target routing (`__address__` + `__metrics_path__` are
+   relabelable) means one feed covers OpenStack (target = the guest IP directly)
+   and libvirt (target = `host:PORT`, `__metrics_path__=/<slot>/metrics` through
+   the host proxy). **Preferred over native OpenStack SD** (removes Nova creds from
+   Prometheus, reuses the existing Prometheus→huskd connection, carries
+   huskd-native labels, emits only runner-online slots). Keep **target labels
+   minimal** (identity to join — `slot`); leave rich attribution (`job_id`,
+   `cycle`) to `husk_slot_info` so per-recycle churn doesn't inflate `node_*`
+   cardinality. (No per-host `file_sd` — the proxy makes the guests reachable
+   through the host address, so the single central feed suffices.)
+5. **The dynamic firewall ingress rule.** The `:9100`-from-scraper allow is
    *policy*, so it rides the existing per-cycle cloud-init ruleset
-   (`husk-egress.nft`), not the image. Scoped to the Prometheus/vmagent source IP.
-   huskd renders it (one config knob: the scraper source CIDR). **OpenStack path
-   always; libvirt only if the optional guest scrape is enabled.**
+   (`husk-egress.nft`), not the image. huskd renders it (one config knob: the
+   scraper source CIDR). **Both backends**: OpenStack scoped to the central
+   Prometheus source; libvirt scoped to the host's own libvirt-bridge address.
 
 ### Baked into the golden image (built once, in CI — `images/build.sh`)
 
@@ -229,39 +350,31 @@ Static capability, per the image/cloud-init boundary (`image-pipeline.md`):
    `images/files/`), **not enabled for boot** — cloud-init starts it like the
    runner unit, or it's enabled to start on boot since it has no per-cycle input.
    Runs as `root` or a dedicated `node_exporter` user — **never** as `runner`.
-7. **node_exporter `--web.config.file`** (`root:root 0600`) carrying TLS server
-   cert + `basic_auth_users` (bcrypt). Safe to bake: the runner is unprivileged
-   (`useradd ... runner; passwd -l runner`; no sudo/wheel), so uid 1000 can't read
-   a `0600` root file, and `basic_auth` stores a hash, not the plaintext. The
-   Prometheus-side credential (basic-auth password / mTLS client key) **never**
-   goes into the image.
-8. **(GPU variant) the DCGM/nvidia metrics exporter** if we want GPU utilization —
+   **No `--web.config.file`, no TLS, no basic-auth** — access is controlled purely
+   at the network layer (see Security). Nothing secret is baked, so there's no
+   credential to protect on a job-executing box.
+7. **(GPU variant) the DCGM/nvidia metrics exporter** if we want GPU utilization —
    deferred; note it here so the boundary is explicit.
 
-### Per-node setup (once per libvirt host — possibly automated later)
+### Per-node setup (once per libvirt host)
 
-Static machine state that isn't a VM image. Today this is manual; automating it is
-tracked as **deferred Ansible host provisioning** (`plan.md` / memory) and this
-plan does **not** un-defer it — it just enumerates what belongs there:
+**Metrics need NO per-node setup.** This section originally carried a host metrics
+proxy; O4 removed the need for it (huskd bridges over its existing SSH channel), so
+what remains here is unrelated to metrics collection:
 
-9. **A metrics agent on each libvirt host:** `vmagent` (or prometheus-agent)
-   running `node_exporter` (host) + `prometheus-libvirt-exporter` (per-domain,
-   hypervisor view) and `remote_write`-ing to central Prometheus. This is the
-   **default, complete** libvirt per-VM path — no in-guest agent, no per-guest
-   discovery. Only if fs/load/CPU-mode/fine-memory are required does the agent
-   *additionally* tail huskd's `file_sd` and scrape `slot:9100`.
-10. **The serial-log file ownership/relabel fix** so libvirt/qemu can write the
-    per-domain console log that huskd's boot-timing exfil (item 2) reads — the exact
-    thing the `libvirt_backend.py:724` comment defers to host setup. (Independent of
-    the metrics agent; needed for boot-timing on libvirt regardless.)
-11. **Network path** from the host to central Prometheus for `remote_write` (and, if
-    the optional guest scrape is on, from the host agent to the guest subnet —
-    usually already there via the host's own libvirt bridge).
+9. **The serial-log file ownership/relabel fix** so libvirt/qemu can write the
+   per-domain console log that huskd's boot-timing exfil (item 2) reads — the thing
+   the `libvirt_backend.py` `console_log_path` comment defers to host setup. Needed
+   for boot-timing on libvirt regardless.
+10. **L2 isolation between sibling slots** on the shared libvirt bridge (see
+    Security) — per-slot isolated networks or bridge port isolation. This protects
+    slot↔slot and is the assumption the `:9100` allowlist rests on.
+11. **(Optional, O5)** `prometheus-libvirt-exporter` for a hypervisor-view
+    cross-check.
 
-> When the deferred host-provisioning work lands, items 9–11 become Ansible roles.
-> Until then they're a documented per-host checklist. **Nothing in 9–11 blocks the
-> OpenStack path**, which needs no per-node setup at all (direct scrape + baked
-> image + huskd discovery).
+> Automating these is tracked as **deferred Ansible host provisioning** (`plan.md` /
+> memory); this plan does not un-defer it. **Nothing here blocks either backend's
+> per-VM metrics** — that path is complete without any host setup.
 
 ### At-a-glance
 
@@ -269,12 +382,12 @@ plan does **not** un-defer it — it just enumerates what belongs there:
 |---|---|---|---|
 | Boot-timing metrics | ✅ parse + expose | — | serial-log fix (libvirt only) |
 | `husk_slot_info` join | ✅ | — | — |
-| Discovery (http_sd/file_sd) | ✅ | — | consume file_sd |
-| `:9100` ingress rule | ✅ (cloud-init) | — | — |
-| node_exporter + web.config | — | ✅ baked (used by OpenStack; libvirt only if guest scrape on) | — |
-| libvirt-exporter + node_exporter on host | — | — | ✅ (default libvirt per-VM path) |
-| Scrape transport | — | — | vmagent (libvirt); direct (OpenStack) |
-| Host + per-domain metrics | — | — | node_exporter + libvirt-exporter |
+| Discovery (`http_sd`, single feed) | ✅ | — | — |
+| `:9100` ingress rule | ✅ (cloud-init, `scrape_cidr`) | — | — |
+| node_exporter (no TLS/auth) | — | ✅ baked (primary per-VM source, both backends) | — |
+| Guest bridge (libvirt) | ✅ `/slot/<pool>/<slot>/metrics` over its existing SSH channel | — | **nothing** |
+| Scrape transport | — | — | central → huskd → ssh → guest (libvirt); direct pull (OpenStack) |
+| Optional per-domain metrics | — | — | optional `prometheus-libvirt-exporter` |
 
 -----
 
@@ -305,26 +418,32 @@ no in-guest network, so they sidestep the runner egress firewall entirely.
 ## Security model
 
 Asset is low-value (host metrics, not secrets); adversary is other tenants on the
-CERN-internal network **and** the untrusted CI job itself. Controls, in order of
-importance:
+CERN-internal network **and** the untrusted CI job itself. **Decision: no TLS, no
+basic-auth — network-layer access control only.** TLS/basic-auth would protect
+low-value data and a credential whose entire blast radius is "read another slot's
+host metrics"; the margin over the network controls rounds to zero, and it buys
+real cost (baking/rotating certs, the dynamic-IP SAN wrinkle). Controls:
 
-1. **Primary: nftables source-IP allowlist on `:9100`.** Only the Prometheus /
-   vmagent source may connect. Network-layer, nothing on the VM to steal, and it's
-   the mechanism husk already has (cloud-init ruleset). Sufficient on its own for
-   this asset.
-2. **Auth/encryption: baked basic-auth over TLS, or mTLS.** node_exporter
-   `--web.config.file` supports `tls_server_config` (incl. `client_ca_file` for
-   mTLS) and `basic_auth_users` (bcrypt). A baked basic-auth secret is adequate
-   **because the runner is unprivileged** — uid 1000 can't read the `root:0600`
-   config, and it holds a bcrypt hash anyway. mTLS is the marginal upgrade: the
-   client key lives only on Prometheus, so even the hash never sits on a
-   job-executing box, plus it encrypts the CERN-internal wire.
-3. **What never touches the image:** the Prometheus-side credential (basic-auth
-   password / mTLS client key). Only server cert + CA + bcrypt hash are baked.
+1. **Primary: nftables source-IP allowlist on `:9100`.** Only the scraper source
+   may connect — central Prometheus on OpenStack, the host proxy on libvirt.
+   Network-layer, nothing on the VM to steal, and it's the mechanism husk already
+   has (cloud-init ruleset). Sufficient on its own for this asset.
+2. **libvirt: private net + the locked-down host proxy.** Guests aren't reachable
+   at all except through a proxy pinned to `:9100` on the guest subnet.
+3. **Nothing secret is baked or held on any host** — no server cert, no bcrypt
+   hash, no push credential. The metrics endpoint serves in the clear to whoever
+   the firewall admits (only the scraper).
 
-Residual risk: a local privilege escalation in the guest (kernel/container-escape)
-defeats the `0600`. Accepted — the ephemeral single-use slot bounds the blast
-radius, and it's a high bar for a host-metrics endpoint. Not engineered around.
+Spend the effort *instead* on the network assumptions the allowlist rests on:
+- **libvirt:** stop sibling slots sniffing/ARP-spoofing each other at L2 on the
+  shared bridge (per-slot isolated networks or bridge port isolation) — this
+  protects slot↔slot better than TLS would, and it's a host-config item.
+- **OpenStack:** confirm CERN's tenant network isolates tenants (Neutron normally
+  does), so the source-IP allowlist can't be defeated by an on-path tenant spoofing
+  the scraper IP.
+
+If either assumption fails, or defense-in-depth is later wanted, **mTLS is the
+add-back** (client key on central only) — not built now.
 
 -----
 
@@ -332,30 +451,58 @@ radius, and it's a high bar for a host-metrics endpoint. Not engineered around.
 
 Independent tracks; ship in any order.
 
-- **Phase O1 — boot-timing exfil (huskd only, OpenStack first).** `get_console_output`
+- **Phase O1 ✅ — boot-timing exfil (huskd only, OpenStack first).** `get_console_output`
   → parse `husk-bootreport` → `husk_slot_boot_*` on `/metrics` + dashboard. No
   image change, no per-node setup. Highest value / lowest cost; validates the
   console-parse path. libvirt half follows once the serial-log host fix lands.
-- **Phase O2 — node_exporter in the image.** Bake node_exporter +
-  `husk-node-exporter.service` + `--web.config.file` into both variants; add the
-  `:9100` ingress rule to the cloud-init ruleset (config knob: scraper source
-  CIDR). Produces scrapeable slots. No huskd delivery change beyond the ruleset.
-- **Phase O3 — discovery + join (huskd).** `http_sd` endpoint + `husk_slot_info`
-  join table. Turns "scrapeable" into "discovered + attributable." OpenStack goes
-  fully direct after this.
-- **Phase O4 — libvirt host exporters.** Per-host `vmagent` + `node_exporter` +
-  `prometheus-libvirt-exporter` (host + per-domain, hypervisor view) with
-  `remote_write`. This is the **complete default** libvirt per-VM path — no in-guest
-  agent, no `file_sd`, no `:9100` rule. Per-node-setup track; folds into the
-  deferred Ansible host-provisioning work when that lands.
-- **Phase O5 (optional) — libvirt guest scrape.** Only if fs/load/CPU-mode/fine-mem
-  are needed beyond the hypervisor view: enable the host `vmagent` to also scrape
-  `slot:9100` (baked node_exporter from O2), add the huskd `file_sd` writer and the
-  `:9100` ingress rule. Skip unless O4's host view proves insufficient.
+- **Phase O2 ✅ — node_exporter in the image.** node_exporter (pinned +
+  checksummed in `images/versions.env`) and `husk-node-exporter.service` are baked
+  into both variants, running as a dedicated unprivileged user, **no TLS/auth**.
+  The `:9100` ingress rule rides the per-cycle cloud-init ruleset, gated on the
+  per-pool `scrape_cidr` knob. **Opt-in and fail-closed**: unset → no ingress rule
+  and no exporter started (nothing listening), so a pool whose scraper source
+  isn't known yet renders exactly today's ruleset. The exporter is started *after*
+  the firewall is applied and *before* the runner, so `:9100` is never briefly
+  open during boot. Requires `prebaked` (the loader rejects the combination
+  otherwise — a stock image has no baked exporter). Takes effect on a rebuild.
+- **Phase O3 ✅ — discovery + join (huskd).** A single `http_sd` endpoint
+  (`GET /sd/targets`) serving both backends via per-target routing (OpenStack →
+  `ip:9100`; libvirt → `host:PORT/<slot>/metrics`) + the `husk_slot_info` join
+  table. `Slot`/`SlotView` carry `ip` (OpenStack) and `host` (libvirt), plus a
+  per-host `metrics_proxy` config knob. Pure huskd; OpenStack goes fully direct
+  after this. Only runner-online slots are published (no scrape-`down` edge noise).
+- **Phase O4 ✅ — libvirt guest bridge, in huskd (NOT a per-host proxy).** Central
+  Prometheus scrapes `huskd/slot/<pool>/<slot>/metrics`; huskd fetches the guest's
+  node_exporter over the SSH channel it **already holds** to the hypervisor (the one
+  `libvirt_backend._ssh` uses for qemu-img). **Nothing is deployed on any
+  hypervisor** — adding a host stays a pure config change.
+  - **Why this and not the per-host proxy originally planned here:** the proxy
+    needed a *new* network path (Prometheus → hypervisor:9101) opened on every host,
+    forever. Prometheus already scrapes huskd, so that path is proven and free. The
+    network-admin + orchestration overhead of the per-host component was judged to
+    outweigh its architectural tidiness.
+  - **The trade, stated plainly:** this puts huskd in the metrics *data* path for
+    libvirt, which the "two layers" section above rejects as a general principle. We
+    accept it *for libvirt only*, because the fleet is small (the bottleneck argument
+    is theoretical at this size). **OpenStack is unaffected** — those guests are
+    routable and still scraped directly; huskd is never in their data path.
+  - **What it costs:** a huskd outage gaps libvirt guest metrics (whereas discovery
+    alone degrades gracefully), and `up` for those targets folds together "the guest
+    is sick" with "huskd/SSH is sick". Losing that distinction is the real price.
+  - **Implementation guards:** the scrape is an async subprocess, hard-bounded by a
+    timeout, so a wedged host degrades one scrape and never the control plane; the
+    SSH connection is multiplexed (`ControlMaster`/`ControlPersist`) so a 15s scrape
+    interval doesn't mean a TCP+auth handshake every 15s; and the slot is resolved
+    from huskd's own snapshot, never from the URL, so the route is not a general
+    relay. The guest-IP lookup inside `list_slots` cannot raise — a metrics nicety
+    must never abort a reconcile tick.
+- **Phase O5 (optional) — libvirt hypervisor cross-check.** Add
+  `prometheus-libvirt-exporter` on the host for per-domain CPU/disk/net independent
+  of the guest agent. Not required.
 
 OpenStack reaches full per-VM observability at O1+O2+O3 with **zero** per-node
-setup. libvirt reaches it at O4 (host-side, no image/guest work); O5 is a
-conditional add-on, not a requirement.
+setup. libvirt reaches it at O2+O3+O4 (baked node_exporter + huskd `http_sd` + the
+host proxy); O5 is a conditional add-on, not a requirement.
 
 -----
 
@@ -363,7 +510,21 @@ conditional add-on, not a requirement.
 
 - **Where does central Prometheus live** relative to the CERN network — can it
   route to runner fixed IPs directly (O3 direct scrape) or must even OpenStack go
-  through a tenant-resident scraper? Gates the OpenStack transport.
+  through a tenant-resident scraper? Gates the OpenStack transport. **This is the
+  one thing still blocking OpenStack**, and it's a config value, not code: set
+  `scrape_cidr` on the pool and recycle (the rule is in cloud-init, *not* baked, so
+  getting it wrong costs a recycle, not an image rebuild). Until it's set the pool
+  is fail-closed (no rule, no exporter).
+  - **If Prometheus runs in k8s, the value is the WORKER-NODE subnet, not the pod
+    CIDR.** A pod egressing *out of the cluster* to the runner VM is normally
+    SNAT'd to its node, so the guest never sees a pod IP — and pod IPs are
+    ephemeral anyway, so they couldn't be allowlisted. Exceptions to check:
+    routable pod IPs with no masquerade (allowlist the pod CIDR), or a dedicated
+    egress gateway/NAT (allowlist that).
+  - **Settle it empirically, not from docs** — let the guest tell you the source:
+    add a `tcp dport 9100 counter` rule and see what hits it, or `curl
+    <slot-ip>:9100/metrics` from a pod in the cluster and look at where the
+    connection came from. One observation ends the question.
 - **Does CERN expose tenant telemetry (Ceilometer → Gnocchi / a Prometheus
   endpoint)?** If yes, it's the host-side equivalent of libvirt-exporter for the
   OpenStack VMs — could drop the in-guest node_exporter there too. Verify (a) the
@@ -381,8 +542,14 @@ conditional add-on, not a requirement.
   `husk_slot_info` for identity.
 - **Series lifecycle for ephemeral slots** — stale-marking / `up==0` handling and
   retention so a recycled slot's series ages out cleanly.
-- **mTLS vs basic-auth** final call (O2) — mTLS if we want the credential off the
-  guest entirely; basic-auth if simplicity wins given the unprivileged runner.
+- ~~**mTLS vs basic-auth** final call (O2)~~ — **resolved in O2: neither.** No TLS,
+  no basic-auth; the nftables source allowlist on `:9100` is the whole access
+  control, so nothing secret is baked into an image that runs untrusted CI jobs.
+  mTLS remains the add-back if the network assumptions below ever fail.
+- **IPv6 scrape sources** are supported (the rule renders `ip6 saddr` when
+  `scrape_cidr` is v6 — inside an `inet` table `ip saddr` matches v4 only, so a v6
+  source under it would never match and the port would silently close), but a
+  **single** family per pool. A dual-stack scraper would need the rule to emit both.
 - **GPU utilization** (DCGM exporter in the gpu variant) — in scope or separate?
 - **libvirt-exporter choice** — `prometheus-libvirt-exporter` vs alternatives;
   per-domain label alignment with `husk_slot_info`.

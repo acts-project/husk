@@ -4,6 +4,11 @@ coroutine the CLI awaits to run it on the main event loop.
   GET /         — live dashboard (Jinja + SSE, no polling)
   GET /status   — JSON list of ControllerState, one per pool (huskctl, dashboards)
   GET /metrics  — Prometheus text exposition (per-pool gauges, backend="..." label)
+  GET /sd/targets — Prometheus http_sd: live per-slot node_exporter scrape targets
+  GET /slot/<pool>/<slot>/metrics — a libvirt guest's node_exporter, bridged over
+                  huskd's SSH channel to the hypervisor (the guest is on a private
+                  net; only its host can reach it). OpenStack guests are routable
+                  and are scraped directly, so they never come through here.
   GET /healthz  — 200 if every pool has a recent reconcile, else 503
   GET /events   — Server-Sent Events stream of the per-pool snapshots
 
@@ -26,6 +31,8 @@ from typing import Callable
 from hypercorn.asyncio import serve
 from hypercorn.config import Config as HypercornConfig
 from quart import Quart, Response, render_template
+
+from husk.guest_scrape import GuestScraper, GuestScrapeError
 
 from husk.snapshot import ControllerState
 
@@ -103,6 +110,33 @@ def render_prometheus(s: ControllerState) -> str:
         for v in s.slots
         if v.live_fraction is not None
     ]
+    out += [
+        "# HELP husk_slot_boot_seconds systemd-analyze boot phase durations (husk-bootreport)",
+        "# TYPE husk_slot_boot_seconds gauge",
+    ]
+    out += [
+        f'husk_slot_boot_seconds{{backend="{b}",slot="{v.name}",phase="{phase}"}} {val}'
+        for v in s.slots
+        for phase, val in (
+            ("kernel", v.boot_kernel_seconds),
+            ("initrd", v.boot_initrd_seconds),
+            ("userspace", v.boot_userspace_seconds),
+            ("total", v.boot_total_seconds),
+        )
+        if val is not None
+    ]
+    # Join table: attributes node_* (keyed by the http_sd target's backend/slot
+    # labels) back to pool/host/runner/cycle. Value is always 1; the labels carry
+    # the information. Join on (backend, slot).
+    out += [
+        "# HELP husk_slot_info Slot identity for joining in-guest metrics (always 1)",
+        "# TYPE husk_slot_info gauge",
+    ]
+    out += [
+        f'husk_slot_info{{backend="{b}",slot="{v.name}",ip="{v.ip or ""}",'
+        f'host="{v.host or ""}",runner="{v.runner or ""}",cycle="{v.cycle}"}} 1'
+        for v in s.slots
+    ]
     return "\n".join(out) + "\n"
 
 
@@ -110,6 +144,8 @@ def make_app(
     snapshot_provider: Callable[[], list[ControllerState]],
     *,
     shutdown: asyncio.Event | None = None,
+    scraper: GuestScraper | None = None,
+    advertise_addr: str = "",
 ) -> Quart:
     """Build the app over a per-pool snapshot provider (the same one every
     endpoint reads). Templates resolve relative to this package.
@@ -117,7 +153,18 @@ def make_app(
     `shutdown`, if given, is the server's shutdown event: the long-lived `/events`
     SSE stream watches it and returns promptly when it fires, so a connected
     dashboard doesn't hold graceful shutdown open until hypercorn's much longer
-    `shutdown_timeout` (this is what made Ctrl-C appear to hang)."""
+    `shutdown_timeout` (this is what made Ctrl-C appear to hang).
+
+    `scraper` bridges to libvirt guests, which sit on a private net no one but
+    their hypervisor can reach: `/slot/<pool>/<slot>/metrics` fetches the guest's
+    node_exporter over the SSH channel huskd already holds to the host. Without it,
+    libvirt slots are simply not published as metrics targets. (OpenStack guests are
+    routable and are scraped directly — huskd is never in *their* data path.)
+
+    `advertise_addr` is where central Prometheus reaches THIS huskd — the address
+    `/sd/targets` hands out for the proxied libvirt targets. Defaults to the
+    controller's `http_addr`, which is wrong only if huskd is behind a NAT/ingress,
+    hence the override."""
     app = Quart(__name__)
 
     def _snaps() -> list[ControllerState]:
@@ -139,6 +186,77 @@ def make_app(
         # Per-pool series are distinguished by the backend="..." label already on
         # every metric, so concatenation across pools is a valid exposition.
         body = "".join(render_prometheus(s) for s in _snaps())
+        return Response(body, content_type="text/plain; version=0.0.4; charset=utf-8")
+
+    @app.get("/sd/targets")
+    async def sd_targets():
+        # Prometheus http_sd: one group per running slot. Per-target routing lets a
+        # single feed serve both backends. Target labels are kept minimal (backend,
+        # slot) for the join to husk_slot_info; only runner-online slots are published
+        # (node_exporter is up by then, which avoids scrape `down` noise while a slot
+        # boots or drains).
+        #
+        # `host` is what distinguishes the two. A libvirt guest is on a private net,
+        # reachable only from its hypervisor, so Prometheus is pointed back at THIS
+        # huskd, which bridges the last hop over its existing SSH channel. An
+        # OpenStack guest has a routable fixed IP and is scraped directly — huskd
+        # stays out of that data path entirely.
+        groups = []
+        for s in _snaps():
+            for v in s.slots:
+                if v.runner_status != "online" or not v.ip:
+                    continue
+                if v.host:  # libvirt: private guest → proxied through huskd
+                    if scraper is None or not advertise_addr:
+                        continue  # can't route to it → don't advertise a dead target
+                    address = advertise_addr
+                    path = f"/slot/{s.backend}/{v.name}/metrics"
+                else:  # OpenStack: routable guest → direct
+                    address, path = f"{v.ip}:9100", "/metrics"
+                groups.append(
+                    {
+                        "targets": [address],
+                        "labels": {
+                            "__metrics_path__": path,
+                            "backend": s.backend,
+                            "slot": v.name,
+                        },
+                    }
+                )
+        return Response(json.dumps(groups), content_type="application/json")
+
+    @app.get("/slot/<backend>/<slot>/metrics")
+    async def slot_metrics(backend: str, slot: str):
+        # The libvirt bridge: fetch this guest's node_exporter over huskd's existing
+        # SSH channel to the hypervisor. Errors are 5xx on purpose — Prometheus turns
+        # that into `up == 0` for the target, which is the honest signal.
+        #
+        # The slot is looked up in the CURRENT snapshot rather than trusted from the
+        # URL, so this can only ever reach a live slot huskd itself manages — it is
+        # not a general-purpose relay, and there is no way to point it at an
+        # arbitrary address.
+        if scraper is None:
+            return Response("no guest scraper configured\n", status=503)
+        view = next(
+            (
+                v
+                for s in _snaps()
+                if s.backend == backend
+                for v in s.slots
+                if v.name == slot
+            ),
+            None,
+        )
+        if view is None:
+            return Response(f"no such slot {slot!r} in pool {backend!r}\n", status=404)
+        if not view.host or not view.ip:
+            # Not a libvirt slot, or its DHCP lease hasn't appeared yet.
+            return Response(f"slot {slot!r} has no guest route\n", status=503)
+        try:
+            body = await scraper.fetch(backend, view.host, view.ip)
+        except GuestScrapeError as e:
+            log.warning("guest scrape failed for %s/%s: %s", backend, slot, e)
+            return Response(f"{e}\n", status=502)
         return Response(body, content_type="text/plain; version=0.0.4; charset=utf-8")
 
     @app.get("/healthz")

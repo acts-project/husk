@@ -47,6 +47,8 @@ if [[ -z "$DISK_SIZE" ]]; then
 fi
 
 RUNNER_URL="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
+NODE_EXPORTER_TGZ="node_exporter-${NODE_EXPORTER_VERSION}.linux-amd64.tar.gz"
+NODE_EXPORTER_URL="https://github.com/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VERSION}/${NODE_EXPORTER_TGZ}"
 
 command -v virt-customize >/dev/null || {
   echo "need guestfs-tools (dnf install guestfs-tools / apt install guestfs-tools)" >&2
@@ -111,6 +113,19 @@ ARGS=(
   # Bake the runner binary + its native deps so recycle doesn't reinstall them.
   --run-command "cd /opt/actions-runner && curl -fL '$RUNNER_URL' | tar xz"
   --run-command '/opt/actions-runner/bin/installdependencies.sh'
+
+  # node_exporter — in-guest per-VM metrics (observability.md). Baked in both
+  # variants; the unit is NOT enabled (cloud-init starts it per cycle, after the
+  # firewall, and only when the pool sets `scrape_cidr`). Checksum-pinned like
+  # the base image: this is a binary we fetch off the internet at build time.
+  --run-command "curl -fL '$NODE_EXPORTER_URL' -o /tmp/$NODE_EXPORTER_TGZ"
+  --run-command "echo '$NODE_EXPORTER_SHA256  /tmp/$NODE_EXPORTER_TGZ' | sha256sum -c -"
+  --run-command "tar -xzf /tmp/$NODE_EXPORTER_TGZ -C /tmp"
+  --run-command "install -m 0755 /tmp/node_exporter-${NODE_EXPORTER_VERSION}.linux-amd64/node_exporter /usr/local/bin/node_exporter"
+  --run-command "rm -rf /tmp/$NODE_EXPORTER_TGZ /tmp/node_exporter-${NODE_EXPORTER_VERSION}.linux-amd64"
+  # Dedicated unprivileged user — never `runner` (which is what the untrusted job runs as).
+  --run-command 'id -u node_exporter >/dev/null 2>&1 || useradd -r -s /sbin/nologin node_exporter'
+  --copy-in "$FILES/husk-node-exporter.service:/etc/systemd/system/"
 
   # Ownership (copy-in lands as root; fix up the runner-owned trees).
   --run-command 'chown -R runner:runner /opt/actions-runner /var/lib/husk /home/runner'

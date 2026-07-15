@@ -164,7 +164,7 @@ write_files:
           ip daddr { 128.141.0.0/16, 128.142.0.0/16, 137.138.0.0/16, 188.184.0.0/15 } drop
           ip6 daddr { 2001:1458::/32, 2001:1459::/32 } drop
         }
-      }
+@@METRICS_INGRESS@@      }
 
 runcmd:
   # Install the runner as the runner user (runuser, not sudo — sudo isn't on the
@@ -297,7 +297,7 @@ write_files:
           ip daddr { 128.141.0.0/16, 128.142.0.0/16, 137.138.0.0/16, 188.184.0.0/15 } drop
           ip6 daddr { 2001:1458::/32, 2001:1459::/32 } drop
         }
-      }
+@@METRICS_INGRESS@@      }
 
 runcmd:
   # jitconfig is written root-owned above; the runner service runs as `runner`.
@@ -309,6 +309,7 @@ runcmd:
   # The runner unit is baked but NOT enabled for boot; cloud-init starts it each
   # cycle once the fresh JIT config is in place (Type=simple returns immediately).
   - systemctl daemon-reload
+@@METRICS_START@@
   - systemctl start husk-runner.service
   # Boot-timing report to the serial console (baked oneshot, ordered After the
   # runner so it never delays registration). Always-on: it only reads timestamps
@@ -326,8 +327,47 @@ _PREBAKED_GPU_ANCHOR = (
 )
 
 
+# Metrics ingress (observability.md). node_exporter is baked into the golden image
+# with NO TLS and NO auth, so this source allowlist IS its access control. The
+# allowed source differs by backend, which is why the CIDR is a per-pool knob:
+#
+#   * OpenStack — central Prometheus scrapes the guest directly, so the source is
+#     Prometheus itself (if it lives in k8s, that's the *worker-node* subnet: pods
+#     egressing out of the cluster are SNAT'd to the node, so the guest never sees
+#     a pod IP).
+#   * libvirt — Prometheus never touches the guest; it scrapes the host proxy,
+#     which opens its own connection over the bridge. The bridge (192.168.122.1)
+#     is therefore the only client the guest ever sees.
+#
+# `policy accept` deliberately leaves the rest of ingress exactly as it was: this
+# chain narrows :9100 and nothing else. Replies to an admitted scrape leave via
+# the output chain's `ct state established,related accept`, so they are NOT caught
+# by the CERN-internal egress drops even when the scraper is itself CERN-internal.
+# `@@SADDR@@` is `ip saddr`/`ip6 saddr` per the CIDR's family: inside an `inet`
+# table `ip saddr` matches v4 only, so a v6 source under `ip saddr` would never
+# match and the drop below would silently close the port.
+_METRICS_INGRESS = """\
+        chain input {
+          type filter hook input priority 0; policy accept;
+
+          tcp dport 9100 @@SADDR@@ { @@SCRAPE_CIDR@@ } accept
+          tcp dport 9100 drop
+        }
+"""
+
+# node_exporter is baked but NOT enabled for boot, and cloud-init starts it only
+# AFTER the nft ruleset is applied — so :9100 is never briefly open to the world
+# during boot. Before the runner, so metrics are live for the whole job.
+_METRICS_START = "  - systemctl start husk-node-exporter.service\n"
+
+
 def render_cloud_init(
-    jit_blob: str, runner_url: str, *, gpu: bool = False, prebaked: bool = False
+    jit_blob: str,
+    runner_url: str,
+    *,
+    gpu: bool = False,
+    prebaked: bool = False,
+    scrape_cidr: str = "",
 ) -> bytes:
     """Render the cloud-init user-data for one slot.
 
@@ -343,19 +383,37 @@ def render_cloud_init(
 
     `gpu=True` adds GPU support in either mode: the install half only on a stock
     image, the runtime half (`modprobe` + `nvidia-ctk cdi generate`) always — the
-    kmod load and CDI spec are hardware-dependent and can't be baked."""
+    kmod load and CDI spec are hardware-dependent and can't be baked.
+
+    `scrape_cidr` turns on in-guest metrics: it opens `:9100` to that source only
+    and starts the (baked) node_exporter. **Opt-in and fail-closed** — unset means
+    no ingress rule and no exporter running, i.e. nothing listening, which is why
+    a pool whose scraper source isn't known yet can simply leave it out. Requires
+    `prebaked` (node_exporter only exists in the golden image); the config loader
+    rejects the combination, and it is ignored here on a stock image."""
+    metrics = scrape_cidr if (scrape_cidr and prebaked) else ""
     if prebaked:
         template = PREBAKED_RUNNER_CLOUD_INIT
         if gpu:
             template = template.replace(
                 _PREBAKED_GPU_ANCHOR, _GPU_RUNTIME + _PREBAKED_GPU_ANCHOR, 1
             )
+        template = template.replace(
+            "@@METRICS_START@@\n", _METRICS_START if metrics else ""
+        )
     else:
         template = RUNNER_CLOUD_INIT
         if gpu:
             template = template.replace(
                 _FIREWALL_ANCHOR, _GPU_INSTALL + _GPU_RUNTIME + _FIREWALL_ANCHOR, 1
             )
+    ingress = ""
+    if metrics:
+        saddr = "ip6 saddr" if ":" in metrics else "ip saddr"
+        ingress = _METRICS_INGRESS.replace("@@SADDR@@", saddr).replace(
+            "@@SCRAPE_CIDR@@", metrics
+        )
+    template = template.replace("@@METRICS_INGRESS@@", ingress)
     return (
         template.replace("@@JIT@@", jit_blob)
         .replace("@@RUNNER_URL@@", runner_url)

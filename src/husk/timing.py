@@ -33,6 +33,16 @@ class SlotTiming:
     last_boot_seconds: float | None = None
     last_cloudinit_seconds: float | None = None
     last_recycle_seconds: float | None = None
+    # systemd-analyze phase durations from the last husk-bootreport block (distinct
+    # from last_boot_seconds above, which is the controller-observed create→ACTIVE
+    # spawn time). Any may stay None if the report is absent/unparseable.
+    last_boot_kernel_seconds: float | None = None
+    last_boot_initrd_seconds: float | None = None
+    last_boot_userspace_seconds: float | None = None
+    last_boot_total_seconds: float | None = None
+    # Slowest entries from the two blame sections: (name, seconds), slowest first.
+    last_boot_units: list[tuple[str, float]] = field(default_factory=list)
+    last_boot_stages: list[tuple[str, float]] = field(default_factory=list)
 
     @property
     def total_seconds(self) -> float:
@@ -71,3 +81,23 @@ class SlotTiming:
             self.last_cloudinit_seconds = now - self.active_at
         if self.issued_at is not None:
             self.last_recycle_seconds = now - self.issued_at
+
+    def on_bootreport(
+        self,
+        *,
+        kernel: float | None,
+        initrd: float | None,
+        userspace: float | None,
+        total: float | None,
+        units: list[tuple[str, float]] | None = None,
+        stages: list[tuple[str, float]] | None = None,
+    ) -> None:
+        """Record the systemd-analyze phase durations and slowest-unit/stage blame
+        entries parsed from the slot's husk-bootreport console block (see
+        husk.bootreport)."""
+        self.last_boot_kernel_seconds = kernel
+        self.last_boot_initrd_seconds = initrd
+        self.last_boot_userspace_seconds = userspace
+        self.last_boot_total_seconds = total
+        self.last_boot_units = list(units or [])
+        self.last_boot_stages = list(stages or [])

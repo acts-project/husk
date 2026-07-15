@@ -85,3 +85,114 @@ def test_slottiming_unit():
     assert t.last_boot_seconds == 60
     assert t.last_cloudinit_seconds == 60
     assert t.last_recycle_seconds == 120
+
+
+def test_slottiming_on_bootreport():
+    t = SlotTiming(first_seen=0.0)
+    t.on_bootreport(kernel=2.1, initrd=None, userspace=8.9, total=11.0)
+    assert t.last_boot_kernel_seconds == 2.1
+    assert t.last_boot_initrd_seconds is None
+    assert t.last_boot_userspace_seconds == 8.9
+    assert t.last_boot_total_seconds == 11.0
+
+
+# A minimal husk-bootreport console block (systemd-analyze time only).
+def _block(ts: str, total: float) -> str:
+    return (
+        f"===== husk-bootreport {ts} =====\n"
+        f"Startup finished in 2.1s (kernel) + 8.9s (userspace) = {total}s\n"
+        "===== husk-bootreport end =====\n"
+    )
+
+
+# A block that also carries the two blame sections (as journald prefixes them).
+def _block_with_blame(ts: str) -> str:
+    return (
+        f"[   1.0] sh[1]: ===== husk-bootreport {ts} =====\n"
+        "[   1.1] systemd-analyze[2]: Startup finished in 2.1s (kernel) = 11.0s\n"
+        "[   1.2] sh[3]: 2.923s cloud-init-local.service\n"
+        "[   1.3] cloud-init[4]:      02.26400s (init-local/search-OpenStackLocal)\n"
+        "[   1.4] sh[5]: ===== husk-bootreport end =====\n"
+    )
+
+
+def _console_reads(backend) -> int:
+    return len(backend.console_reads)
+
+
+def test_bootreport_captured_from_console(clock):
+    runner = make_runner(id=1, name="husk-1-c0", status="online", busy=False)
+    backend = FakeBackend(slots=[make_slot(id="vm-1", name="husk-1", status="ACTIVE")])
+    backend.console_text = _block("2026-07-10T12:00:00Z", 11.0)
+    github = FakeGitHub(runners=[runner])
+    ctrl = make_controller(backend, github, make_config(max_total=1), clock)
+
+    snap = ctrl.tick()
+
+    t = ctrl.timing["vm-1"]
+    assert t.last_boot_kernel_seconds == 2.1
+    assert t.last_boot_userspace_seconds == 8.9
+    assert t.last_boot_total_seconds == 11.0
+    assert snap.slots[0].boot_total_seconds == 11.0
+
+    # Captured once: a subsequent tick must not re-read the console.
+    reads = _console_reads(backend)
+    ctrl.tick()
+    assert _console_reads(backend) == reads
+
+
+def test_bootreport_blame_surfaces_in_snapshot(clock):
+    runner = make_runner(id=1, name="husk-1-c0", status="online", busy=False)
+    backend = FakeBackend(slots=[make_slot(id="vm-1", name="husk-1", status="ACTIVE")])
+    backend.console_text = _block_with_blame("2026-07-10T12:00:00Z")
+    github = FakeGitHub(runners=[runner])
+    ctrl = make_controller(backend, github, make_config(max_total=1), clock)
+
+    snap = ctrl.tick()
+
+    v = snap.slots[0]
+    assert v.boot_units[0] == ("cloud-init-local.service", 2.9)
+    assert v.boot_cloudinit_stages[0] == ("init-local/search-OpenStackLocal", 2.3)
+
+
+def test_bootreport_stale_block_rejected_until_new_ts(clock):
+    runner = make_runner(id=1, name="husk-1-c0", status="online", busy=False)
+    backend = FakeBackend(slots=[make_slot(id="vm-1", name="husk-1", status="ACTIVE")])
+    backend.console_text = _block("2026-07-10T12:00:00Z", 11.0)
+    github = FakeGitHub(runners=[runner])
+    ctrl = make_controller(backend, github, make_config(max_total=1), clock)
+
+    ctrl.tick()
+    assert ctrl.timing["vm-1"].last_boot_total_seconds == 11.0
+
+    # Re-arm capture exactly as the next bring-up (_rebuild_then_start) does: clear
+    # captured/attempts but KEEP bootreport_last_ts, so the previous cycle's block —
+    # still in the console ring buffer — is rejected.
+    ctrl.bootreport_captured.discard("vm-1")
+    ctrl.bootreport_attempts.pop("vm-1", None)
+
+    ctrl.tick()  # console still shows the old ts -> rejected, timing unchanged
+    assert "vm-1" not in ctrl.bootreport_captured
+    assert ctrl.timing["vm-1"].last_boot_total_seconds == 11.0
+
+    backend.console_text = _block("2026-07-10T12:05:00Z", 22.0)  # newer cycle flushed
+    ctrl.tick()
+    assert "vm-1" in ctrl.bootreport_captured
+    assert ctrl.timing["vm-1"].last_boot_total_seconds == 22.0
+
+
+def test_bootreport_attempts_bounded(clock):
+    # No block on the console (block never flushes): reads stop at the cap.
+    from husk.controller import BOOTREPORT_MAX_ATTEMPTS
+
+    runner = make_runner(id=1, name="husk-1-c0", status="online", busy=False)
+    backend = FakeBackend(slots=[make_slot(id="vm-1", name="husk-1", status="ACTIVE")])
+    backend.console_text = "no bootreport here\n"
+    github = FakeGitHub(runners=[runner])
+    ctrl = make_controller(backend, github, make_config(max_total=1), clock)
+
+    for _ in range(BOOTREPORT_MAX_ATTEMPTS + 3):
+        ctrl.tick()
+
+    assert _console_reads(backend) == BOOTREPORT_MAX_ATTEMPTS
+    assert ctrl.timing["vm-1"].last_boot_total_seconds is None

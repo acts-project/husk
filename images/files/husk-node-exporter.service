@@ -1,0 +1,31 @@
+[Unit]
+Description=Husk in-guest resource metrics (node_exporter) for the runner slot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Its own unprivileged user — NEVER `runner`. The untrusted job runs as `runner`,
+# and must not be able to signal, ptrace or replace the exporter.
+User=node_exporter
+Group=node_exporter
+# No --web.config.file: no TLS, no basic-auth. Access control is purely at the
+# network layer — the nftables :9100 source allowlist that cloud-init lays down
+# with the egress ruleset (observability.md, "Security model"). The data is
+# low-value host metrics, and baking a cert or a bcrypt hash would put a
+# credential on a box that executes untrusted CI jobs to protect it.
+ExecStart=/usr/local/bin/node_exporter --web.listen-address=:9100
+Restart=on-failure
+RestartSec=5
+# Read-only view of the host: the exporter only ever reads /proc, /sys and
+# statfs()es mountpoints. NB: no PrivateTmp — a private /tmp would make the
+# filesystem collector report a synthetic tmpfs instead of the real /tmp, which
+# is one of the fill numbers we're here to see.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+
+# NB: no [Install] — the unit is NOT enabled for boot. cloud-init `systemctl
+# start`s it each cycle (like husk-runner.service), and only for pools with a
+# `scrape_cidr`. Crucially it starts AFTER the firewall is applied, so :9100 is
+# never briefly open to the world during boot.

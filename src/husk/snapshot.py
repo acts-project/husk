@@ -14,6 +14,16 @@ from husk.ops import OpView
 from husk.slot import SlotState
 
 
+def _round1(v: float | None) -> float | None:
+    return round(v, 1) if v is not None else None
+
+
+def _round_pairs(
+    pairs: list[tuple[str, float]] | None,
+) -> tuple[tuple[str, float], ...]:
+    return tuple((name, round(sec, 1)) for name, sec in pairs) if pairs else ()
+
+
 @dataclass(frozen=True)
 class SlotView:
     """A flat, serializable summary of one classified slot."""
@@ -27,6 +37,8 @@ class SlotView:
     runner_status: str | None  # "online" | "offline" | None
     busy: bool  # runner currently running a job
     cycle: int  # recycle cycle (durable husk-cycle)
+    ip: str | None = None  # guest fixed IP (OpenStack) — metrics http_sd target
+    host: str | None = None  # libvirt host name — metrics routes via its proxy
     cloudinit_seconds: float | None = (
         None  # last ACTIVE→runner-online (cloud-init step)
     )
@@ -34,6 +46,28 @@ class SlotView:
     live_fraction: float | None = (
         None  # (busy+idle) / total tracked ("available to serve")
     )
+    boot_seconds: float | None = None  # spawn: issue→ACTIVE (controller clock)
+    # systemd-analyze guest boot phases from the last husk-bootreport (seconds) —
+    # a sub-breakdown of the cloud-init window, on the *guest's* clock.
+    boot_kernel_seconds: float | None = None
+    boot_initrd_seconds: float | None = None
+    boot_userspace_seconds: float | None = None
+    boot_total_seconds: float | None = None
+    # Slowest blame entries from the report: [name, seconds], slowest first.
+    boot_units: tuple[tuple[str, float], ...] = ()
+    boot_cloudinit_stages: tuple[tuple[str, float], ...] = ()
+
+    def __post_init__(self) -> None:
+        # JSON has no tuples, so a serialize round-trip (to_dict → from_dict) turns
+        # these into lists-of-lists; coerce back so equality/round-trip is stable.
+        object.__setattr__(self, "boot_units", _as_pairs(self.boot_units))
+        object.__setattr__(
+            self, "boot_cloudinit_stages", _as_pairs(self.boot_cloudinit_stages)
+        )
+
+
+def _as_pairs(pairs) -> tuple[tuple[str, float], ...]:
+    return tuple((name, sec) for name, sec in pairs)
 
 
 @dataclass(frozen=True)
@@ -81,6 +115,8 @@ class ControllerState:
                     runner_status=runner.status if runner else None,
                     busy=runner.busy if runner else False,
                     cycle=slot.cycle,
+                    ip=slot.ip,
+                    host=slot.host,
                     cloudinit_seconds=(
                         round(t.last_cloudinit_seconds, 1)
                         if t is not None and t.last_cloudinit_seconds is not None
@@ -92,6 +128,27 @@ class ControllerState:
                         else None
                     ),
                     live_fraction=round(lf, 3) if lf is not None else None,
+                    boot_seconds=_round1(
+                        t.last_boot_seconds if t is not None else None
+                    ),
+                    boot_kernel_seconds=_round1(
+                        t.last_boot_kernel_seconds if t is not None else None
+                    ),
+                    boot_initrd_seconds=_round1(
+                        t.last_boot_initrd_seconds if t is not None else None
+                    ),
+                    boot_userspace_seconds=_round1(
+                        t.last_boot_userspace_seconds if t is not None else None
+                    ),
+                    boot_total_seconds=_round1(
+                        t.last_boot_total_seconds if t is not None else None
+                    ),
+                    boot_units=_round_pairs(
+                        t.last_boot_units if t is not None else None
+                    ),
+                    boot_cloudinit_stages=_round_pairs(
+                        t.last_boot_stages if t is not None else None
+                    ),
                 )
             )
         return cls(

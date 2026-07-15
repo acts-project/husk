@@ -46,6 +46,14 @@ class RunnerConfig:
     runner_group_id: int
     gpu: bool = False  # GPU pools: cloud-init activates the NVIDIA driver + CDI
     prebaked: bool = False  # golden-image pools: skip the install steps (baked in)
+    # Source allowed to scrape the slot's node_exporter on :9100 — the sole access
+    # control for it (no TLS/auth). Per-pool because the client differs by backend:
+    # OpenStack = central Prometheus, which scrapes the guest directly; libvirt =
+    # the host's bridge, because the scrape is issued FROM the hypervisor (huskd
+    # SSHes in and curls the guest), so the bridge is the only client it ever sees.
+    # Empty (default) = no ingress rule, exporter not started — fail-closed, so a
+    # pool whose scraper source isn't known yet just leaves it unset.
+    scrape_cidr: str = ""
 
     @property
     def url(self) -> str:
@@ -120,6 +128,11 @@ class ControllerConfig:
     # Always on (the only way huskctl reads state); must be set.
     http_addr: str = "127.0.0.1:9100"
     shrink_ticks: int = 3
+    # Where central Prometheus reaches THIS huskd. `/sd/targets` hands it out as the
+    # address of the proxied libvirt targets (their guests are private, so the scrape
+    # comes back through huskd). Empty → falls back to http_addr, which is right
+    # unless huskd sits behind a NAT/ingress and is reached on a different address.
+    advertise_addr: str = ""
 
 
 @dataclass(frozen=True)
@@ -172,6 +185,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         runner_group_id: int = 1
         gpu: bool = False
         prebaked: bool = False
+        scrape_cidr: str = ""
 
     class _Host(BaseModel):
         name: str
@@ -220,6 +234,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         lock_path: str = "/tmp/huskd.lock"
         http_addr: str = "127.0.0.1:9100"
         shrink_ticks: int = 3
+        advertise_addr: str = ""
 
     class _Settings(BaseSettings):
         model_config = SettingsConfigDict(
@@ -294,6 +309,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         lock_path=s.controller.lock_path,
         http_addr=s.controller.http_addr,
         shrink_ticks=s.controller.shrink_ticks,
+        advertise_addr=s.controller.advertise_addr,
     )
 
     configs = [_pool_config(p, github, controller) for p in s.pool]
@@ -307,6 +323,15 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
             f"duplicate vm_prefix across pools: {prefixes} — pools must mint "
             "distinct VM/runner names (GitHub runner APIs are repo-wide)"
         )
+    # node_exporter only exists in the golden image, so scrape_cidr on a stock-image
+    # pool would open :9100 to a port with nothing behind it. Fail loudly rather
+    # than silently not collecting the metrics someone just asked for.
+    for c in configs:
+        if c.runner.scrape_cidr and not c.runner.prebaked:
+            raise RuntimeError(
+                f"pool {c.backend.name}: scrape_cidr requires prebaked = true "
+                "(node_exporter is baked into the golden image; a stock image has none)"
+            )
     return configs
 
 
@@ -352,6 +377,7 @@ def _pool_config(p, github: GithubConfig, controller: ControllerConfig) -> Confi
             runner_group_id=p.runner.runner_group_id,
             gpu=p.runner.gpu,
             prebaked=p.runner.prebaked,
+            scrape_cidr=p.runner.scrape_cidr,
         ),
         backend=backend,
         timeouts=TimeoutsConfig(
