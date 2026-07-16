@@ -6,8 +6,8 @@ requires-python = ">=3.11"
 dependencies = [
     "openstacksdk",
     "requests",
-    "typer>=0.12",
-    "pydantic-settings>=2",
+    "typer>=0.26.8",
+    "pydantic-settings>=2.14.2",
     "rich>=13",
     # Pure-Python OCI client for pulling golden VM images (no oras CLI dep). Shared
     # by BOTH backends now — the controller pulls one qcow2 and fans it to libvirt
@@ -24,9 +24,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff>=0.15"]
+dev = ["pytest", "ruff>=0.15.20"]
 # libvirt backend — kept optional so the OpenStack/CI path needs no libvirt headers.
-libvirt = ["libvirt-python>=10"]
+libvirt = ["libvirt-python>=12.5.0"]
 
 [project.scripts]
 huskd = "husk.cli:huskd"
