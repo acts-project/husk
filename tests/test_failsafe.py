@@ -84,6 +84,35 @@ def test_rebuild_failure_surfaces_on_the_slot_then_clears(clock):
     assert v.error is None  # cleared
 
 
+def test_backend_nonfatal_warning_surfaces_on_the_slot(clock):
+    # A non-fatal backend warning (e.g. a swallowed metadata-write 500) is folded
+    # into the same per-slot error column, so it's visible without the log.
+    backend = FakeBackend(slots=[make_slot(id="vm-1", status="ACTIVE")])
+    backend.warnings = {"vm-1": (1000.0, "metadata write failed: HTTP 500 CernLanDB")}
+    ctrl = _run(
+        backend,
+        FakeGitHub(runners=[make_runner(name="husk-1-c0")]),
+        make_config(),
+        clock,
+    )
+
+    ctrl.tick()
+    v = next(s for s in ctrl.snapshot.slots if s.id == "vm-1")
+    assert v.error == "metadata write failed: HTTP 500 CernLanDB"
+
+
+def test_fatal_error_wins_over_a_backend_warning(clock):
+    # If a slot has both, the fatal action error takes the column (more actionable).
+    backend = FakeBackend(slots=[make_slot(id="vm-1", status="SHUTOFF")])
+    backend.raise_on_rebuild = True
+    backend.warnings = {"vm-1": (1000.0, "metadata write failed")}
+    ctrl = _run(backend, FakeGitHub(), make_config(), clock)
+
+    ctrl.tick()
+    v = next(s for s in ctrl.snapshot.slots if s.id == "vm-1")
+    assert "rebuild failed" in v.error  # fatal overrides the warning
+
+
 def test_busy_over_timeout_stop_not_destroy(clock):
     runner = make_runner(name="husk-1-c0", busy=True)
     backend = FakeBackend(slots=[make_slot(id="vm-1", name="husk-1", status="ACTIVE")])

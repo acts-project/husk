@@ -380,7 +380,7 @@ class Controller:
             timing=self.timing,
             ops=self._backend_ops(),
             image_ref=self.cfg.backend.image_ref,
-            errors=self.slot_errors,
+            errors=self._all_errors(),
         )
         log.debug(
             "tick %d done: %s",
@@ -413,7 +413,7 @@ class Controller:
             timing=self.timing,
             ops=self._backend_ops(),
             image_ref=self.cfg.backend.image_ref,
-            errors=self.slot_errors,
+            errors=self._all_errors(),
         )
         return self.snapshot
 
@@ -777,6 +777,14 @@ class Controller:
     def _state_age(self, slot_id: str, now: float) -> float:
         entry = self.first_seen_state.get(slot_id)
         return now - entry[1] if entry else 0.0
+
+    def _all_errors(self) -> dict[str, tuple[float, str]]:
+        """Per-slot errors for the dashboard: the backend's non-fatal warnings
+        (e.g. swallowed metadata-write 500s) overlaid by our fatal action failures,
+        so a fatal error wins when a slot has both."""
+        combined = dict(self.backend.slot_warnings())
+        combined.update(self.slot_errors)
+        return combined
 
     def _safe(self, fn, what: str, *, slot_id: str | None = None) -> None:
         try:

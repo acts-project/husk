@@ -90,6 +90,9 @@ _API_TIMEOUT_S = 30
 class OpenStackBackend:
     def __init__(self, cfg: BackendConfig) -> None:
         self.cfg = cfg
+        # Non-fatal per-slot issues (swallowed metadata-write failures) for the
+        # dashboard — slot_id -> (epoch, message). See slot_warnings().
+        self._warnings: dict[str, tuple[float, str]] = {}
         self.conn = openstack.connect(cloud=cfg.cloud, api_timeout=_API_TIMEOUT_S)
         flavor = self.conn.compute.find_flavor(cfg.flavor_name)
         if not flavor:
@@ -177,6 +180,9 @@ class OpenStackBackend:
             for s in servers
             if (getattr(s, "metadata", None) or {}).get("managed-by") == MANAGED_BY
         ]
+        # Drop warnings for slots that no longer exist (keeps the dict bounded).
+        live = {s.id for s in slots}
+        self._warnings = {k: v for k, v in self._warnings.items() if k in live}
         log.debug(
             "listed %d server(s), %d managed-by=%s",
             len(servers),
@@ -184,6 +190,9 @@ class OpenStackBackend:
             MANAGED_BY,
         )
         return slots
+
+    def slot_warnings(self) -> dict[str, tuple[float, str]]:
+        return dict(self._warnings)
 
     # ----------------------------------------------------------- image sync
     def sync_images(self, cfg: BackendConfig | None = None) -> None:
@@ -355,7 +364,10 @@ class OpenStackBackend:
             raise RuntimeError(
                 f"rebuild rejected: HTTP {resp.status_code}: {resp.text[:300]}"
             )
-        # Update durable state so a restart recovers cycle + provision clock.
+        # Update durable state so a restart recovers cycle + provision clock. A
+        # metadata-write failure (e.g. CERN's CernLanDB 500) must NOT fail the
+        # rebuild — the rebuild action above already succeeded — but it's no longer
+        # swallowed silently: it's recorded as a per-slot warning the dashboard shows.
         try:
             self.conn.compute.set_server_metadata(
                 slot.id,
@@ -364,8 +376,10 @@ class OpenStackBackend:
                     "husk-provisioned-at": f"{time.time():.0f}",
                 },
             )
-        except Exception:
+            self._warnings.pop(slot.id, None)
+        except Exception as e:
             log.warning("could not update husk metadata on %s", slot.id, exc_info=True)
+            self._warnings[slot.id] = (time.time(), f"metadata write failed: {e}")
 
     def mark_active(self, slot: Slot) -> None:
         try:
@@ -373,8 +387,10 @@ class OpenStackBackend:
                 slot.id, **{"husk-provisioned-at": f"{time.time():.0f}"}
             )
             log.debug("marked %s ACTIVE; reset husk-provisioned-at", slot.id)
-        except Exception:
+            self._warnings.pop(slot.id, None)
+        except Exception as e:
             log.warning("could not mark %s active (metadata)", slot.id, exc_info=True)
+            self._warnings[slot.id] = (time.time(), f"metadata write failed: {e}")
 
     def start_slot(self, slot: Slot) -> None:
         self._action(slot, {"os-start": None})

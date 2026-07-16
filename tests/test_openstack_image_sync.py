@@ -95,6 +95,7 @@ def _backend(ref: str = REF, servers=None) -> OpenStackBackend:
         name="os", type="openstack", min_ready=1, max_total=1, image_ref=ref
     )
     b.conn = FakeConn(servers or [])
+    b._warnings = {}
     b._sync = FakeSync(CURR)
     b._backend_ref = ref
     b._synced_ref = ""

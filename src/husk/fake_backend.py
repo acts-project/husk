@@ -82,6 +82,9 @@ class FakeBackend:
     def capacity(self) -> Capacity:
         return self.cap
 
+    def slot_warnings(self) -> dict[str, tuple[float, str]]:
+        return dict(getattr(self, "warnings", {}))
+
     def image_ready(self, slot: Slot) -> bool:
         return self._image_ready
 

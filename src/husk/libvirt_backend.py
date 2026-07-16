@@ -857,3 +857,6 @@ class LibvirtBackend:
                 exc_info=True,
             )
             return Capacity(can_create=True, free_instances=10**6)
+
+    def slot_warnings(self) -> dict[str, tuple[float, str]]:
+        return {}  # libvirt metadata is written on-host; no swallowed API warnings yet
