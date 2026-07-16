@@ -1,0 +1,26 @@
+version: 2
+
+updates:
+  # GitHub Actions — Dependabot bumps the SHA pins (keeping the version comment
+  # accurate). One grouped PR for the whole ecosystem.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # Python dependencies (pyproject.toml + uv.lock). One grouped PR for the whole
+  # ecosystem.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      python:
+        patterns: ["*"]

@@ -1,0 +1,9 @@
+# zizmor configuration (https://docs.zizmor.sh/configuration/).
+# Require every action reference to be pinned to a full commit SHA — tag/branch
+# refs (e.g. @v5) are mutable and a supply-chain risk. pinact keeps the pins in
+# sync and Dependabot bumps them (grouped, with a 7-day cooldown).
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        "*": hash-pin

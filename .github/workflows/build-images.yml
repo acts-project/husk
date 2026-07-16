@@ -37,7 +37,9 @@ jobs:
         variant: [base, gpu]
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
 
       - name: Install build tooling
         run: |
@@ -88,24 +90,28 @@ jobs:
 
       - name: Set up ORAS
         if: github.event_name == 'workflow_dispatch'
-        uses: oras-project/setup-oras@v2
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
 
       - name: Publish to ghcr.io
         if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Kept out of the inline script so an attacker-controllable value can't
+          # expand into shell code (zizmor template-injection).
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
           # shellcheck disable=SC1091
           source images/versions.env
 
-          version="${{ github.event.inputs.version }}"
+          version="$INPUT_VERSION"
           [ -n "$version" ] || version="0.0.0-$(date +%Y%m%d)"
           sha="${GITHUB_SHA::7}"
           repo="ghcr.io/${{ github.repository_owner }}/husk-${{ matrix.variant }}"
           img="husk-${{ matrix.variant }}.qcow2"
 
-          echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          echo "$GH_TOKEN" | oras login ghcr.io -u "$ACTOR" --password-stdin
 
           oras push "${repo}:${version},${sha}" \
             --artifact-type application/vnd.husk.vmimage \
