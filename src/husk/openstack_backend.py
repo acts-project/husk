@@ -81,7 +81,9 @@ def _fixed_ip(server) -> str | None:
 
 
 class OpenStackBackend:
-    def __init__(self, cfg: BackendConfig) -> None:
+    def __init__(
+        self, cfg: BackendConfig, *, image_sync: ImageSync | None = None
+    ) -> None:
         self.cfg = cfg
         self.conn = openstack.connect(cloud=cfg.cloud)
         flavor = self.conn.compute.find_flavor(cfg.flavor_name)
@@ -98,7 +100,9 @@ class OpenStackBackend:
         #    rotating self.image_id; sync_images() does that before any create. The
         #    same artifact serves the libvirt hosts (see image_sync.py).
         #  * image_name (legacy): a Glance image already present, resolved once here.
-        self._sync = ImageSync(cfg.image_cache_dir or None)
+        # Shared across pools (huskd builds it once) so the registry pull is
+        # single-flighted; a fresh default keeps one-shots/tests self-contained.
+        self._sync = image_sync or ImageSync()
         self._backend_ref = cfg.image_ref or ""
         self._synced_ref = ""  # the ref behind the current image_id (sync no-op guard)
         self._image_digest: str | None = None

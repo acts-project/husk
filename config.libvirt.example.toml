@@ -10,6 +10,7 @@ pat_env = "GH_TOKEN"          # secret from env; never written to this file
 lock_path = "/tmp/huskd.lock"
 http_addr = "127.0.0.1:9100"
 shrink_ticks = 3
+# image_cache_dir = "/var/cache/husk/images"   # optional; default ~/.cache/husk/images. Shared by every pool
 
 [[pool]]
 name = "libvirt-gpu"          # → backend name + default vm_prefix "husk-libvirt-gpu"
@@ -45,7 +46,6 @@ max_total = 2                          # one GPU host, one GPU → 1 (raise as t
 #      this while huskd runs hot-reloads: the new image is staged and idle slots
 #      drain onto it (running jobs finish first), old goldens are GC'd.
 image_ref = "ghcr.io/acts-project/husk-gpu:v1"
-# image_cache_dir = "/var/cache/husk/images"   # optional; default ~/.cache/husk/images
 #
 #  (b) image_name: a qcow2 filename you placed in each host's pool dir yourself
 #      (the manual path — no registry, no auto-sync/drain).

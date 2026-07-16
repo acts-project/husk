@@ -102,7 +102,6 @@ class BackendConfig:
     # qcow2 filename already present in the host pool (the manual/local path).
     image_name: str = ""
     image_ref: str = ""  # libvirt: OCI ref pulled+staged by the controller
-    image_cache_dir: str = ""  # controller-local oras pull cache ("" → default)
     # OpenStack-only (optional / unused for the libvirt backend)
     cloud: str = ""
     flavor_name: str = ""
@@ -128,6 +127,10 @@ class ControllerConfig:
     # Always on (the only way huskctl reads state); must be set.
     http_addr: str = "127.0.0.1:9100"
     shrink_ticks: int = 3
+    # Controller-local oras pull cache, shared by every pool ("" → default
+    # ~/.cache/husk/images). Process-wide: the registry golden is pulled once here
+    # and fanned out to each pool's hosts/Glance.
+    image_cache_dir: str = ""
     # Where central Prometheus reaches THIS huskd. `/sd/targets` hands it out as the
     # address of the proxied libvirt targets (their guests are private, so the scrape
     # comes back through huskd). Empty → falls back to http_addr, which is right
@@ -206,7 +209,6 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         vm_prefix: str = ""  # defaults to husk-<slug(pool name)>
         image_name: str = ""
         image_ref: str = ""
-        image_cache_dir: str = ""
         min_ready: int = 1
         max_total: int = 2
         # OpenStack-only (optional for the libvirt backend)
@@ -235,6 +237,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         http_addr: str = "127.0.0.1:9100"
         shrink_ticks: int = 3
         advertise_addr: str = ""
+        image_cache_dir: str = ""
 
     class _Settings(BaseSettings):
         model_config = SettingsConfigDict(
@@ -310,6 +313,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         http_addr=s.controller.http_addr,
         shrink_ticks=s.controller.shrink_ticks,
         advertise_addr=s.controller.advertise_addr,
+        image_cache_dir=s.controller.image_cache_dir,
     )
 
     configs = [_pool_config(p, github, controller) for p in s.pool]
@@ -345,7 +349,6 @@ def _pool_config(p, github: GithubConfig, controller: ControllerConfig) -> Confi
         cloud=b.cloud,
         image_name=b.image_name,
         image_ref=b.image_ref,
-        image_cache_dir=b.image_cache_dir,
         flavor_name=b.flavor_name,
         network_name=b.network_name,
         keypair=b.keypair,

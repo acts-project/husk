@@ -70,6 +70,36 @@ def _config(tmp_path, monkeypatch, http_addr: str) -> str:
     return str(cfg)
 
 
+def test_build_forwards_shared_image_sync(tmp_path, monkeypatch):
+    # huskd builds ONE ImageSync and hands the same instance to every pool's
+    # backend, so the registry pull is single-flighted and the cache is shared.
+    import husk.github as gh
+    import husk.libvirt_backend as lb
+    import husk.openstack_backend as ob
+    from husk.cli import _build
+    from husk.config import load_configs
+
+    captured = []
+
+    class Cap:
+        def __init__(self, cfg, *, image_sync=None):
+            captured.append(image_sync)
+
+    monkeypatch.setattr(lb, "LibvirtBackend", Cap)
+    monkeypatch.setattr(ob, "OpenStackBackend", Cap)
+    monkeypatch.setattr(gh, "GitHubClient", lambda **kw: object())
+    monkeypatch.setenv("GH_TOKEN", "ghp_x")
+
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(_CONFIG.format(http_addr="127.0.0.1:9100"))
+    cfgs = load_configs(str(cfg_path))
+
+    sentinel = object()
+    for cfg in cfgs:
+        _build(cfg, image_sync=sentinel)
+    assert captured == [sentinel, sentinel]  # one shared instance, both backends
+
+
 def test_status_renders_all_pools(tmp_path, monkeypatch):
     snaps = _snaps()
     with serve_in_thread(lambda: snaps) as base:

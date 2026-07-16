@@ -134,6 +134,36 @@ def test_load_configs_two_pools_share_github_and_controller(tmp_path, monkeypatc
     assert gpu.backend.hosts[0].gpu_pci_addresses == ("0000:01:00.0",)
 
 
+def test_image_cache_dir_lives_on_controller(tmp_path, monkeypatch):
+    # The oras pull cache is process-wide, so it's a [controller] knob shared
+    # identically by every pool (not a per-[backend] field anymore).
+    monkeypatch.setenv("GH_TOKEN", "ghp_x")
+    toml = _MULTI_TOML.replace(
+        '[controller]\nhttp_addr = "127.0.0.1:9100"\n',
+        '[controller]\nhttp_addr = "127.0.0.1:9100"\n'
+        'image_cache_dir = "/var/cache/husk/images"\n',
+    )
+    p = tmp_path / "multi.toml"
+    p.write_text(toml)
+    cfgs = load_configs(str(p))
+    assert cfgs[0].controller.image_cache_dir == "/var/cache/husk/images"
+    assert cfgs[0].controller == cfgs[1].controller  # shared across pools
+
+
+def test_stray_backend_image_cache_dir_is_ignored(tmp_path, monkeypatch):
+    # Clean cutover: image_cache_dir moved out of [pool.backend]; a leftover one is
+    # silently dropped (pydantic extra="ignore") rather than erroring.
+    monkeypatch.setenv("GH_TOKEN", "ghp_x")
+    toml = _MULTI_TOML.replace(
+        "min_ready = 2\n", 'min_ready = 2\nimage_cache_dir = "/ignored"\n'
+    )
+    p = tmp_path / "multi.toml"
+    p.write_text(toml)
+    cfgs = load_configs(str(p))  # must not raise
+    assert not hasattr(cfgs[0].backend, "image_cache_dir")
+    assert cfgs[0].controller.image_cache_dir == ""
+
+
 def test_no_pool_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setenv("GH_TOKEN", "ghp_x")
     p = tmp_path / "empty.toml"
