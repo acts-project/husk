@@ -78,8 +78,10 @@ def test_metrics_compose_with_gpu():
     assert "modprobe nvidia" in out
 
 
-def test_loader_rejects_scrape_cidr_without_prebaked(tmp_path):
+def test_loader_rejects_scrape_cidr_without_prebaked(tmp_path, monkeypatch):
     from husk.config import load_configs
+
+    monkeypatch.setenv("GH_TOKEN", "ghp_x")  # else the PAT check fires first
 
     cfg = tmp_path / "c.toml"
     cfg.write_text(

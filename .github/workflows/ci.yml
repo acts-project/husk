@@ -1,0 +1,49 @@
+name: ci
+
+# Lint + run the pytest suite on every push and PR. No secrets needed: the
+# tests that touch a GitHub token inject a fake one (monkeypatch GH_TOKEN), and
+# the libvirt-backed tests `pytest.importorskip("libvirt")`, so the suite runs
+# green without libvirt headers or a real PAT. That's why we install only the
+# `dev` extra here (not `libvirt`) — same rationale as the OpenStack/CI path.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Install project (dev extra)
+        run: uv sync --extra dev
+
+      - name: Lint (ruff)
+        # Scoped to the package + suite; the root-level phase/one-off scripts
+        # (phase3-recycle.py, measure-standup.py, …) aren't shipped and aren't
+        # kept lint-clean.
+        run: uv run ruff check src tests
+
+      - name: Test (pytest)
+        run: uv run pytest -q
