@@ -27,14 +27,20 @@ graceful shutdown. There is **no** separate ASGI entrypoint to add — an extern
 loop, and multiple workers would fight the single-controller lock. So run exactly
 one container per config.
 
-Mount your config (and any secrets) and expose the dashboard port:
+Mount your config (and any secrets), pass the GitHub PAT (`github.pat_env`,
+default `GH_TOKEN`), and expose the dashboard port:
 
 ```sh
 docker run --rm \
   -p 9100:9100 \
   -v ./config.toml:/etc/husk/config.toml:ro \
+  -e GH_TOKEN="$(gh auth token)" \
   ghcr.io/acts-project/husk:latest
 ```
+
+For local dev, `just docker-run [config]` wraps this — it builds the image,
+mounts the config, forwards `GH_TOKEN` (falling back to `gh auth token`) and any
+`OS_*` OpenStack vars, and mounts `~/.config/openstack`.
 
 Two things the mounted config must account for:
 
