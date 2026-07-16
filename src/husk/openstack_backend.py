@@ -80,10 +80,17 @@ def _fixed_ip(server) -> str | None:
     return None
 
 
+# Per-request bound on every Nova/Glance call. Without it a hung CERN API call
+# (e.g. a rebuild POST that stalls before eventually 500-ing) blocks the pool's
+# whole reconcile thread indefinitely. This caps the stall; a slow call fails the
+# one tick and retries next, instead of wedging the loop.
+_API_TIMEOUT_S = 30
+
+
 class OpenStackBackend:
     def __init__(self, cfg: BackendConfig) -> None:
         self.cfg = cfg
-        self.conn = openstack.connect(cloud=cfg.cloud)
+        self.conn = openstack.connect(cloud=cfg.cloud, api_timeout=_API_TIMEOUT_S)
         flavor = self.conn.compute.find_flavor(cfg.flavor_name)
         if not flavor:
             raise RuntimeError(f"flavor {cfg.flavor_name!r} not found")
@@ -231,7 +238,9 @@ class OpenStackBackend:
         """A dedicated OpenStack connection for the background uploader, so its
         Glance calls never share a connection with the tick's compute calls."""
         if self._image_conn is None:
-            self._image_conn = openstack.connect(cloud=self.cfg.cloud)
+            self._image_conn = openstack.connect(
+                cloud=self.cfg.cloud, api_timeout=_API_TIMEOUT_S
+            )
         return self._image_conn
 
     def _ensure_in_glance(self, conn, resolved, report=None) -> str:
@@ -340,6 +349,7 @@ class OpenStackBackend:
             headers={
                 "OpenStack-API-Version": f"compute {self.cfg.rebuild_microversion}"
             },
+            timeout=_API_TIMEOUT_S,
         )
         if resp.status_code not in (200, 202):
             raise RuntimeError(
@@ -375,7 +385,9 @@ class OpenStackBackend:
     def _action(self, slot: Slot, body: dict) -> None:
         action = list(body)[0]
         log.debug("POST action %s on %s", action, slot.id)
-        resp = self.conn.compute.post(f"/servers/{slot.id}/action", json=body)
+        resp = self.conn.compute.post(
+            f"/servers/{slot.id}/action", json=body, timeout=_API_TIMEOUT_S
+        )
         if resp.status_code not in (200, 202):
             raise RuntimeError(
                 f"action {action} on {slot.id} rejected: "

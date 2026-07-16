@@ -99,6 +99,10 @@ class Controller:
         self.pending_start: set[str] = set()
         self.cycle_counter: dict[str, int] = {}
         self.timing: dict[str, SlotTiming] = {}
+        # Last failed backend action per slot (rebuild/start/stop/…), surfaced on the
+        # dashboard so a stuck slot's cause is visible without the logs. slot_id ->
+        # (epoch, message); cleared when the same slot's next action succeeds.
+        self.slot_errors: dict[str, tuple[float, str]] = {}
         # Boot-report (husk-bootreport) capture state, per bring-up:
         self.bootreport_captured: set[str] = set()  # got a fresh block → stop polling
         self.bootreport_attempts: dict[str, int] = {}  # console reads this bring-up
@@ -320,7 +324,11 @@ class Controller:
             elif state is SlotState.BUSY:
                 if self._state_age(s.id, now) > self.cfg.timeouts.max_job_duration_sec:
                     log.warning("slot %s busy past max_job_duration; stopping", s.id)
-                    self._safe(lambda: self.backend.stop_slot(s), f"stop {s.id}")
+                    self._safe(
+                        lambda: self.backend.stop_slot(s),
+                        f"stop {s.id}",
+                        slot_id=s.id,
+                    )
             elif state is SlotState.IDLE:
                 stale = s.image_stale
                 idle_timed_out = (
@@ -372,6 +380,7 @@ class Controller:
             timing=self.timing,
             ops=self._backend_ops(),
             image_ref=self.cfg.backend.image_ref,
+            errors=self.slot_errors,
         )
         log.debug(
             "tick %d done: %s",
@@ -404,6 +413,7 @@ class Controller:
             timing=self.timing,
             ops=self._backend_ops(),
             image_ref=self.cfg.backend.image_ref,
+            errors=self.slot_errors,
         )
         return self.snapshot
 
@@ -469,8 +479,10 @@ class Controller:
                 scrape_cidr=self.cfg.runner.scrape_cidr,
             )
             self.backend.rebuild_slot(slot, user_data=user_data, cycle=cycle)
-        except Exception:
+            self.slot_errors.pop(slot.id, None)  # cleared on a successful rebuild
+        except Exception as e:
             log.exception("rebuild of slot %s failed", slot.id)
+            self.slot_errors[slot.id] = (now, f"rebuild failed: {e}")
             return
         self.cycle_counter[slot.id] = cycle
         self.last_provision_action[slot.id] = now
@@ -498,7 +510,11 @@ class Controller:
             return  # still settling
         if slot.status == "SHUTOFF":
             log.info("slot %s rebuild settled to SHUTOFF; os-starting", slot.id)
-            self._safe(lambda: self.backend.start_slot(slot), f"start {slot.id}")
+            self._safe(
+                lambda: self.backend.start_slot(slot),
+                f"start {slot.id}",
+                slot_id=slot.id,
+            )
             self.last_provision_action[slot.id] = now  # reset grace for runner-online
             self.pending_start.discard(slot.id)
         elif slot.status == "ACTIVE":
@@ -615,7 +631,9 @@ class Controller:
                 if s.status == "ACTIVE":  # draining toward SHUTOFF, not unhealthy
                     self.last_provision_action[s.id] = now
                     self._safe(
-                        lambda: self.backend.mark_active(s), f"mark_active {s.id}"
+                        lambda: self.backend.mark_active(s),
+                        f"mark_active {s.id}",
+                        slot_id=s.id,
                     )
                     log.debug(
                         "slot %s runner gone while ACTIVE; draining (grace reset)", s.id
@@ -707,7 +725,11 @@ class Controller:
             # Persist the grace origin so stateless observers (huskctl status) and
             # a restarted controller agree with us instead of re-deriving grace
             # from the create-time metadata (which would read UNHEALTHY).
-            self._safe(lambda: self.backend.mark_active(slot), f"mark_active {slot.id}")
+            self._safe(
+                lambda: self.backend.mark_active(slot),
+                f"mark_active {slot.id}",
+                slot_id=slot.id,
+            )
             log.debug("slot %s reached ACTIVE; (re)starting startup grace", slot.id)
         self.prev_status[slot.id] = slot.status
 
@@ -720,6 +742,7 @@ class Controller:
             self.timing,
             self.bootreport_attempts,
             self.bootreport_last_ts,
+            self.slot_errors,
         ):
             for k in list(d):
                 if k not in live:
@@ -755,9 +778,12 @@ class Controller:
         entry = self.first_seen_state.get(slot_id)
         return now - entry[1] if entry else 0.0
 
-    @staticmethod
-    def _safe(fn, what: str) -> None:
+    def _safe(self, fn, what: str, *, slot_id: str | None = None) -> None:
         try:
             fn()
-        except Exception:
+            if slot_id is not None:
+                self.slot_errors.pop(slot_id, None)  # cleared on success
+        except Exception as e:
             log.exception("%s failed", what)
+            if slot_id is not None:
+                self.slot_errors[slot_id] = (self._clock(), f"{what} failed: {e}")

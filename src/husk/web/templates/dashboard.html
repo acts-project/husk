@@ -79,8 +79,12 @@ function poolHtml(p) {
         const img = !v.image
           ? `<td>-</td>`
           : `<td><span class="${v.image_stale ? "stale" : "dim"}" title="${imgTitle}">${esc(v.image)}${v.image_stale ? " ⚠" : ""}</span></td>`;
+        const errShort = v.error && v.error.length > 48 ? v.error.slice(0,48) + "…" : v.error;
+        const err = !v.error
+          ? `<td>-</td>`
+          : `<td class="stale" title="${esc(v.error)}${v.error_epoch ? " ("+ago(v.error_epoch)+")" : ""}">⚠ ${esc(errShort)}</td>`;
         return `
-        <tr>
+        <tr class="${v.error ? "errored" : ""}">
           <td>${esc(v.id)}</td><td>${esc(v.name)}</td>
           <td class="s-${v.state}">${esc(v.state)}</td>
           <td>${esc(v.status)}</td><td>${esc(v.task_state||"-")}</td>
@@ -93,6 +97,7 @@ function poolHtml(p) {
           ${img}
           ${rec}
           <td class="num">${pct(v.live_fraction)}</td>
+          ${err}
         </tr>`;
       }).join("");
     body = `<div class="tablewrap"><table><thead><tr>
@@ -101,6 +106,7 @@ function poolHtml(p) {
         <th class="num">CYCLE</th>
         <th>IMAGE</th>
         <th class="num">RECYCLE</th><th class="num">LIVE%</th>
+        <th>LAST ERROR</th>
       </tr></thead><tbody>${rows}</tbody></table></div>`;
   }
   return `<section class="pool"><div class="head">
