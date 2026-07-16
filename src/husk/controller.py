@@ -25,8 +25,10 @@ from husk.backend import ListSlotsError
 from husk.bootreport import parse_bootreport
 from husk.cloudinit import render_cloud_init
 from husk.config import Config
+from husk.demand import DemandRegistry
 from husk.slot import Runner, Slot, SlotState, classify, match_runner
 from husk.snapshot import ControllerState
+from husk.target import Target
 from husk.timing import SlotTiming
 
 log = logging.getLogger("husk.controller")
@@ -82,11 +84,22 @@ class Controller:
         *,
         clock=time.monotonic,
         reload_config: Callable[[], Config | None] | None = None,
+        target: Target | None = None,
+        demand: DemandRegistry | None = None,
     ) -> None:
         self.backend = backend
         self.github = github
         self.cfg = config
         self._clock = clock
+        # Reconcile is re-keyed pool → (target, pool). Today there is exactly one
+        # static target per pool, derived from the configured owner/repo; the App
+        # migration makes the target set dynamic without this loop changing. The
+        # demand registry is the seam reconcile reads `desired` from — an injected
+        # one lets a future centralized poller be the producer; else a private one
+        # that this same loop fills inline (identical value, Phase 0).
+        self.target = target or Target.repo(config.github.repo)
+        self.pool = config.backend.name
+        self.demand = demand or DemandRegistry()
         # Optional hot-reload hook: called once per tick from run(); returns a
         # freshly loaded Config when the file changed (else None). cli.py wires an
         # mtime-guarded loader; tests leave it None (tick() stays reload-free).
@@ -275,7 +288,7 @@ class Controller:
         # ramp-down can never drain a downscale; retiring at poweroff can. Gated by
         # the same hysteresis as the idle ramp-down (one retirement per sustained-
         # surplus window) so it doesn't thrash when `desired` oscillates.
-        desired = min(self.cfg.backend.max_total, busy + self.cfg.backend.min_ready)
+        desired = self._publish_demand(busy)
         total = len(slots)
         over = max(0, total - desired)
         if over > 0:
@@ -401,7 +414,7 @@ class Controller:
             self._first_sight(s, now)
         classified = self._classify_all(slots, runners, now)
         busy = sum(1 for _, _, st in classified if st is SlotState.BUSY)
-        desired = min(self.cfg.backend.max_total, busy + self.cfg.backend.min_ready)
+        desired = self._publish_demand(busy)
         self._generation += 1
         self.snapshot = ControllerState.from_classified(
             generation=self._generation,
@@ -416,6 +429,21 @@ class Controller:
             errors=self._all_errors(),
         )
         return self.snapshot
+
+    def _publish_demand(self, busy: int) -> int:
+        """Size this target through the demand seam: compute `desired` from the
+        observed load, publish it to the registry, and read it back.
+
+        In Phase 0 the producer and consumer are the same tick, so the read-back
+        is identical to the old inline `min(max_total, busy + min_ready)` — the
+        point is only to move the sizing behind the registry so a centralized
+        poller (Phase 1) or a webhook (Phase 4) can become the producer without
+        touching this loop. The read-back falls back to the just-computed value
+        defensively; it is never actually None here."""
+        desired = min(self.cfg.backend.max_total, busy + self.cfg.backend.min_ready)
+        self.demand.publish(self.target, self.pool, busy=busy, desired=desired)
+        got = self.demand.desired(self.target, self.pool)
+        return got if got is not None else desired
 
     def _classify_all(
         self, slots, runners, now
