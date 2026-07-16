@@ -78,10 +78,11 @@ EXPOSE 9100
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD ["python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9100/healthz', timeout=3).status==200 else 1)"]
 
-# huskd IS the ASGI host: `huskd run` drives hypercorn on the main event loop AND
-# runs the reconcile loop on a background thread under one process-wide lock, with
+# huskd IS the ASGI host: it drives hypercorn on the main event loop AND runs the
+# reconcile loop on a background thread under one process-wide lock, with
 # SIGTERM/SIGINT wired to graceful shutdown. So there is no separate uvicorn/ASGI
 # entrypoint to add — an external ASGI server would serve the Quart surface but
-# skip the reconcile loop entirely. Mount your config + secrets at these paths.
-ENTRYPOINT ["huskd", "run"]
+# skip the reconcile loop entirely. (huskd is a single-command Typer app, so the
+# daemon is `huskd <opts>` with no subcommand.) Mount config + secrets at these paths.
+ENTRYPOINT ["huskd"]
 CMD ["--config", "/etc/husk/config.toml"]

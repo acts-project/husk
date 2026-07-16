@@ -19,7 +19,7 @@ the [`build-app-image`](.github/workflows/build-app-image.yml) workflow. Pushes 
 `:X.Y.Z` and `:X.Y`. (This is the **daemon** image — distinct from the
 `husk-{base,gpu}` **VM** images above, which are the qcow2s slots boot from.)
 
-`huskd run` is the whole process: it serves the HTTP surface (dashboard +
+`huskd` is the whole process: it serves the HTTP surface (dashboard +
 `/status` `/metrics` `/healthz` `/events`) on hypercorn *and* runs the reconcile
 loop on a background thread under one process-wide lock, with SIGTERM wired to a
 graceful shutdown. There is **no** separate ASGI entrypoint to add — an external
