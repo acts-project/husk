@@ -29,6 +29,7 @@ class FakeBackend:
         self.cap = capacity
         self._image_ready = image_ready
         self.raise_on_list = False
+        self.raise_on_rebuild = False  # emulate a backend rejecting the rebuild
         self.calls: list[tuple] = []
         self._ids = itertools.count(1)
         self.console_text: str | None = None  # scripted serial console (bootreport)
@@ -57,6 +58,8 @@ class FakeBackend:
 
     def rebuild_slot(self, slot: Slot, *, user_data: bytes, cycle: int) -> None:
         self.calls.append(("rebuild", slot.id))
+        if self.raise_on_rebuild:
+            raise RuntimeError("rebuild rejected: HTTP 500")
         # Emulate Nova: rebuild starts an in-flight task, power state preserved.
         self.set_status(slot.id, task_state="rebuilding", cycle=cycle)
 
@@ -78,6 +81,9 @@ class FakeBackend:
 
     def capacity(self) -> Capacity:
         return self.cap
+
+    def slot_warnings(self) -> dict[str, tuple[float, str]]:
+        return dict(getattr(self, "warnings", {}))
 
     def image_ready(self, slot: Slot) -> bool:
         return self._image_ready

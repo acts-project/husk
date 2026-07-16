@@ -41,6 +41,8 @@ class SlotView:
     host: str | None = None  # libvirt host name — metrics routes via its proxy
     image: str | None = None  # short id of the slot's ACTIVE image (digest / glance id)
     image_stale: bool = False  # active image differs from the pool's current target
+    error: str | None = None  # last failed backend action (rebuild/start/…), if any
+    error_epoch: float | None = None  # when that error was recorded (wall-clock)
     cloudinit_seconds: float | None = (
         None  # last ACTIVE→runner-online (cloud-init step)
     )
@@ -132,8 +134,10 @@ class ControllerState:
         timing: dict | None = None,  # slot_id -> SlotTiming (optional)
         ops: list[OpView] | None = None,  # backend async ops (image staging)
         image_ref: str = "",  # pool's configured target ref → per-slot tag labels
+        errors: dict | None = None,  # slot_id -> (epoch, message) last-action failure
     ) -> "ControllerState":
         timing = timing or {}
+        errors = errors or {}
         tag = _ref_tag(image_ref)
         counts = {st.value: 0 for st in SlotState}
         views: list[SlotView] = []
@@ -156,6 +160,8 @@ class ControllerState:
                     host=slot.host,
                     image=_slot_image_label(slot.active_image, slot.image_stale, tag),
                     image_stale=slot.image_stale,
+                    error=(errors.get(slot.id) or (None, None))[1],
+                    error_epoch=(errors.get(slot.id) or (None, None))[0],
                     cloudinit_seconds=(
                         round(t.last_cloudinit_seconds, 1)
                         if t is not None and t.last_cloudinit_seconds is not None

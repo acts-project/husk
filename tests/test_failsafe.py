@@ -66,6 +66,53 @@ def test_shutoff_rebuild_not_destroy(clock):
     assert "mint" in github.ops()  # fresh JIT minted for the recycle
 
 
+def test_rebuild_failure_surfaces_on_the_slot_then_clears(clock):
+    # A rejected rebuild (e.g. CERN Nova 500) must be visible per slot on the
+    # dashboard, not just logged — and clear once a later rebuild succeeds.
+    backend = FakeBackend(slots=[make_slot(id="vm-1", status="SHUTOFF")])
+    backend.raise_on_rebuild = True
+    ctrl = _run(backend, FakeGitHub(), make_config(), clock)
+
+    ctrl.tick()  # rebuild attempt raises
+    v = next(s for s in ctrl.snapshot.slots if s.id == "vm-1")
+    assert v.error and "rebuild failed" in v.error
+    assert v.error_epoch is not None
+
+    backend.raise_on_rebuild = False  # backend recovers
+    ctrl.tick()  # rebuild now succeeds
+    v = next(s for s in ctrl.snapshot.slots if s.id == "vm-1")
+    assert v.error is None  # cleared
+
+
+def test_backend_nonfatal_warning_surfaces_on_the_slot(clock):
+    # A non-fatal backend warning (e.g. a swallowed metadata-write 500) is folded
+    # into the same per-slot error column, so it's visible without the log.
+    backend = FakeBackend(slots=[make_slot(id="vm-1", status="ACTIVE")])
+    backend.warnings = {"vm-1": (1000.0, "metadata write failed: HTTP 500 CernLanDB")}
+    ctrl = _run(
+        backend,
+        FakeGitHub(runners=[make_runner(name="husk-1-c0")]),
+        make_config(),
+        clock,
+    )
+
+    ctrl.tick()
+    v = next(s for s in ctrl.snapshot.slots if s.id == "vm-1")
+    assert v.error == "metadata write failed: HTTP 500 CernLanDB"
+
+
+def test_fatal_error_wins_over_a_backend_warning(clock):
+    # If a slot has both, the fatal action error takes the column (more actionable).
+    backend = FakeBackend(slots=[make_slot(id="vm-1", status="SHUTOFF")])
+    backend.raise_on_rebuild = True
+    backend.warnings = {"vm-1": (1000.0, "metadata write failed")}
+    ctrl = _run(backend, FakeGitHub(), make_config(), clock)
+
+    ctrl.tick()
+    v = next(s for s in ctrl.snapshot.slots if s.id == "vm-1")
+    assert "rebuild failed" in v.error  # fatal overrides the warning
+
+
 def test_busy_over_timeout_stop_not_destroy(clock):
     runner = make_runner(name="husk-1-c0", busy=True)
     backend = FakeBackend(slots=[make_slot(id="vm-1", name="husk-1", status="ACTIVE")])

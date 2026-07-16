@@ -40,6 +40,15 @@ def test_ingress_chain_narrows_only_9100():
     assert "type filter hook input priority 0; policy accept;" in out
 
 
+def test_hidden_from_the_guests_own_job():
+    # The untrusted runner must not read host metrics. Traffic to any LOCAL address
+    # (loopback or the guest's own IP) is delivered via lo, so this drops all
+    # in-guest access — and it must precede the accept so it holds even wide open.
+    out = _render(scrape_cidr="0.0.0.0/0")
+    assert 'iif "lo" tcp dport 9100 drop' in out
+    assert out.index('iif "lo" tcp dport 9100 drop') < out.index("saddr")
+
+
 def test_exporter_starts_after_the_firewall_and_before_the_runner():
     out = _render(scrape_cidr="192.168.122.1/32")
     # After the firewall: :9100 is never briefly open to the world during boot.

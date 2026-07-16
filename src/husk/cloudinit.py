@@ -346,10 +346,18 @@ _PREBAKED_GPU_ANCHOR = (
 # `@@SADDR@@` is `ip saddr`/`ip6 saddr` per the CIDR's family: inside an `inet`
 # table `ip saddr` matches v4 only, so a v6 source under `ip saddr` would never
 # match and the drop below would silently close the port.
+#
+# The `iif "lo" ... drop` hides the exporter from the guest's OWN (untrusted) job:
+# a connection to any local address — 127.0.0.1 or the guest's own fixed IP — is
+# delivered via the loopback interface, so this drops all in-guest access while the
+# external scraper (arriving on the real NIC) is unaffected. It sits BEFORE the
+# accept, so it holds even with a wide scrape_cidr, and needs no knowledge of the
+# guest's IP. The runner has no business reading host metrics.
 _METRICS_INGRESS = """\
         chain input {
           type filter hook input priority 0; policy accept;
 
+          iif "lo" tcp dport 9100 drop
           tcp dport 9100 @@SADDR@@ { @@SCRAPE_CIDR@@ } accept
           tcp dport 9100 drop
         }

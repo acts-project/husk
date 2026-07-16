@@ -80,6 +80,13 @@ class Backend(Protocol):
         """Best-effort free capacity. The controller also clamps to max_total."""
         ...
 
+    def slot_warnings(self) -> dict[str, tuple[float, str]]:
+        """Non-fatal per-slot issues the backend swallowed (e.g. a metadata-write
+        500 that didn't fail the operation), as slot_id -> (epoch, message). The
+        controller folds these into the dashboard's per-slot error column so a
+        recurring backend problem is visible instead of log-only. Default: none."""
+        return {}
+
     def console_output(self, slot: Slot, *, lines: int | None = None) -> str | None:
         """Best-effort serial-console log of the slot — for the boot report.
 

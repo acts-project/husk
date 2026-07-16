@@ -80,6 +80,28 @@ def test_stale_slot_shows_digest_not_tag():
     assert snap.slots[0].image_stale is True
 
 
+def test_slot_error_surfaced_and_round_trips():
+    slot = make_slot(id="vm-1", name="husk-1")
+    snap = ControllerState.from_classified(
+        generation=1,
+        backend="pool-a",
+        min_ready=1,
+        max_total=2,
+        desired_total=1,
+        classified=[(slot, None, SlotState.NEEDS_RECYCLE)],
+        errors={"vm-1": (1234.0, "rebuild failed: HTTP 500")},
+    )
+    v = snap.slots[0]
+    assert v.error == "rebuild failed: HTTP 500" and v.error_epoch == 1234.0
+    back = ControllerState.from_dict(json.loads(json.dumps(snap.to_dict())))
+    assert back.slots[0].error == "rebuild failed: HTTP 500"
+
+
+def test_slot_without_error_is_none():
+    snap = _snap([(make_slot(id="vm-9"), None, SlotState.IDLE)])
+    assert snap.slots[0].error is None and snap.slots[0].error_epoch is None
+
+
 def test_ref_tag_parsing():
     from husk.snapshot import _ref_tag
 
