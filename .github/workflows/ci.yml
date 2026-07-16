@@ -10,6 +10,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Run the same checks on the merge queue's temporary merge commit, so the
+  # required `test (3.x)` contexts report on the merge group (a queue entry
+  # would otherwise hang forever waiting for checks that never run).
+  merge_group:
 
 concurrency:
   group: ci-${{ github.ref }}
