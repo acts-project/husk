@@ -1,0 +1,29 @@
+# Keep the build context small and code-only, so a docs/test/script edit doesn't
+# churn the image. Only pyproject.toml, uv.lock and src/ are actually needed to
+# build the wheel (pyproject declares no readme, so README isn't required).
+.git
+.github
+.venv
+**/__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+
+# Tests + one-off phase/measurement scripts — not shipped in the image.
+tests
+scripts
+verify-phase1.py
+phase3-recycle.py
+phase3.yml
+measure-standup.py
+
+# Docs, examples, and the VM-image pipeline (its own build-images workflow).
+*.md
+examples
+images
+config.example.toml
+config.libvirt.example.toml
+cloud-init-hello.yaml
+justfile
+Dockerfile
+.dockerignore

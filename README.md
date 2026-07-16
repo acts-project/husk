@@ -11,6 +11,45 @@ the per-cycle dynamic bits (JIT config, egress firewall ruleset, start).
 - Deeper design docs: [`image-pipeline.md`](image-pipeline.md) (image ↔ cloud-init
   boundary), [`plan.md`](plan.md) (roadmap).
 
+## Running huskd in Docker
+
+The controller ships as a container image at `ghcr.io/acts-project/husk`, built by
+the [`build-app-image`](.github/workflows/build-app-image.yml) workflow. Pushes to
+`main` publish `:latest` and `:sha-<short>`; version tags (`v*`) also publish
+`:X.Y.Z` and `:X.Y`. (This is the **daemon** image — distinct from the
+`husk-{base,gpu}` **VM** images above, which are the qcow2s slots boot from.)
+
+`huskd run` is the whole process: it serves the HTTP surface (dashboard +
+`/status` `/metrics` `/healthz` `/events`) on hypercorn *and* runs the reconcile
+loop on a background thread under one process-wide lock, with SIGTERM wired to a
+graceful shutdown. There is **no** separate ASGI entrypoint to add — an external
+`uvicorn`/`gunicorn` worker would serve the web routes but skip the reconcile
+loop, and multiple workers would fight the single-controller lock. So run exactly
+one container per config.
+
+Mount your config (and any secrets) and expose the dashboard port:
+
+```sh
+docker run --rm \
+  -p 9100:9100 \
+  -v ./config.toml:/etc/husk/config.toml:ro \
+  ghcr.io/acts-project/husk:latest
+```
+
+Two things the mounted config must account for:
+
+- Set `controller.http_addr = "0.0.0.0:9100"` — the default `127.0.0.1:9100` is
+  only reachable inside the container. (The image's `HEALTHCHECK` uses
+  `127.0.0.1`, so it works either way.)
+- For k8s-style secret mounts, add `--secrets-dir` by overriding the command:
+  `... ghcr.io/acts-project/husk:latest --config /etc/husk/config.toml --secrets-dir /etc/husk/secrets`.
+
+The image carries **both** backends — OpenStack and libvirt/QEMU (the `libvirt`
+extra is compiled in). For libvirt pools, huskd reaches each host over `qemu+ssh://`
+and bridges guest metrics scrapes over that same SSH channel, so also mount an SSH
+identity and `known_hosts` for the runtime user (`/app/.ssh`), e.g.
+`-v ./husk-ssh:/app/.ssh:ro`, and point each host's `ssh_target` at it.
+
 ## Rebuilding the golden image
 
 The image is the single source of truth for everything baked into a slot. Its

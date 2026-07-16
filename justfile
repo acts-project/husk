@@ -20,6 +20,44 @@ rebuild-all: (rebuild "base") (rebuild "gpu")
 publish version:
     gh workflow run build-images.yml -f version={{version}}
 
+# ── docker ──────────────────────────────────────────────────────────────────
+
+# Local tag for the huskd daemon image (the ghcr image is ghcr.io/acts-project/husk).
+image := "husk:local"
+
+# Build the huskd container image locally.
+docker-build:
+    docker build -t {{image}} .
+
+# Mounts the config at /etc/husk/config.toml, forwards GH_TOKEN and any OS_*
+# (OpenStack) vars from your shell, and mounts ~/.config/openstack so a
+# `cloud = "..."` profile resolves inside the container. Ctrl-C stops it
+# (SIGTERM → graceful shutdown). Examples:
+#   just docker-run                     # uses ./config.toml
+#   just docker-run config.libvirt.toml
+# NB the config must bind `controller.http_addr = "0.0.0.0:9100"` to be reachable.
+# Run huskd in Docker against a local config (rebuilds the image first).
+docker-run config="config.toml": docker-build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ -f "{{config}}" ] || { echo "config not found: {{config}}" >&2; exit 1; }
+    cfg="$(cd "$(dirname "{{config}}")" && pwd)/$(basename "{{config}}")"
+
+    args=(--rm -it -p 9100:9100 -v "$cfg":/etc/husk/config.toml:ro)
+
+    # GitHub PAT (github.pat_env, default GH_TOKEN) — forward if set in the shell.
+    [ -n "${GH_TOKEN:-}" ] && args+=(-e GH_TOKEN)
+    # huskd log level passthrough.
+    [ -n "${HUSK_LOG_LEVEL:-}" ] && args+=(-e HUSK_LOG_LEVEL)
+
+    # OpenStack: forward every OS_* var, and mount clouds.yaml if present.
+    while IFS='=' read -r name _; do
+        [ -n "$name" ] && args+=(-e "$name")
+    done < <(env | grep '^OS_' || true)
+    [ -d "$HOME/.config/openstack" ] && args+=(-v "$HOME/.config/openstack":/app/.config/openstack:ro)
+
+    docker run "${args[@]}" {{image}}
+
 # ── dev ─────────────────────────────────────────────────────────────────────
 
 # Run the test suite (extra args pass through to pytest).
