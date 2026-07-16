@@ -29,9 +29,8 @@ image := "husk:local"
 docker-build:
     docker build -t {{image}} .
 
-# Mounts the config at /etc/husk/config.toml, forwards GH_TOKEN (or falls back to
-# `gh auth token`) and any OS_* (OpenStack) vars from your shell, and mounts
-# ~/.config/openstack so a
+# Mounts the config at /etc/husk/config.toml, forwards GH_TOKEN and any OS_*
+# (OpenStack) vars from your shell, and mounts ~/.config/openstack so a
 # `cloud = "..."` profile resolves inside the container. Ctrl-C stops it
 # (SIGTERM → graceful shutdown). Examples:
 #   just docker-run                     # uses ./config.toml
@@ -46,13 +45,11 @@ docker-run config="config.toml": docker-build
 
     args=(--rm -it -p 9100:9100 -v "$cfg":/etc/husk/config.toml:ro)
 
-    # GitHub PAT (github.pat_env, default GH_TOKEN): use $GH_TOKEN if exported,
-    # else fall back to the gh CLI's token. Exported + passed by NAME (-e GH_TOKEN)
-    # so the value comes from this process's env, never the docker argv / ps output.
-    : "${GH_TOKEN:=$(gh auth token 2>/dev/null || true)}"
-    export GH_TOKEN
+    # GitHub PAT (github.pat_env, default GH_TOKEN) — forwarded from the environment
+    # `just` runs in. Passed by NAME (-e GH_TOKEN) so the value comes from this
+    # process's env, never the docker argv / ps output. Export it before running.
     if [ -n "${GH_TOKEN:-}" ]; then args+=(-e GH_TOKEN); else
-        echo "warning: no GH_TOKEN and no gh CLI token — huskd will fail to auth" >&2
+        echo "warning: GH_TOKEN not set in environment — huskd will fail to auth" >&2
     fi
     # huskd log level passthrough.
     [ -n "${HUSK_LOG_LEVEL:-}" ] && args+=(-e HUSK_LOG_LEVEL)

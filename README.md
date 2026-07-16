@@ -34,13 +34,13 @@ default `GH_TOKEN`), and expose the dashboard port:
 docker run --rm \
   -p 9100:9100 \
   -v ./config.toml:/etc/husk/config.toml:ro \
-  -e GH_TOKEN="$(gh auth token)" \
+  -e GH_TOKEN \
   ghcr.io/acts-project/husk:latest
 ```
 
 For local dev, `just docker-run [config]` wraps this — it builds the image,
-mounts the config, forwards `GH_TOKEN` (falling back to `gh auth token`) and any
-`OS_*` OpenStack vars, and mounts `~/.config/openstack`.
+mounts the config, forwards `GH_TOKEN` and any `OS_*` OpenStack vars from the
+environment, and mounts `~/.config/openstack`.
 
 Two things the mounted config must account for:
 
