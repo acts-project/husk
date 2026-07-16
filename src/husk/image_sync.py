@@ -96,11 +96,31 @@ class ImageSync:
         self.cache_dir = cache_dir or _default_cache_dir()
         self._client_factory = client_factory
         self._client = None
+        # One instance is shared across all pools (huskd builds it once), so its
+        # concurrency has teeth: guard the lazy client build and single-flight the
+        # pull per content digest so two pools resolving the same new ref don't
+        # both download it.
+        self._locks_guard = threading.Lock()
+        self._digest_locks: dict[str, threading.Lock] = {}
 
     def _client_(self):
-        if self._client is None:
-            self._client = self._client_factory()
-        return self._client
+        # Two pool worker threads can race the first resolve; build the shared
+        # oras client at most once.
+        with self._locks_guard:
+            if self._client is None:
+                self._client = self._client_factory()
+            return self._client
+
+    def _digest_lock(self, digest: str) -> threading.Lock:
+        """A lock unique to a content digest — held around the pull so concurrent
+        resolves of the same digest (across pools) serialize into one download.
+        Keyed by digest, not ref: two tags can resolve to the same content, and
+        the digest is what names the cache dest."""
+        with self._locks_guard:
+            lock = self._digest_locks.get(digest)
+            if lock is None:
+                lock = self._digest_locks[digest] = threading.Lock()
+            return lock
 
     def resolve(self, ref: str, report=None) -> ResolvedImage:
         """Ensure `ref` is present in the controller cache; return its concrete
@@ -118,36 +138,44 @@ class ImageSync:
             log.debug("image %s already cached at %s", ref, cached)
             return ResolvedImage(ref=ref, digest=digest, local_path=cached)
 
-        os.makedirs(self.cache_dir, exist_ok=True)
-        # Pull into a temp dir then atomically swap into place, so an interrupted
-        # pull never leaves a half-written qcow2 that a later run treats as cached.
-        tmp = tempfile.mkdtemp(prefix=".pull-", dir=self.cache_dir)
-        stop = threading.Event()
-        threading.Thread(
-            target=self._log_pull_progress,
-            args=(ref, tmp, stop, size, report),
-            name="husk-pull-progress",
-            daemon=True,
-        ).start()
-        try:
-            log.info("pulling image %s (%s) to controller cache", ref, digest[:19])
-            # NB: don't pass allowed_media_type here — in oras-py that filters the
-            # *manifest* Accept header (not the layers), and restricting it to the
-            # qcow2 type makes the registry 404 the manifest. The default accepts
-            # the OCI manifest; the artifact's only layer is the qcow2.
-            self._client_().pull(target=ref, outdir=tmp)
-            qcow2 = self._qcow2_in(tmp)
-            if qcow2 is None:
-                raise ImageSyncError(
-                    f"artifact {ref} contained no *.qcow2 layer (got: {os.listdir(tmp)})"
-                )
-            shutil.rmtree(dest, ignore_errors=True)
-            os.replace(tmp, dest)
-            tmp = None  # consumed by the rename; don't clean it up below
-        finally:
-            stop.set()
-            if tmp is not None:
-                shutil.rmtree(tmp, ignore_errors=True)
+        # Serialize the pull per digest so two pools resolving the same new ref on
+        # a cold cache don't both download it. A pool that blocks here re-checks
+        # the cache on the far side of the lock and reuses the sibling's pull.
+        with self._digest_lock(digest):
+            cached = self._qcow2_in(dest)
+            if cached is not None:
+                log.debug("image %s cached by a sibling pull at %s", ref, cached)
+                return ResolvedImage(ref=ref, digest=digest, local_path=cached)
+            os.makedirs(self.cache_dir, exist_ok=True)
+            # Pull into a temp dir then atomically swap into place, so an interrupted
+            # pull never leaves a half-written qcow2 that a later run treats as cached.
+            tmp = tempfile.mkdtemp(prefix=".pull-", dir=self.cache_dir)
+            stop = threading.Event()
+            threading.Thread(
+                target=self._log_pull_progress,
+                args=(ref, tmp, stop, size, report),
+                name="husk-pull-progress",
+                daemon=True,
+            ).start()
+            try:
+                log.info("pulling image %s (%s) to controller cache", ref, digest[:19])
+                # NB: don't pass allowed_media_type here — in oras-py that filters the
+                # *manifest* Accept header (not the layers), and restricting it to the
+                # qcow2 type makes the registry 404 the manifest. The default accepts
+                # the OCI manifest; the artifact's only layer is the qcow2.
+                self._client_().pull(target=ref, outdir=tmp)
+                qcow2 = self._qcow2_in(tmp)
+                if qcow2 is None:
+                    raise ImageSyncError(
+                        f"artifact {ref} contained no *.qcow2 layer (got: {os.listdir(tmp)})"
+                    )
+                shutil.rmtree(dest, ignore_errors=True)
+                os.replace(tmp, dest)
+                tmp = None  # consumed by the rename; don't clean it up below
+            finally:
+                stop.set()
+                if tmp is not None:
+                    shutil.rmtree(tmp, ignore_errors=True)
         local = self._qcow2_in(dest)
         assert local is not None  # we just placed it
         log.info("image %s ready at %s", ref, local)

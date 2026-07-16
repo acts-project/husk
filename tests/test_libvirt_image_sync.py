@@ -52,6 +52,27 @@ def _backend(**host_overrides):
     return b
 
 
+def test_uses_injected_image_sync():
+    # huskd passes one shared ImageSync so the registry pull is single-flighted and
+    # the cache is shared across pools; the backend must use exactly that instance.
+    shared = FakeSync(CURR)
+    host = HostConfig(
+        name="h1",
+        libvirt_uri="qemu+ssh://u@host/system",
+        ssh_target="u@host",
+    )
+    cfg = BackendConfig(
+        name="lv",
+        type="libvirt",
+        min_ready=1,
+        max_total=1,
+        image_ref="ghcr.io/acts-project/husk-gpu:v1",
+        hosts=(host,),
+    )
+    b = LibvirtBackend(cfg, image_sync=shared)
+    assert b._sync is shared
+
+
 def test_sync_pulls_pushes_and_stamps_digest():
     b = _backend()
     b._sync = FakeSync(CURR)

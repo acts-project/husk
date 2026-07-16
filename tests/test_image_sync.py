@@ -70,6 +70,57 @@ def test_second_resolve_is_a_cache_hit(tmp_path):
     assert oras.pulls == 1  # already cached at that digest → no second pull
 
 
+def test_concurrent_resolve_same_ref_pulls_once(tmp_path):
+    # One shared ImageSync across pools: two threads resolving the same new ref on
+    # a cold cache must single-flight the pull (the per-digest lock + re-check),
+    # not both download it.
+    started = threading.Event()
+
+    class BlockingOras(FakeOras):
+        def pull(self, *, target, outdir, allowed_media_type=None):
+            started.set()
+            time.sleep(0.2)  # hold the digest lock so the sibling has to wait
+            return super().pull(target=target, outdir=outdir)
+
+    oras = BlockingOras()
+    sync = _sync(tmp_path, oras)
+    results: list = []
+
+    def go():
+        results.append(sync.resolve("ghcr.io/acts-project/husk-base:v1"))
+
+    t1 = threading.Thread(target=go)
+    t2 = threading.Thread(target=go)
+    t1.start()
+    started.wait(timeout=1)  # ensure t1 is mid-pull before t2 reaches the lock
+    t2.start()
+    t1.join(timeout=2)
+    t2.join(timeout=2)
+
+    assert oras.pulls == 1  # the sibling reused the first pull, didn't re-download
+    assert len(results) == 2
+    assert results[0].local_path == results[1].local_path
+
+
+def test_distinct_digests_not_serialized(tmp_path):
+    # The lock is per content digest, not global: two refs that resolve to
+    # different digests each pull (a shared lock would wrongly gate the second).
+    digest_b = "sha256:" + "b" * 64
+
+    class TwoRefOras(FakeOras):
+        def get_manifest(self, ref, **kw):
+            self.manifests += 1
+            digest = digest_b if "gpu" in ref else LAYER_DIGEST
+            return {"layers": [{"mediaType": QCOW2_MT, "digest": digest}]}
+
+    oras = TwoRefOras()
+    sync = _sync(tmp_path, oras)
+    a = sync.resolve("ghcr.io/org/husk-base:v1")
+    b = sync.resolve("ghcr.io/org/husk-gpu:v1")
+    assert oras.pulls == 2
+    assert a.digest == LAYER_DIGEST and b.digest == digest_b
+
+
 def test_digest_comes_from_qcow2_layer(tmp_path):
     # A manifest with the empty-config layer present: the qcow2 layer is selected,
     # not the config.

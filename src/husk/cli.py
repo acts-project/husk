@@ -111,17 +111,17 @@ def _configs_reloader(
     return reload
 
 
-def _build(cfg: Config):
+def _build(cfg: Config, image_sync=None):
     from husk.github import GitHubClient
 
     if cfg.backend.type == "libvirt":
         from husk.libvirt_backend import LibvirtBackend
 
-        backend = LibvirtBackend(cfg.backend)
+        backend = LibvirtBackend(cfg.backend, image_sync=image_sync)
     else:
         from husk.openstack_backend import OpenStackBackend
 
-        backend = OpenStackBackend(cfg.backend)
+        backend = OpenStackBackend(cfg.backend, image_sync=image_sync)
     github = GitHubClient(
         repo=cfg.github.repo,
         token=cfg.github.token,
@@ -376,10 +376,15 @@ def run(
         # sub-controllers get a blanked http_addr and no reload hook. A pool that
         # can't be built (bad backend config, unreachable cloud) is skipped with a
         # loud error rather than taking the whole daemon down — the other pools run.
+        # One process-wide image coordinator: the registry pull is single-flighted
+        # per content digest and the controller cache is shared across all pools.
+        from husk.image_sync import ImageSync
+
+        image_sync = ImageSync(shared.image_cache_dir or None)
         controllers = []
         for cfg in cfgs:
             try:
-                backend, github = _build(cfg)
+                backend, github = _build(cfg, image_sync=image_sync)
             except Exception as e:
                 typer.echo(
                     f"pool {cfg.backend.name!r} failed to start, skipping: {e}",

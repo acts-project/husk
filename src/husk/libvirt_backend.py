@@ -177,7 +177,9 @@ class _HostConn:
 
 
 class LibvirtBackend:
-    def __init__(self, cfg: BackendConfig) -> None:
+    def __init__(
+        self, cfg: BackendConfig, *, image_sync: ImageSync | None = None
+    ) -> None:
         if libvirt is None:
             raise RuntimeError(
                 "libvirt-python not installed; install the extra: pip install 'husk[libvirt]'"
@@ -188,7 +190,10 @@ class LibvirtBackend:
             )
         self.cfg = cfg
         self._pool = cfg.name  # stamped into domain metadata; scopes list_slots
-        self._sync = ImageSync(cfg.image_cache_dir or None)
+        # huskd passes one shared ImageSync so the registry pull is single-flighted
+        # and the cache is shared across pools; a fresh default keeps one-shot
+        # callers and tests self-contained.
+        self._sync = image_sync or ImageSync()
         self._backend_ref = cfg.image_ref or ""
         # Per-host ref last successfully synced, so sync_images is a cheap no-op
         # each tick until the configured ref actually changes.
