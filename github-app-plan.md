@@ -8,15 +8,18 @@ written once in its final form.
 ## Settled decisions
 
 - **Restriction lives in huskd, not GitHub.** GitHub can't restrict a public App
-  to a set of orgs, so the App is installable by *any* account and huskd enforces
-  a two-list allowlist. huskd holds the App private key and runs the VMs, so an
-  install it doesn't recognize simply gets no runners.
-- **Two-list allowlist; entry type decides scope.**
-  - `allowed_orgs = ["acts-project"]` → **org-level** runners for the whole org.
-  - `allowed_repos = ["paulgessinger/husk-test"]` → **repo-level** runners for
+  to a set of orgs, so the App is installable by *any* account and huskd decides
+  who it serves. huskd holds the App private key and runs the VMs, so an install
+  it doesn't recognize simply gets no runners.
+- **Each pool names the one target it serves** (revised 2026-07-20; originally a
+  two-list `[access]` allowlist fanned out over all pools):
+  - `target = { org = "acts-project", group = "husk" }` → **org-level** runners.
+  - `target = { repo = "paulgessinger/husk-test" }` → **repo-level** runners for
     exactly that `owner/repo`, nothing else that owner owns.
-  - Defense in depth: the install's granted-repo set *and* huskd's allowlist must
+  - Defense in depth: the install's granted-repo set *and* huskd's config must
     both agree before a repo is served.
+  - `group` is nested in the target table because runner groups are an org-only
+    concept — the schema makes "group on a repo target" unrepresentable.
 - **Hybrid scope.** Org-level is the scalable default (one poll + one warm pool
   per org, existing `busy + min_ready` math, scales to any repo count). Repo-level
   (today's code path) is the fallback for personal-account projects. Personal
@@ -47,8 +50,10 @@ written once in its final form.
   (`GET /orgs/{org}/actions/runner-groups`), falling back to Default (1). Repo /
   personal path ignores groups.
 - **Name isolation** (unique `vm_prefix` / labels, already required because runner
-  APIs are repo-wide) now must also be per-target so names don't collide across
-  targets sharing a backend — fold the target into the prefix.
+  APIs are repo-wide) is sufficient as-is now that a pool maps to exactly one
+  target: `load_configs` enforces unique pool names and prefixes, and no
+  target-folded renaming is needed. Ownership is additionally enforced at the
+  backend listing (`husk-pool` metadata) — see `targets-and-capacity.md`.
 
 ## Why async before the App (churn rationale)
 
