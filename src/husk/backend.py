@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
 from husk.slot import Capacity, Slot
+from husk.storage import DiskUsage
 
 
 class BackendError(Exception):
@@ -86,6 +87,17 @@ class Backend(Protocol):
         controller folds these into the dashboard's per-slot error column so a
         recurring backend problem is visible instead of log-only. Default: none."""
         return {}
+
+    def disk_usage(self) -> list[DiskUsage]:
+        """Count + bytes of the qcow2 images this backend put on each machine it
+        manages, for the storage metrics. Read from a per-tick cached scan — this
+        is called from the `/metrics` handler and must not do I/O or raise.
+
+        Backends that store no images of their own (fake) or store them somewhere
+        husk doesn't own the filesystem of (OpenStack: Glance) return []. The
+        controller-side OCI cache is reported separately by `ImageSync`, since it
+        is shared across every pool. Default: nothing."""
+        return []
 
     def console_output(self, slot: Slot, *, lines: int | None = None) -> str | None:
         """Best-effort serial-console log of the slot — for the boot report.

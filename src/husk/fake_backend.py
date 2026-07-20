@@ -85,6 +85,9 @@ class FakeBackend:
     def slot_warnings(self) -> dict[str, tuple[float, str]]:
         return dict(getattr(self, "warnings", {}))
 
+    def disk_usage(self) -> list:
+        return list(getattr(self, "usage", []))
+
     def image_ready(self, slot: Slot) -> bool:
         return self._image_ready
 

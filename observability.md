@@ -382,12 +382,58 @@ what remains here is unrelated to metrics collection:
 |---|---|---|---|
 | Boot-timing metrics | ✅ parse + expose | — | serial-log fix (libvirt only) |
 | `husk_slot_info` join | ✅ | — | — |
+| qcow2 storage usage | ✅ cache scan + per-host `stat` | — | — |
 | Discovery (`http_sd`, single feed) | ✅ | — | — |
 | `:9100` ingress rule | ✅ (cloud-init, `scrape_cidr`) | — | — |
 | node_exporter (no TLS/auth) | — | ✅ baked (primary per-VM source, both backends) | — |
 | Guest bridge (libvirt) | ✅ `/slot/<pool>/<slot>/metrics` over its existing SSH channel | — | **nothing** |
 | Scrape transport | — | — | central → huskd → ssh → guest (libvirt); direct pull (OpenStack) |
 | Optional per-domain metrics | — | — | optional `prometheus-libvirt-exporter` |
+
+-----
+
+## qcow2 storage usage
+
+`/metrics` carries one **daemon-wide** block (no `backend` label — see below)
+counting the qcow2 images husk has put on disk:
+
+```
+husk_images{kind="cache",host=""}          2
+husk_image_bytes{kind="cache",host=""}     7516192768
+husk_images{kind="golden",host="gpu-1"}    1
+husk_image_bytes{kind="golden",host="gpu-1"} 3221225472
+husk_images{kind="overlay",host="gpu-1"}   4
+husk_image_bytes{kind="overlay",host="gpu-1"} 88604672
+```
+
+Three populations, two machines (`storage.py`):
+
+- **`cache`** — the controller-local OCI pull cache (`~/.cache/husk/images`).
+  Nothing GCs it, so it grows by one multi-GB golden per image bump forever.
+  This gauge is what makes that leak visible; alert on it.
+- **`golden`** — the backing files staged into each hypervisor's storage pool.
+  `_gc_goldens` prunes unreferenced ones, so this should stay flat across a
+  rollout, briefly doubling while the new golden lands.
+- **`overlay`** — per-slot COW disks. Grows with runner churn; this is the
+  series that actually predicts a full hypervisor disk.
+
+**No `backend` label, deliberately.** The cache is shared by every pool, and two
+libvirt pools can target one hypervisor's storage pool dir — a per-pool label
+would make `sum(husk_image_bytes)` double-count a disk that only filled once.
+`storage.collect` dedupes by `(host, kind)` for the same reason. Labels stop at
+`kind`/`host`: per-image series would churn on every image bump for no
+analytical gain.
+
+Neither side does I/O during a scrape. Hosts are `stat`'d once per reconcile
+tick (one command, riding the existing `sync_images` pass) and `/metrics` reads
+the cached result, so a wedged hypervisor can't stall a scrape; the controller
+cache scan is local and memoized for 30s. A host that can't be reached keeps its
+last-known numbers rather than reporting zero — a transient SSH failure must not
+look like a disk that emptied itself.
+
+OpenStack pools report no host rows: Nova/Glance own that storage. The Glance
+image listing already returns per-image sizes (`_gc_glance`), so a `kind="glance"`
+row is a small follow-up, not yet exposed.
 
 -----
 

@@ -473,6 +473,7 @@ def run(
                     shared.http_addr,
                     ssh_targets=ssh_targets,
                     advertise_addr=shared.advertise_addr or shared.http_addr,
+                    image_sync=image_sync,
                 )
             )
     finally:
@@ -515,6 +516,7 @@ async def _serve(
     *,
     ssh_targets: dict[tuple[str, str], str] | None = None,
     advertise_addr: str = "",
+    image_sync=None,
 ) -> None:
     """Run the whole daemon on this one event loop: the centralized runner poller,
     every pool's reconcile task, and Quart serving each endpoint. SIGINT/SIGTERM
@@ -524,6 +526,7 @@ async def _serve(
     Blocking backend work never runs here — `Controller.tick()` pushes it through
     `asyncio.to_thread` — so a wedged hypervisor stalls only its own pool."""
     from husk.guest_scrape import GuestScraper
+    from husk.storage import collect as collect_storage
     from husk.web import make_app, parse_addr, serve_app
 
     stop = asyncio.Event()
@@ -552,6 +555,13 @@ async def _serve(
                 shutdown=stop,
                 scraper=scraper,
                 advertise_addr=advertise_addr,
+                # Daemon-wide qcow2 usage: the shared controller cache plus each
+                # backend's last per-tick host scan. Read fresh per scrape (both
+                # sides are in-memory or memoized), and deduped across pools that
+                # share a host, so nothing here can block or double-count.
+                storage_provider=lambda: collect_storage(
+                    image_sync, [c.backend for c in facade.controllers]
+                ),
             ),
             host,
             port,

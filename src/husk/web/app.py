@@ -3,7 +3,8 @@ coroutine the CLI awaits to run it on the main event loop.
 
   GET /         — live dashboard (Jinja + SSE, no polling)
   GET /status   — JSON list of ControllerState, one per pool (huskctl, dashboards)
-  GET /metrics  — Prometheus text exposition (per-pool gauges, backend="..." label)
+  GET /metrics  — Prometheus text exposition (per-pool gauges, backend="..." label,
+                  plus one daemon-wide block of qcow2 storage usage)
   GET /sd/targets — Prometheus http_sd: live per-slot node_exporter scrape targets
   GET /slot/<pool>/<slot>/metrics — a libvirt guest's node_exporter, bridged over
                   huskd's SSH channel to the hypervisor (the guest is on a private
@@ -37,6 +38,7 @@ from quart import Quart, Response, render_template
 from husk.guest_scrape import GuestScraper, GuestScrapeError
 
 from husk.snapshot import ControllerState
+from husk.storage import DiskUsage
 
 log = logging.getLogger("husk.web")
 
@@ -142,12 +144,40 @@ def render_prometheus(s: ControllerState) -> str:
     return "\n".join(out) + "\n"
 
 
+def render_storage_prometheus(usage: list[DiskUsage]) -> str:
+    """Storage metrics, rendered ONCE per scrape — not per pool.
+
+    These carry no `backend` label on purpose: the controller cache is shared by
+    every pool, and two libvirt pools can share a hypervisor's storage pool dir.
+    A per-pool label would make `sum(husk_image_bytes)` double-count a dir that
+    two pools both touch. `storage.collect` has already deduped by (host, kind);
+    `host` is "" for the controller-local cache.
+
+    Labelled by `kind`/`host` only — never per image file. Per-image series would
+    churn on every image bump and blow up cardinality for no analytical gain."""
+    out = [
+        "# HELP husk_images Stored qcow2 images by location",
+        "# TYPE husk_images gauge",
+    ]
+    out += [f'husk_images{{kind="{u.kind}",host="{u.host}"}} {u.images}' for u in usage]
+    out += [
+        "# HELP husk_image_bytes Total size of stored qcow2 images by location",
+        "# TYPE husk_image_bytes gauge",
+    ]
+    out += [
+        f'husk_image_bytes{{kind="{u.kind}",host="{u.host}"}} {u.total_bytes}'
+        for u in usage
+    ]
+    return "\n".join(out) + "\n"
+
+
 def make_app(
     snapshot_provider: Callable[[], list[ControllerState]],
     *,
     shutdown: asyncio.Event | None = None,
     scraper: GuestScraper | None = None,
     advertise_addr: str = "",
+    storage_provider: Callable[[], list[DiskUsage]] | None = None,
 ) -> Quart:
     """Build the app over a per-pool snapshot provider (the same one every
     endpoint reads). Templates resolve relative to this package.
@@ -186,8 +216,12 @@ def make_app(
     @app.get("/metrics")
     async def metrics():
         # Per-pool series are distinguished by the backend="..." label already on
-        # every metric, so concatenation across pools is a valid exposition.
+        # every metric, so concatenation across pools is a valid exposition. The
+        # storage block is emitted once, ahead of them: it is daemon-wide, so
+        # repeating it per pool would be a duplicate-series exposition error.
         body = "".join(render_prometheus(s) for s in _snaps())
+        if storage_provider is not None:
+            body = render_storage_prometheus(storage_provider() or []) + body
         return Response(body, content_type="text/plain; version=0.0.4; charset=utf-8")
 
     @app.get("/sd/targets")

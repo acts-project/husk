@@ -32,6 +32,7 @@ from husk.config import BackendConfig, HostConfig
 from husk.image_sync import ImageSync
 from husk.ops import DONE, OpStore, OpView
 from husk.slot import Capacity, Slot
+from husk.storage import GOLDEN, OVERLAY, DiskUsage
 
 
 @dataclass(frozen=True)
@@ -202,6 +203,8 @@ class LibvirtBackend:
         # thread as a keyed op; the tick only adopts a ready result (points each
         # host's current image at the staged golden).
         self._ops = OpStore()
+        # host name -> its last disk scan (see _scan_disk); read by disk_usage().
+        self._disk: dict[str, list[DiskUsage]] = {}
         self._hosts: dict[str, _HostConn] = {}
         for h in cfg.hosts:
             if h.gpu_pci_addresses and h.max_slots is not None:
@@ -504,6 +507,7 @@ class LibvirtBackend:
         )
         self._sync.gc()
         self._gc_goldens()
+        self._scan_disk()
 
     def staging_ops(self) -> list[OpView]:
         """In-flight / recent image-staging ops, for the status board."""
@@ -719,6 +723,64 @@ class LibvirtBackend:
                 if base and base not in keep:
                     log.info("GC stale golden %s on host %s", base, name)
                     self._ssh(host, f"rm -f {shlex.quote(path)}")
+
+    # ------------------------------------------------------------ disk usage
+    def _scan_disk(self) -> None:
+        """Measure each host's husk qcow2 files, for the storage metrics.
+
+        One `stat` per host per tick, on the reconcile thread — `disk_usage()`
+        then serves the result to `/metrics` from memory, so a scrape never waits
+        on SSH. Runs after `_gc_goldens` so the numbers reflect the post-GC disk.
+
+        Measures the whole shared pool dir, not just this pool's files: two husk
+        pools can target one hypervisor, and what matters operationally is
+        whether *that disk* is filling up. `storage.collect` dedupes by host so
+        the shared bytes are still only counted once.
+
+        A host that can't be reached keeps its previous numbers rather than
+        reporting zero — a transient SSH failure must not look like a disk that
+        emptied itself."""
+        for name, host in self._hosts.items():
+            try:
+                pool = host.pool_dir()
+                out = self._ssh(
+                    host,
+                    f"stat -c '%s %n' {shlex.quote(pool)}/husk-*.qcow2 2>/dev/null "
+                    "|| true",
+                )
+            except Exception:
+                log.debug("disk scan on host %s failed", name, exc_info=True)
+                continue
+            goldens = overlays = golden_bytes = overlay_bytes = 0
+            for line in out.decode(errors="replace").splitlines():
+                size, _, path = line.strip().partition(" ")
+                if not path:
+                    continue
+                try:
+                    n = int(size)
+                except ValueError:
+                    continue
+                # Goldens are the shared backing files; everything else husk put
+                # in this dir is a per-slot COW overlay.
+                if path.rsplit("/", 1)[-1].startswith("husk-golden-"):
+                    goldens += 1
+                    golden_bytes += n
+                else:
+                    overlays += 1
+                    overlay_bytes += n
+            self._disk[name] = [
+                DiskUsage(
+                    kind=GOLDEN, host=name, images=goldens, total_bytes=golden_bytes
+                ),
+                DiskUsage(
+                    kind=OVERLAY, host=name, images=overlays, total_bytes=overlay_bytes
+                ),
+            ]
+
+    def disk_usage(self) -> list[DiskUsage]:
+        """Last scanned per-host golden/overlay usage. In-memory; never does I/O
+        (see `_scan_disk`). Empty until the first `sync_images` tick completes."""
+        return [row for rows in self._disk.values() for row in rows]
 
     # --------------------------------------------------------------- backend
     def list_slots(self) -> list[Slot]:

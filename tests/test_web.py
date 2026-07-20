@@ -15,6 +15,7 @@ import pytest
 from conftest import make_config, make_runner, make_slot, serve_in_thread
 from husk.slot import SlotState
 from husk.snapshot import ControllerState
+from husk.storage import DiskUsage
 from husk.web import make_app, parse_addr, render_prometheus
 
 
@@ -284,6 +285,31 @@ def test_metrics_concats_pools():
     assert code == 200
     assert b'husk_slots_desired{backend="pool-a"}' in body
     assert b'husk_slots_desired{backend="pool-b"}' in body
+
+
+def test_metrics_emits_storage_once_across_pools():
+    """The storage block is daemon-wide: repeating it per pool would be a
+    duplicate-series exposition error."""
+    usage = [
+        DiskUsage(kind="cache", host="", images=2, total_bytes=350),
+        DiskUsage(kind="golden", host="hv1", images=1, total_bytes=100),
+    ]
+    app = make_app(
+        lambda: [_snap("pool-a"), _snap("pool-b")], storage_provider=lambda: usage
+    )
+    code, body = _client_get(app, "/metrics")
+
+    assert code == 200
+    assert body.count(b"# TYPE husk_image_bytes gauge") == 1
+    assert body.count(b'husk_image_bytes{kind="cache",host=""} 350') == 1
+    assert b'husk_slots_desired{backend="pool-b"}' in body  # pool metrics intact
+
+
+def test_metrics_without_a_storage_provider_omits_the_block():
+    code, body = _client_get(make_app(lambda: [_snap()]), "/metrics")
+
+    assert code == 200
+    assert b"husk_image_bytes" not in body
 
 
 def test_healthz_ok_when_fresh():

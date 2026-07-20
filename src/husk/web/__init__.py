@@ -8,6 +8,7 @@ from husk.web.app import (
     make_app,
     parse_addr,
     render_prometheus,
+    render_storage_prometheus,
     serve_app,
 )
 
@@ -16,5 +17,6 @@ __all__ = [
     "serve_app",
     "parse_addr",
     "render_prometheus",
+    "render_storage_prometheus",
     "STALE_AFTER_SEC",
 ]

@@ -35,6 +35,8 @@ import threading
 import time
 from dataclasses import dataclass
 
+from husk.storage import CACHE, DiskUsage
+
 log = logging.getLogger("husk.image")
 
 # How often to log registry-pull progress (MiB pulled so far) during a slow pull.
@@ -69,6 +71,11 @@ _GC_INTERVAL_S = 900
 # GC only ever deletes entries matching this or the `.pull-` prefix, so anything
 # else a human parked in the cache dir is left alone.
 _DIGEST_DIR = re.compile(r"^sha\d+-[0-9a-f]{32,}$")
+
+# How long a cache-usage measurement is reused. The scan is a local scandir over
+# a handful of digest dirs (microseconds), but it is reached from the /metrics
+# handler, so a memo keeps a scrape storm off the disk entirely.
+_USAGE_TTL_S = 30.0
 
 
 def _default_cache_dir() -> str:
@@ -142,6 +149,8 @@ class ImageSync:
         self._pins: dict[str, set[str]] = {}
         self._active_tmp: set[str] = set()
         self._last_gc = 0.0
+        # Memoized cache_usage(): (measured_at, usage). Guarded by _locks_guard.
+        self._usage: tuple[float, "DiskUsage"] | None = None
 
     def _client_(self):
         # Two pool worker threads can race the first resolve; build the shared
@@ -357,6 +366,42 @@ class ImageSync:
             f"artifact {ref!r} has no {_QCOW2_MEDIA_TYPE} layer (layers: "
             f"{[layer.get('mediaType') for layer in layers]})"
         )
+
+    def cache_usage(self) -> DiskUsage:
+        """How many qcow2 images the controller cache holds, and their total size.
+
+        Nothing prunes this cache, so it grows by one golden (multi-GB) per image
+        bump forever — this is the metric that makes that leak visible.
+
+        Memoized for `_USAGE_TTL_S` because `/metrics` reads it. In-flight pulls
+        (`.pull-*` temp dirs) are excluded: they are not cache content yet, and
+        counting them would make the gauge sawtooth during a pull. A cache dir
+        that doesn't exist yet is 0/0, not an error."""
+        now = time.time()
+        with self._locks_guard:
+            if self._usage is not None and now - self._usage[0] < _USAGE_TTL_S:
+                return self._usage[1]
+        images = total = 0
+        try:
+            for entry in os.scandir(self.cache_dir):
+                if not entry.is_dir() or entry.name.startswith("."):
+                    continue
+                for name in os.listdir(entry.path):
+                    if not name.endswith(".qcow2"):
+                        continue
+                    try:
+                        total += os.path.getsize(os.path.join(entry.path, name))
+                    except OSError:
+                        continue  # vanished mid-scan (a concurrent re-pull swap)
+                    images += 1
+        except FileNotFoundError:
+            pass  # nothing pulled yet
+        except OSError:
+            log.debug("could not scan image cache %s", self.cache_dir, exc_info=True)
+        usage = DiskUsage(kind=CACHE, host="", images=images, total_bytes=total)
+        with self._locks_guard:
+            self._usage = (now, usage)
+        return usage
 
     @staticmethod
     def _qcow2_in(directory: str) -> str | None:

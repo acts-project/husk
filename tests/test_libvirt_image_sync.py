@@ -343,3 +343,78 @@ def test_sync_pins_the_staged_digest_in_the_controller_cache():
     b.sync_images(b.cfg)
 
     assert b._sync.pins == {"lv": {CURR}}
+
+
+# ------------------------------------------------------- per-host disk usage
+def _scan_ssh(listing: str):
+    """An _ssh stub that answers the disk scan with `listing` and nothing else."""
+
+    def _ssh(host, cmd, data=None):
+        if cmd.startswith("stat -c '%s %n'"):
+            return listing.encode()
+        return b"n\n" if cmd.startswith("test -s") else b""
+
+    return _ssh
+
+
+def test_scan_disk_splits_goldens_from_overlays():
+    b = _backend()
+    b._ssh = _scan_ssh(
+        "100 /pool/husk-golden-cccccccccccc.qcow2\n"
+        "200 /pool/husk-golden-dddddddddddd.qcow2\n"
+        "7 /pool/husk-lv-1-c3.qcow2\n"
+        "9 /pool/husk-lv-2-c1.qcow2\n"
+    )
+
+    b._scan_disk()
+
+    usage = {u.kind: u for u in b.disk_usage()}
+    assert (usage["golden"].images, usage["golden"].total_bytes) == (2, 300)
+    assert (usage["overlay"].images, usage["overlay"].total_bytes) == (2, 16)
+    assert {u.host for u in b.disk_usage()} == {"h1"}
+
+
+def test_scan_disk_on_empty_pool_reports_zero():
+    b = _backend()
+    b._ssh = _scan_ssh("")
+
+    b._scan_disk()
+
+    assert [(u.kind, u.images, u.total_bytes) for u in b.disk_usage()] == [
+        ("golden", 0, 0),
+        ("overlay", 0, 0),
+    ]
+
+
+def test_scan_disk_keeps_last_known_when_a_host_is_unreachable():
+    """A transient SSH failure must not look like a disk that emptied itself."""
+    b = _backend()
+    b._ssh = _scan_ssh("100 /pool/husk-golden-cccccccccccc.qcow2\n")
+    b._scan_disk()
+
+    def _boom(host, cmd, data=None):
+        raise BackendError("host down")
+
+    b._ssh = _boom
+    b._scan_disk()
+
+    assert [(u.kind, u.total_bytes) for u in b.disk_usage()] == [
+        ("golden", 100),
+        ("overlay", 0),
+    ]
+
+
+def test_disk_usage_is_empty_before_the_first_scan():
+    assert _backend().disk_usage() == []
+
+
+def test_sync_images_scans_disk():
+    """The scan rides the existing per-tick sync so /metrics never waits on SSH."""
+    b = _backend()
+    b._sync = FakeSync(CURR)
+    b._push_file = lambda *a, **kw: None
+    b._ssh = _scan_ssh("42 /pool/husk-golden-cccccccccccc.qcow2\n")
+
+    b.sync_images(b.cfg)
+
+    assert any(u.total_bytes == 42 for u in b.disk_usage())
