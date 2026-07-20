@@ -262,11 +262,44 @@ async def main() -> int:
                     found = groups.get("runner_groups", [])
                     print(
                         "        groups: "
-                        + ", ".join(f"{g['name']}(id={g['id']})" for g in found)
+                        + ", ".join(
+                            f"{g['name']}(id={g['id']},visibility={g.get('visibility')})"
+                            for g in found
+                        )
                     )
                     # Phase 2 resolves a group NAME to an id per target; prove it here.
                     want = group_name or "Default"
                     match = next((g for g in found if g["name"] == want), None)
+                    # Existing-and-resolvable is not enough. A group whose
+                    # visibility is "selected" only serves the repos explicitly
+                    # added to it — huskd would mint runners into it happily, they
+                    # would register fine, and jobs from every other repo would
+                    # just queue forever. That silent failure is worth naming here
+                    # rather than discovering it during live bring-up.
+                    if match and match.get("visibility") == "selected":
+                        n = await probe(
+                            client,
+                            rep,
+                            f"group {want!r} selected-repository list",
+                            f"{GH}/orgs/{login}/actions/runner-groups/"
+                            f"{match['id']}/repositories",
+                            tok,
+                            HINTS["org-groups"],
+                        )
+                        repos_in = [
+                            r["full_name"] for r in (n or {}).get("repositories", [])
+                        ]
+                        print(
+                            f"        NOTE: group {want!r} is visibility=selected; it "
+                            f"serves ONLY: {repos_in or '(none!)'}\n"
+                            "         jobs from any other repo will queue forever. "
+                            "Set it to 'all' or add the repos you intend to serve."
+                        )
+                        rep.check(
+                            f"group {want!r} serves at least one repository",
+                            bool(repos_in),
+                            f"{len(repos_in)} repo(s)",
+                        )
                     rep.check(
                         f"resolve runner group {want!r} → id",
                         match is not None,
