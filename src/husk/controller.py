@@ -102,12 +102,12 @@ class Controller:
         self.github = github
         self.cfg = config
         self._clock = clock
-        # Reconcile is re-keyed pool → (target, pool). Today there is exactly one
-        # static target per pool, derived from the configured owner/repo; the App
-        # migration makes the target set dynamic without this loop changing. The
-        # demand registry is the seam reconcile reads `desired` from — a webhook
-        # becomes a second producer in Phase 4 without this loop changing either.
-        self.target = target or Target.repo(config.github.repo)
+        # Reconcile is keyed (target, pool) — one Controller per pair. The target
+        # is injected by the caller from `[access].targets`; Phase 3 makes that set
+        # dynamic (discovery ∩ allowlist) without this loop changing. The demand
+        # registry is the seam reconcile reads `desired` from — a webhook becomes a
+        # second producer in Phase 4 without this loop changing either.
+        self.target = target or config.access.targets[0]
         self.pool = config.backend.name
         self.demand = demand or DemandRegistry()
         # Runner listings come from the centralized poller via this registry, never

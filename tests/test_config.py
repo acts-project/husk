@@ -1,4 +1,4 @@
-"""PAT resolution + env-override precedence + the [[pool]] schema in load_config(s)."""
+"""App private-key resolution + env-override precedence + the [[pool]] schema."""
 
 from __future__ import annotations
 
@@ -8,14 +8,17 @@ from husk.config import load_config, load_configs
 
 _TOML = """
 [github]
-repo = "acts-project/husk-test"
+app_id = 123456
 {extra}
+[access]
+targets = ["org:acts-project"]
+
 [[pool]]
 name = "openstack-cern"
 [pool.runner]
 version = "2.334.0"
 labels = ["self-hosted"]
-runner_group_id = 1
+runner_group = "husk"
 [pool.backend]
 cloud = "cern"
 image_name = "ALMA10 - x86_64"
@@ -31,43 +34,70 @@ def _write(tmp_path, extra: str = "") -> str:
     return str(p)
 
 
+FAKE_PEM = "-----BEGIN RSA PRIVATE KEY-----\nnotreal\n-----END RSA PRIVATE KEY-----\n"
+
+
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    for var in ("GH_TOKEN", "HUSK_GITHUB__PAT", "MY_TOKEN"):
+    # The App key must come from whatever each test sets, never from the ambient
+    # environment — otherwise the fail-closed test would pass for the wrong reason.
+    for var in ("GH_TOKEN", "HUSK_GITHUB__PAT", "HUSK_GITHUB__PRIVATE_KEY"):
         monkeypatch.delenv(var, raising=False)
 
 
-def test_pat_from_gh_token_env(tmp_path, monkeypatch):
-    monkeypatch.setenv("GH_TOKEN", "ghp_local")
-    assert load_config(_write(tmp_path)).github.token == "ghp_local"
+def test_private_key_from_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    cfg = load_config(_write(tmp_path))
+    assert cfg.github.private_key == FAKE_PEM
+    assert cfg.github.app_id == 123456
 
 
-def test_husk_env_overrides_gh_token(tmp_path, monkeypatch):
-    monkeypatch.setenv("GH_TOKEN", "ghp_local")
-    monkeypatch.setenv("HUSK_GITHUB__PAT", "ghp_explicit")
-    assert load_config(_write(tmp_path)).github.token == "ghp_explicit"
+def test_private_key_path_file_fallback(tmp_path):
+    pem = tmp_path / "app.pem"
+    pem.write_text(FAKE_PEM)
+    cfg = load_config(_write(tmp_path, extra=f'private_key_path = "{pem}"'))
+    assert cfg.github.private_key == FAKE_PEM
 
 
-def test_custom_pat_env(tmp_path, monkeypatch):
-    monkeypatch.setenv("MY_TOKEN", "ghp_custom")
-    cfg = load_config(_write(tmp_path, extra='pat_env = "MY_TOKEN"'))
-    assert cfg.github.token == "ghp_custom"
+def test_env_key_wins_over_path(tmp_path, monkeypatch):
+    pem = tmp_path / "app.pem"
+    pem.write_text(FAKE_PEM)
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----\nenv\n")
+    cfg = load_config(_write(tmp_path, extra=f'private_key_path = "{pem}"'))
+    assert "env" in cfg.github.private_key
 
 
-def test_pat_path_file_fallback(tmp_path):
-    secret = tmp_path / "pat"
-    secret.write_text("ghp_fromfile\n")
-    cfg = load_config(_write(tmp_path, extra=f'pat_path = "{secret}"'))
-    assert cfg.github.token == "ghp_fromfile"
-
-
-def test_fail_closed_when_no_pat(tmp_path):
-    with pytest.raises(RuntimeError, match="GitHub PAT not configured"):
+def test_fail_closed_when_no_private_key(tmp_path):
+    with pytest.raises(RuntimeError, match="private key not configured"):
         load_config(_write(tmp_path))
 
 
+def test_rejects_a_file_that_is_not_a_pem(tmp_path):
+    junk = tmp_path / "app.pem"
+    junk.write_text("this is not a key")
+    with pytest.raises(RuntimeError, match="private key not configured"):
+        load_config(_write(tmp_path, extra=f'private_key_path = "{junk}"'))
+
+
+def test_targets_are_parsed_into_Target(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    cfg = load_config(_write(tmp_path))
+    assert [t.key for t in cfg.access.targets] == ["org:acts-project"]
+
+
+def test_malformed_target_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    bad = _TOML.format(extra="").replace(
+        'targets = ["org:acts-project"]', 'targets = ["acts-project"]'
+    )
+    p = tmp_path / "c.toml"
+    p.write_text(bad)
+    with pytest.raises(RuntimeError, match="access..targets"):
+        load_config(str(p))
+
+
 def test_pool_name_drives_backend_name_and_vm_prefix(tmp_path, monkeypatch):
-    monkeypatch.setenv("GH_TOKEN", "ghp_x")
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
     cfg = load_config(_write(tmp_path))
     assert cfg.backend.name == "openstack-cern"  # from pool name
     assert cfg.backend.vm_prefix == "husk-openstack-cern"  # derived default
@@ -76,7 +106,10 @@ def test_pool_name_drives_backend_name_and_vm_prefix(tmp_path, monkeypatch):
 # ------------------------------------------------------------------- multi-pool
 _MULTI_TOML = """
 [github]
-repo = "acts-project/husk-test"
+app_id = 123456
+
+[access]
+targets = ["org:acts-project"]
 [controller]
 http_addr = "127.0.0.1:9100"
 
@@ -114,7 +147,7 @@ gpu_pci_addresses = ["0000:01:00.0"]
 
 
 def test_load_configs_two_pools_share_github_and_controller(tmp_path, monkeypatch):
-    monkeypatch.setenv("GH_TOKEN", "ghp_x")
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
     p = tmp_path / "multi.toml"
     p.write_text(_MULTI_TOML)
     cfgs = load_configs(str(p))
@@ -137,7 +170,7 @@ def test_load_configs_two_pools_share_github_and_controller(tmp_path, monkeypatc
 def test_image_cache_dir_lives_on_controller(tmp_path, monkeypatch):
     # The oras pull cache is process-wide, so it's a [controller] knob shared
     # identically by every pool (not a per-[backend] field anymore).
-    monkeypatch.setenv("GH_TOKEN", "ghp_x")
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
     toml = _MULTI_TOML.replace(
         '[controller]\nhttp_addr = "127.0.0.1:9100"\n',
         '[controller]\nhttp_addr = "127.0.0.1:9100"\n'
@@ -153,7 +186,7 @@ def test_image_cache_dir_lives_on_controller(tmp_path, monkeypatch):
 def test_stray_backend_image_cache_dir_is_ignored(tmp_path, monkeypatch):
     # Clean cutover: image_cache_dir moved out of [pool.backend]; a leftover one is
     # silently dropped (pydantic extra="ignore") rather than erroring.
-    monkeypatch.setenv("GH_TOKEN", "ghp_x")
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
     toml = _MULTI_TOML.replace(
         "min_ready = 2\n", 'min_ready = 2\nimage_cache_dir = "/ignored"\n'
     )
@@ -165,18 +198,18 @@ def test_stray_backend_image_cache_dir_is_ignored(tmp_path, monkeypatch):
 
 
 def test_no_pool_fails_closed(tmp_path, monkeypatch):
-    monkeypatch.setenv("GH_TOKEN", "ghp_x")
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
     p = tmp_path / "empty.toml"
-    p.write_text('[github]\nrepo = "acts-project/husk-test"\n')
+    p.write_text('[github]\napp_id = 1\n[access]\ntargets = ["org:acme"]\n')
     with pytest.raises(RuntimeError, match="no \\[\\[pool\\]\\] defined"):
         load_configs(str(p))
 
 
 def test_duplicate_pool_name_rejected(tmp_path, monkeypatch):
-    monkeypatch.setenv("GH_TOKEN", "ghp_x")
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
     p = tmp_path / "dup.toml"
     p.write_text(
-        '[github]\nrepo = "r"\n'
+        '[github]\napp_id = 1\n[access]\ntargets = ["org:acme"]\n'
         '[[pool]]\nname = "dup"\n[pool.runner]\nversion="1"\nlabels=["a"]\n'
         '[[pool]]\nname = "dup"\n[pool.runner]\nversion="1"\nlabels=["b"]\n'
     )
@@ -197,7 +230,7 @@ def test_ssh_target_from_uri_preserves_case_and_strips_port():
 
 
 def test_libvirt_config_parses_host_storage_pool(tmp_path, monkeypatch):
-    monkeypatch.setenv("GH_TOKEN", "ghp_x")
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
     p = tmp_path / "multi.toml"
     p.write_text(_MULTI_TOML)
     cfg = load_configs(str(p))[1]  # the libvirt-gpu pool

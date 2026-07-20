@@ -12,6 +12,8 @@ import re
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
+from husk.target import Target
+
 
 def _slug(name: str) -> str:
     """A short, name-safe pool tag for the default vm_prefix (`husk-<slug>`)."""
@@ -35,15 +37,37 @@ def _ssh_target_from_uri(uri: str) -> str:
 
 @dataclass(frozen=True)
 class GithubConfig:
-    repo: str
-    token: str  # resolved secret (PAT); never logged
+    """GitHub App identity — replaces the old single-repo PAT entirely.
+
+    huskd authenticates as the App (RS256 JWT) and exchanges that for a
+    short-lived *installation* token per target; there is no long-lived
+    credential. `private_key` holds the resolved PEM contents and is never
+    logged."""
+
+    app_id: int
+    private_key: str
+
+
+@dataclass(frozen=True)
+class AccessConfig:
+    """Which targets huskd serves.
+
+    Phase 2 scaffold: an explicit list, standing in for discovery. Phase 3
+    replaces it with the two-list allowlist (`allowed_orgs`/`allowed_repos`)
+    intersected against what each installation actually granted."""
+
+    targets: tuple[Target, ...]
 
 
 @dataclass(frozen=True)
 class RunnerConfig:
     version: str
     labels: list[str]
-    runner_group_id: int
+    # Runner-group NAME, not id: group ids are not portable across orgs, so the
+    # client resolves this per target (falling back to Default/1 when the org has
+    # no such group — e.g. a free-plan org, which can't create custom groups).
+    # Ignored on repo-scoped targets, which have no runner groups.
+    runner_group: str = "Default"
     gpu: bool = False  # GPU pools: cloud-init activates the NVIDIA driver + CDI
     prebaked: bool = False  # golden-image pools: skip the install steps (baked in)
     # Source allowed to scrape the slot's node_exporter on :9100 — the sole access
@@ -141,6 +165,7 @@ class ControllerConfig:
 @dataclass(frozen=True)
 class Config:
     github: GithubConfig
+    access: AccessConfig
     runner: RunnerConfig
     backend: BackendConfig
     timeouts: TimeoutsConfig = field(default_factory=TimeoutsConfig)
@@ -155,7 +180,8 @@ def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
 
 def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
     """Build one `Config` per `[[pool]]` from a TOML file, overlaid by env vars,
-    with the PAT read from a file (k8s Secret mount). Precedence for the shared
+    with the App private key read from a file (k8s Secret mount). Precedence for
+    the shared
     `[github]`/`[controller]` sections: **env > TOML > defaults**; per-pool knobs
     are TOML-only.
 
@@ -165,7 +191,6 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
     isolation invariant). pydantic-settings is imported lazily here so the rest of
     the package stays pydantic-free.
     """
-    import os
     from pathlib import Path
 
     from pydantic import BaseModel, Field
@@ -177,15 +202,19 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
     )
 
     class _Github(BaseModel):
-        repo: str
-        pat: str | None = None  # secret value (env HUSK_GITHUB__PAT); never in TOML
-        pat_path: str | None = None  # k8s: path to a mounted Secret file
-        pat_env: str = "GH_TOKEN"  # local dev: env var to read the PAT from
+        app_id: int
+        # PEM contents (env HUSK_GITHUB__PRIVATE_KEY); never in TOML
+        private_key: str | None = None
+        private_key_path: str | None = None  # file / k8s Secret mount
+
+    class _Access(BaseModel):
+        # TEMP (Phase 2): explicit targets standing in for discovery.
+        targets: list[str] = []
 
     class _Runner(BaseModel):
         version: str
         labels: list[str]
-        runner_group_id: int = 1
+        runner_group: str = "Default"
         gpu: bool = False
         prebaked: bool = False
         scrape_cidr: str = ""
@@ -247,6 +276,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
             extra="ignore",
         )
         github: _Github
+        access: _Access = Field(default_factory=_Access)
         controller: _Controller = Field(default_factory=_Controller)
         pool: list[_Pool] = []
 
@@ -271,20 +301,29 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
 
     s = _Settings()
 
-    # Resolve the PAT, in priority order:
-    #   1. HUSK_GITHUB__PAT        — explicit override (pydantic-nested env)
-    #   2. $GH_TOKEN (= pat_env)   — local dev convenience (matches the .env flow)
-    #   3. [github].pat_path file  — k8s Secret mount
-    # then fail closed.
-    token = s.github.pat
-    if not token and s.github.pat_env:
-        token = os.environ.get(s.github.pat_env)
-    if not token and s.github.pat_path:
-        token = Path(s.github.pat_path).read_text().strip()
-    if not token:
+    # Resolve the App private key, in priority order:
+    #   1. HUSK_GITHUB__PRIVATE_KEY     — PEM contents (pydantic-nested env)
+    #   2. [github].private_key_path    — file / mounted k8s Secret
+    # then fail closed. There is no PAT path any more: huskd authenticates as the
+    # App and mints short-lived per-installation tokens.
+    private_key = s.github.private_key
+    if not private_key and s.github.private_key_path:
+        private_key = Path(s.github.private_key_path).read_text()
+    if not private_key or "PRIVATE KEY" not in private_key:
         raise RuntimeError(
-            f"GitHub PAT not configured: set ${s.github.pat_env}, HUSK_GITHUB__PAT, "
-            "or [github].pat_path (a file path, e.g. a mounted k8s Secret)"
+            "GitHub App private key not configured: set HUSK_GITHUB__PRIVATE_KEY "
+            "(PEM contents) or [github].private_key_path (a path to the .pem the "
+            "App settings page generated)"
+        )
+
+    try:
+        targets = tuple(Target.parse(t) for t in s.access.targets)
+    except ValueError as e:
+        raise RuntimeError(f"[access].targets: {e}") from e
+    if not targets:
+        raise RuntimeError(
+            "no [access].targets configured: huskd needs at least one target, e.g. "
+            'targets = ["org:acts-project"] or ["repo:owner/name"]'
         )
 
     if not s.pool:
@@ -306,8 +345,10 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
             "[pool.runner] and [pool.backend])" + hint
         )
 
-    # Shared across every pool — one repo+PAT, one lock/http per daemon.
-    github = GithubConfig(repo=s.github.repo, token=token)
+    # Shared across every pool — one App identity + target set, one lock/http
+    # per daemon.
+    github = GithubConfig(app_id=s.github.app_id, private_key=private_key)
+    access = AccessConfig(targets=targets)
     controller = ControllerConfig(
         lock_path=s.controller.lock_path,
         http_addr=s.controller.http_addr,
@@ -316,7 +357,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         image_cache_dir=s.controller.image_cache_dir,
     )
 
-    configs = [_pool_config(p, github, controller) for p in s.pool]
+    configs = [_pool_config(p, github, access, controller) for p in s.pool]
 
     names = [c.backend.name for c in configs]
     if len(set(names)) != len(names):
@@ -339,7 +380,9 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
     return configs
 
 
-def _pool_config(p, github: GithubConfig, controller: ControllerConfig) -> Config:
+def _pool_config(
+    p, github: GithubConfig, access: AccessConfig, controller: ControllerConfig
+) -> Config:
     """Assemble one pool's runtime `Config` from its parsed pydantic model `p`."""
     b = p.backend
     backend = BackendConfig(
@@ -374,10 +417,11 @@ def _pool_config(p, github: GithubConfig, controller: ControllerConfig) -> Confi
     )
     return Config(
         github=github,
+        access=access,
         runner=RunnerConfig(
             version=p.runner.version,
             labels=list(p.runner.labels),
-            runner_group_id=p.runner.runner_group_id,
+            runner_group=p.runner.runner_group,
             gpu=p.runner.gpu,
             prebaked=p.runner.prebaked,
             scrape_cidr=p.runner.scrape_cidr,

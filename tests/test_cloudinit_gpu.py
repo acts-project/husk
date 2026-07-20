@@ -59,5 +59,5 @@ def test_gpu_on_still_a_superset_of_the_base_template():
 
 
 def test_runner_config_defaults_gpu_off():
-    cfg = RunnerConfig(version="2.334.0", labels=["self-hosted"], runner_group_id=1)
+    cfg = RunnerConfig(version="2.334.0", labels=["self-hosted"], runner_group="husk")
     assert cfg.gpu is False

@@ -10,6 +10,10 @@ import pytest
 
 from husk.cloudinit import render_cloud_init
 
+FAKE_PEM = (
+    "-----BEGIN RSA PRIVATE KEY-----\\nnotreal\\n-----END RSA PRIVATE KEY-----\\n"
+)
+
 _START = "systemctl start husk-node-exporter.service"
 _NFT_APPLY = "/usr/sbin/nft -f /etc/nftables/husk-egress.nft"
 
@@ -90,13 +94,19 @@ def test_metrics_compose_with_gpu():
 def test_loader_rejects_scrape_cidr_without_prebaked(tmp_path, monkeypatch):
     from husk.config import load_configs
 
-    monkeypatch.setenv("GH_TOKEN", "ghp_x")  # else the PAT check fires first
+    monkeypatch.setenv(
+        "HUSK_GITHUB__PRIVATE_KEY",
+        FAKE_PEM,
+    )
 
     cfg = tmp_path / "c.toml"
     cfg.write_text(
         """
 [github]
-repo = "o/r"
+app_id = 123456
+
+[access]
+targets = ["org:acts-project"]
 
 [[pool]]
 name = "p1"

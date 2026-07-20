@@ -13,9 +13,16 @@ from husk.cli import huskctl_app
 from husk.fake_backend import FakeBackend, FakeGitHub
 
 
-def _recycle(*args, **kwargs):
-    """Drive the (now async) helper to completion — it awaits the runner listing."""
-    return asyncio.run(_arecycle(*args, **kwargs))
+def _recycle(backend, github, **kwargs):
+    """Drive the (now async) helper to completion. It takes a LIST of clients now
+    — one per target the pool serves — so wrap the single fake."""
+    return asyncio.run(_arecycle(backend, [github], **kwargs))
+
+
+class _NullTokens:
+    """Recycle only needs a client per target; no real credential is involved."""
+
+    async def aclose(self) -> None: ...
 
 
 def _names(slots):
@@ -26,7 +33,10 @@ _cli = CliRunner()
 
 _TWO_POOLS = """
 [github]
-repo = "acts-project/husk-test"
+app_id = 123456
+
+[access]
+targets = ["org:acts-project"]
 [[pool]]
 name = "openstack-cpu"
 [pool.runner]
@@ -47,7 +57,10 @@ type = "libvirt"
 def _two_pool_cli(tmp_path, monkeypatch):
     """Write a 2-pool config and stub _build so each pool gets its own fake
     backend (one ACTIVE slot each). Returns (config_path, {pool: backend})."""
-    monkeypatch.setenv("GH_TOKEN", "ghp_x")
+    monkeypatch.setenv(
+        "HUSK_GITHUB__PRIVATE_KEY",
+        "-----BEGIN RSA PRIVATE KEY-----\nnotreal\n-----END RSA PRIVATE KEY-----\n",
+    )
     cfg = tmp_path / "config.toml"
     cfg.write_text(_TWO_POOLS)
     backends = {
@@ -59,8 +72,10 @@ def _two_pool_cli(tmp_path, monkeypatch):
         ),
     }
     monkeypatch.setattr(
-        "husk.cli._build", lambda c: (backends[c.backend.name], FakeGitHub())
+        "husk.cli._backend_for", lambda c, image_sync=None: backends[c.backend.name]
     )
+    monkeypatch.setattr("husk.cli._tokens", lambda c: _NullTokens())
+    monkeypatch.setattr("husk.github.GitHubClient", lambda **kw: FakeGitHub())
     return str(cfg), backends
 
 

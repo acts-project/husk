@@ -13,6 +13,7 @@ import urllib.request
 import pytest
 
 from husk.config import (
+    AccessConfig,
     BackendConfig,
     Config,
     ControllerConfig,
@@ -24,6 +25,9 @@ from husk.controller import Controller
 from husk.fake_backend import FakeBackend, FakeGitHub
 from husk.poller import SnapshotRegistry
 from husk.slot import Runner, Slot
+from husk.target import Target
+
+TEST_TARGET = Target.org("acts-project")
 
 
 class FakeClock:
@@ -47,9 +51,10 @@ def make_config(
     shrink_ticks: int = 3,
 ) -> Config:
     return Config(
-        github=GithubConfig(repo="acts-project/husk-test", token="x"),
+        github=GithubConfig(app_id=123456, private_key="-----FAKE PRIVATE KEY-----"),
+        access=AccessConfig(targets=(TEST_TARGET,)),
         runner=RunnerConfig(
-            version="2.334.0", labels=["self-hosted"], runner_group_id=1
+            version="2.334.0", labels=["self-hosted"], runner_group="husk"
         ),
         backend=BackendConfig(
             name="fake",

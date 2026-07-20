@@ -6,15 +6,19 @@
 # pool. A single-backend setup is just one [[pool]] (see config.libvirt.example.toml).
 #
 # Log verbosity: --log-level DEBUG (or -l), or $HUSK_LOG_LEVEL (default INFO).
-# The GitHub PAT is NOT stored here. It is resolved in priority order:
-#   1. $HUSK_GITHUB__PAT            (explicit override)
-#   2. $GH_TOKEN                    (local dev — just `export GH_TOKEN=ghp_...`)
-#   3. [github].pat_path file       (k8s Secret mount, 0400)
+# The App private key is NOT stored here. It is resolved in priority order:
+#   1. $HUSK_GITHUB__PRIVATE_KEY    (the PEM contents, e.g. from a secret store)
+#   2. [github].private_key_path    (path to the .pem; k8s Secret mount, 0400)
 
-[github]                               # shared: one repo + PAT for every pool
-repo = "acts-project/husk-test"
-# pat_env = "GH_TOKEN"               # env var name for local dev (this is the default)
-# pat_path = "/etc/husk/github-pat"  # k8s Secret mount
+[github]                               # GitHub App identity (replaces repo + PAT)
+app_id = 123456                        # from the App's settings page
+private_key_path = "/etc/husk/husk-app.pem"   # or env HUSK_GITHUB__PRIVATE_KEY (PEM contents)
+
+[access]                               # TEMP (Phase 2): explicit targets.
+# Phase 3 replaces this with the two-list allowlist:
+#   allowed_orgs  = ["acts-project"]   # whole org  -> org-level runners
+#   allowed_repos = ["owner/name"]     # this repo  -> repo-level runners
+targets = ["org:acts-project"]
 
 [controller]                           # shared: one lock / state / http per daemon
 lock_path = "/tmp/huskd.lock"
@@ -37,7 +41,7 @@ name = "openstack-cpu"
 [pool.runner]
 version = "2.334.0"
 labels = ["self-hosted", "linux", "x64", "husk-cpu"]   # jobs route here via these labels
-runner_group_id = 1
+runner_group = "husk"
 # prebaked = true  # set ONLY when image_ref points at a husk golden: cloud-init then
 #                  # skips the runner/podman install and `version` must match the image.
 # In-guest metrics (observability.md). Opens :9100 (node_exporter, baked into the
@@ -80,7 +84,7 @@ name = "libvirt-gpu"
 [pool.runner]
 version = "2.334.0"
 labels = ["self-hosted", "linux", "x64", "gpu"]   # jobs route here via "gpu"
-runner_group_id = 1
+runner_group = "husk"
 gpu = true                             # activate the NVIDIA driver (modprobe + CDI) each boot
 prebaked = true                        # husk-gpu golden: skip install (version must match the image)
 # In-guest metrics (observability.md). On libvirt the guest is on a private net

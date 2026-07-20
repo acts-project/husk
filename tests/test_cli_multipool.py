@@ -12,6 +12,10 @@ from husk.cli import huskctl_app
 from husk.slot import SlotState
 from husk.snapshot import ControllerState
 
+FAKE_PEM = (
+    "-----BEGIN RSA PRIVATE KEY-----\\nnotreal\\n-----END RSA PRIVATE KEY-----\\n"
+)
+
 runner = CliRunner()
 
 
@@ -41,7 +45,10 @@ def _snaps():
 
 _CONFIG = """
 [github]
-repo = "acts-project/husk-test"
+app_id = 123456
+
+[access]
+targets = ["org:acts-project"]
 [controller]
 http_addr = "{http_addr}"
 
@@ -64,7 +71,10 @@ type = "libvirt"
 
 
 def _config(tmp_path, monkeypatch, http_addr: str) -> str:
-    monkeypatch.setenv("GH_TOKEN", "ghp_x")
+    monkeypatch.setenv(
+        "HUSK_GITHUB__PRIVATE_KEY",
+        FAKE_PEM,
+    )
     cfg = tmp_path / "config.toml"
     cfg.write_text(_CONFIG.format(http_addr=http_addr))
     return str(cfg)
@@ -88,7 +98,10 @@ def test_build_forwards_shared_image_sync(tmp_path, monkeypatch):
     monkeypatch.setattr(lb, "LibvirtBackend", Cap)
     monkeypatch.setattr(ob, "OpenStackBackend", Cap)
     monkeypatch.setattr(gh, "GitHubClient", lambda **kw: object())
-    monkeypatch.setenv("GH_TOKEN", "ghp_x")
+    monkeypatch.setenv(
+        "HUSK_GITHUB__PRIVATE_KEY",
+        FAKE_PEM,
+    )
 
     cfg_path = tmp_path / "config.toml"
     cfg_path.write_text(_CONFIG.format(http_addr="127.0.0.1:9100"))

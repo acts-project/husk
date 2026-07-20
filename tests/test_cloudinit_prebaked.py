@@ -82,5 +82,5 @@ def test_prebaked_false_is_unchanged_full_path():
 
 
 def test_runner_config_defaults_prebaked_off():
-    cfg = RunnerConfig(version="2.334.0", labels=["self-hosted"], runner_group_id=1)
+    cfg = RunnerConfig(version="2.334.0", labels=["self-hosted"], runner_group="husk")
     assert cfg.prebaked is False

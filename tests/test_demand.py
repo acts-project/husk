@@ -49,7 +49,8 @@ def test_tick_publishes_desired_matching_snapshot():
     assert published.desired == snap.desired_total
 
 
-def test_target_defaults_to_configured_repo():
+def test_target_defaults_to_first_configured_target():
+    # With no explicit target the Controller takes the first from [access].targets.
     ctrl = make_controller(FakeBackend(), FakeGitHub(), make_config(), FakeClock())
-    assert ctrl.target == Target.repo("acts-project/husk-test")
+    assert ctrl.target == Target.org("acts-project")
     assert ctrl.pool == "fake"

@@ -2,9 +2,15 @@
 # backend is just one [[pool]]. See config.example.toml for a two-pool daemon
 # (OpenStack CPU + libvirt GPU at once).
 
-[github]
-repo = "acts-project/husk-test"
-pat_env = "GH_TOKEN"          # secret from env; never written to this file
+[github]                               # GitHub App identity (replaces repo + PAT)
+app_id = 123456                        # from the App's settings page
+private_key_path = "/etc/husk/husk-app.pem"   # or env HUSK_GITHUB__PRIVATE_KEY (PEM contents)
+
+[access]                               # TEMP (Phase 2): explicit targets.
+# Phase 3 replaces this with the two-list allowlist:
+#   allowed_orgs  = ["acts-project"]   # whole org  -> org-level runners
+#   allowed_repos = ["owner/name"]     # this repo  -> repo-level runners
+targets = ["org:acts-project"]
 
 [controller]
 lock_path = "/tmp/huskd.lock"
@@ -18,7 +24,7 @@ name = "libvirt-gpu"          # → backend name + default vm_prefix "husk-libvi
 [pool.runner]
 version = "2.334.0"
 labels = ["self-hosted", "linux", "x64", "gpu"]   # jobs target the GPU pool via `gpu`
-runner_group_id = 1
+runner_group = "husk"
 # gpu = true       # activate the NVIDIA driver (modprobe + CDI) each boot
 # prebaked = true  # set when image_ref points at a golden image: cloud-init skips
 #                  # the install steps (podman, runner, driver — all baked). In

@@ -110,24 +110,58 @@ def _configs_reloader(
     return reload
 
 
-def _build(cfg: Config, image_sync=None):
-    from husk.github import GitHubClient
+def _tokens(cfg: Config):
+    """The process-wide App credential. One provider serves every (target, pool):
+    installation tokens are per *account*, so pools sharing a target share a
+    token (and its refresh)."""
+    from husk.appauth import InstallationTokenProvider
 
+    return InstallationTokenProvider(cfg.github.app_id, cfg.github.private_key)
+
+
+def _backend_for(cfg: Config, image_sync=None):
     if cfg.backend.type == "libvirt":
         from husk.libvirt_backend import LibvirtBackend
 
-        backend = LibvirtBackend(cfg.backend, image_sync=image_sync)
-    else:
-        from husk.openstack_backend import OpenStackBackend
+        return LibvirtBackend(cfg.backend, image_sync=image_sync)
+    from husk.openstack_backend import OpenStackBackend
 
-        backend = OpenStackBackend(cfg.backend, image_sync=image_sync)
+    return OpenStackBackend(cfg.backend, image_sync=image_sync)
+
+
+def _build(cfg: Config, image_sync=None, *, tokens=None, target=None):
+    """One (backend, github client) pair for a pool, scoped to one target."""
+    from husk.github import GitHubClient
+
+    backend = _backend_for(cfg, image_sync=image_sync)
     github = GitHubClient(
-        repo=cfg.github.repo,
-        token=cfg.github.token,
+        target=target or cfg.access.targets[0],
+        tokens=tokens or _tokens(cfg),
         labels=cfg.runner.labels,
-        runner_group_id=cfg.runner.runner_group_id,
+        runner_group=cfg.runner.runner_group,
     )
     return backend, github
+
+
+def _target_naming(cfg: Config, target, n_targets: int) -> dict:
+    """Per-`(target, pool)` identity overrides for the backend config.
+
+    Runner names are how husk tells its own slots apart (`match_runner` is
+    prefix-based) and the runner APIs are target-wide, so two targets sharing a
+    backend MUST mint distinct names.
+
+    With a single target both are deliberately left alone: changing `vm_prefix`
+    would orphan every running VM (existing slots stop matching the prefix and
+    become invisible to reconcile), which is a live migration rather than a config
+    detail. So the fold only kicks in where it is actually required."""
+    from husk.config import _slug
+
+    if n_targets < 2:
+        return {}
+    return {
+        "name": f"{cfg.backend.name}@{target.name}",
+        "vm_prefix": f"{cfg.backend.vm_prefix}-{_slug(target.name)}",
+    }
 
 
 def _select_pool(cfgs: list[Config], pool: Optional[str]) -> Config:
@@ -384,24 +418,36 @@ def run(
         # One registry for the whole daemon: the centralized poller writes each
         # target's runner listing here and every pool's reconcile task reads it.
         registry = SnapshotRegistry()
+        tokens = _tokens(cfgs[0])  # shared App credential (targets are process-wide)
+        targets = cfgs[0].access.targets
         controllers = []
-        for cfg in cfgs:
-            try:
-                backend, github = _build(cfg, image_sync=image_sync)
-            except Exception as e:
-                typer.echo(
-                    f"pool {cfg.backend.name!r} failed to start, skipping: {e}",
-                    err=True,
+        # The reconcile unit is (target, pool) — one Controller each. Today the
+        # target set is static config; Phase 3 makes it dynamic and adds spawn/reap.
+        for target in targets:
+            for cfg in cfgs:
+                label = f"{target}/{cfg.backend.name}"
+                try:
+                    backend, github = _build(
+                        cfg, image_sync=image_sync, tokens=tokens, target=target
+                    )
+                except Exception as e:
+                    typer.echo(
+                        f"pool {label!r} failed to start, skipping: {e}", err=True
+                    )
+                    logging.getLogger("husk").error(
+                        "pool %s failed to build; skipping", label, exc_info=True
+                    )
+                    continue
+                sub = dataclasses.replace(
+                    cfg,
+                    controller=dataclasses.replace(cfg.controller, http_addr=""),
+                    backend=dataclasses.replace(
+                        cfg.backend, **_target_naming(cfg, target, len(targets))
+                    ),
                 )
-                logging.getLogger("husk").error(
-                    "pool %s failed to build; skipping", cfg.backend.name, exc_info=True
+                controllers.append(
+                    Controller(backend, github, sub, target=target, registry=registry)
                 )
-                continue
-            sub = dataclasses.replace(
-                cfg,
-                controller=dataclasses.replace(cfg.controller, http_addr=""),
-            )
-            controllers.append(Controller(backend, github, sub, registry=registry))
         if not controllers:
             typer.echo("no pools could be started", err=True)
             raise typer.Exit(code=1)
@@ -423,7 +469,7 @@ def run(
         )
         githubs = [c.github for c in controllers]
         if once:
-            asyncio.run(_once(facade, poller, githubs))
+            asyncio.run(_once(facade, poller, githubs, tokens))
         else:
             if not shared.http_addr:
                 typer.echo("controller.http_addr must be set", err=True)
@@ -441,6 +487,7 @@ def run(
                     facade,
                     poller,
                     githubs,
+                    tokens,
                     shared.http_addr,
                     ssh_targets=ssh_targets,
                     advertise_addr=shared.advertise_addr or shared.http_addr,
@@ -450,7 +497,7 @@ def run(
         lock.release()
 
 
-async def _once(facade: MultiPoolController, poller, githubs: list) -> None:
+async def _once(facade: MultiPoolController, poller, githubs: list, tokens) -> None:
     """Single reconcile pass: warm the registry, tick every pool, print, close."""
     try:
         await poller.poll_once()
@@ -460,12 +507,14 @@ async def _once(facade: MultiPoolController, poller, githubs: list) -> None:
     finally:
         for gh in githubs:
             await gh.aclose()
+        await tokens.aclose()
 
 
 async def _serve(
     facade: MultiPoolController,
     poller,
     githubs: list,
+    tokens,
     http_addr: str,
     *,
     ssh_targets: dict[tuple[str, str], str] | None = None,
@@ -514,6 +563,7 @@ async def _serve(
         await asyncio.gather(*tasks, return_exceptions=True)
         for gh in githubs:
             await gh.aclose()
+        await tokens.aclose()
         if scraper is not None:
             scraper.close()  # drop the multiplexed SSH control sockets
 
@@ -605,23 +655,46 @@ def reap(
     secrets_dir: _SecretsOpt = None,
     log_level: _LogLevelOpt = None,
 ) -> None:
-    """Delete all offline runner registrations from GitHub (repo-wide)."""
+    """Delete all offline runner registrations from GitHub, across every target."""
     _setup_logging(log_level)
     cfgs = _load_all(config, secrets_dir)
-    # reap_offline is repo-wide and label-agnostic, so any pool's client does it.
-    _, github = _build(cfgs[0])
+    from husk.github import GitHubClient
+
+    # reap_offline is target-wide and label-agnostic, so one client per target
+    # covers every pool serving it.
+    tokens = _tokens(cfgs[0])
 
     async def go():
+        out: list[tuple[str, list[str]]] = []
+        clients = [
+            GitHubClient(
+                target=t,
+                tokens=tokens,
+                labels=cfgs[0].runner.labels,
+                runner_group=cfgs[0].runner.runner_group,
+            )
+            for t in cfgs[0].access.targets
+        ]
         try:
-            return await github.reap_offline()
+            for gh in clients:
+                try:
+                    out.append((str(gh.target), await gh.reap_offline()))
+                except Exception as e:  # one bad target must not hide the others
+                    typer.echo(f"reap failed for {gh.target}: {e}", err=True)
         finally:
-            await github.aclose()
+            for gh in clients:
+                await gh.aclose()
+            await tokens.aclose()
+        return out
 
-    names = asyncio.run(go())
-    typer.echo(f"reaped {len(names)} offline runner(s): {names}")
+    total = 0
+    for target, names in asyncio.run(go()):
+        typer.echo(f"{target}: reaped {len(names)} offline runner(s): {names}")
+        total += len(names)
+    typer.echo(f"reaped {total} offline runner(s) in total")
 
 
-async def _recycle(backend, github, *, names, all_slots, force, dry_run):
+async def _recycle(backend, githubs, *, names, all_slots, force, dry_run):
     """Select and stop slots so huskd rebuilds them on its next tick.
 
     Stopping a slot drives it to SHUTOFF, which the controller classifies as
@@ -633,10 +706,14 @@ async def _recycle(backend, github, *, names, all_slots, force, dry_run):
     from husk.slot import match_runner
 
     current = backend.list_slots()  # may raise ListSlotsError → caller aborts
-    try:
-        runners = await github.list_runners()
-    except Exception:
-        runners = []  # busy detection is best-effort; without it, don't block
+    # Busy detection is best-effort and spans every target the pool serves — a
+    # slot's runner lives on whichever target minted it.
+    runners = []
+    for gh in githubs:
+        try:
+            runners += await gh.list_runners()
+        except Exception:
+            pass  # without it, don't block the recycle
 
     if all_slots:
         targets, unknown = list(current), []
@@ -722,24 +799,39 @@ def recycle(
     pools = cfgs if (all_slots and pool is None) else [_select_pool(cfgs, pool)]
     multi = len(pools) > 1
 
+    from husk.github import GitHubClient
+
+    tokens = _tokens(cfgs[0])
     total_acted, any_unknown, any_err = 0, False, False
     for cfg in pools:
-        backend, github = _build(cfg)
+        backend = _backend_for(cfg)
+        # One client per target: a pool's slots may have been minted against any
+        # of them, so busy detection has to look at all.
+        githubs = [
+            GitHubClient(
+                target=tg,
+                tokens=tokens,
+                labels=cfg.runner.labels,
+                runner_group=cfg.runner.runner_group,
+            )
+            for tg in cfg.access.targets
+        ]
         if multi:
             typer.echo(f"── {cfg.backend.name} ──")
 
-        async def go(backend=backend, github=github):
+        async def go(backend=backend, githubs=githubs):
             try:
                 return await _recycle(
                     backend,
-                    github,
+                    githubs,
                     names=names or [],
                     all_slots=all_slots,
                     force=force,
                     dry_run=dry_run,
                 )
             finally:
-                await github.aclose()
+                for gh in githubs:
+                    await gh.aclose()
 
         try:
             acted, skipped, unknown = asyncio.run(go())
@@ -761,6 +853,8 @@ def recycle(
             typer.echo("no matching slots")
         total_acted += len(acted)
         any_unknown = any_unknown or bool(unknown)
+
+    asyncio.run(tokens.aclose())
 
     if total_acted and not dry_run:
         typer.echo(

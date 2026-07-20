@@ -134,8 +134,27 @@ inline `list_runners()` raise is gone.
 - **Churn:** the one big mechanical rewrite, done while the domain is one PAT
   target so correctness is easy to check.
 
-### Phase 2 — GitHub App auth (swap PAT → App)
+### Phase 2 — GitHub App auth (swap PAT → App) ✅ SHIPPED
 *(targets still static/explicit — no discovery yet)*
+
+Shipped as described below, plus:
+- `husk/ghhttp.py` holds the shared API base / two-layer timeout / error type, so
+  `appauth` and `github` share plumbing without an import cycle.
+- **Reconcile is now genuinely `(target, pool)`**: one Controller per pair. With
+  >1 target the pool name and `vm_prefix` fold in the target (`gpu@acts-project`,
+  `husk-gpu-acts-project`) so names can't collide; with a single target both are
+  left untouched, because changing `vm_prefix` would orphan every running VM.
+- Runner-group resolution **degrades rather than fails**: an unknown name (or a
+  failed listing) falls back to Default/1. Free-plan orgs can't create groups at
+  all, so a hard failure here would be wrong.
+- One `InstallationTokenProvider` process-wide, serialized on a lock so N pools
+  sharing a target don't stampede the mint endpoint.
+- `huskctl reap`/`recycle` are now target-scoped: reap iterates every target;
+  recycle unions runner listings across targets for busy detection.
+- Verified by 321 unit tests plus an end-to-end smoke of the real `_serve`
+  composition on App auth (org + repo targets: JWT→installations→per-installation
+  tokens, `/orgs` vs `/repos` branching, group `husk`→7 on org and absent on repo,
+  per-target name isolation, clean shutdown).
 - `InstallationTokenProvider`: sign RS256 JWT (10-min exp, in-memory) from
   `app_id` + PEM; exchange for per-installation tokens
   (`POST /app/installations/{id}/access_tokens`), cache per installation_id,
