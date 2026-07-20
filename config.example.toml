@@ -12,7 +12,7 @@
 # pod template so editing it actually triggers a rolling restart.
 #
 # Check this file without touching a cloud, a hypervisor or GitHub:
-#   huskd validate -c config.toml     # exit 0 = valid, 2 = not, one line per problem
+#   huskctl validate -c config.toml   # exit 0 = valid, 2 = not, one line per problem
 # Unknown keys are errors, not defaults — a typo fails the load rather than quietly
 # leaving the default in place. Run it as a k8s initContainer so a bad ConfigMap
 # fails the rollout instead of starting a misconfigured daemon.

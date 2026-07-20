@@ -348,8 +348,12 @@ def _print_status(snap: ControllerState | None) -> None:
 
 
 # ------------------------------------------------------------------ validate
+# huskctl only, deliberately: `huskd` must stay a SINGLE-command Typer app, because
+# Typer makes the subcommand optional with one command and mandatory with two —
+# adding one here would break `ENTRYPOINT ["huskd"]` + `CMD ["--config", ...]` in
+# the container. Both console scripts ship in the same venv, so `huskctl validate`
+# is available wherever huskd is.
 @huskctl_app.command("validate")
-@huskd_app.command("validate")
 def validate(
     config: _ConfigOpt = Path("config.toml"),
     secrets_dir: _SecretsOpt = None,
