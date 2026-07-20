@@ -14,10 +14,12 @@ coroutine the CLI awaits to run it on the main event loop.
 
 All endpoints read the SAME in-memory snapshot provider (a 0-arg callable
 returning `list[ControllerState]`, swapped atomically per tick), so they never
-touch the backends and a cross-thread read is safe. The reconcile loop runs in a
-background thread; this app owns the event loop on the main thread (see
-`husk.cli._serve`). No auth: it exposes slot ids / runner names (not secrets) —
-bind to localhost unless it sits behind network controls.
+touch the backends and a read is always of a complete, immutable state. This app
+shares one event loop with the centralized runner poller and every pool's
+reconcile task (see `husk.cli._serve`); reconcile keeps its blocking backend work
+off that loop via `asyncio.to_thread`, so a wedged hypervisor can't stall these
+handlers. No auth: it exposes slot ids / runner names (not secrets) — bind to
+localhost unless it sits behind network controls.
 """
 
 from __future__ import annotations

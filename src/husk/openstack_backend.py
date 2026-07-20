@@ -81,9 +81,10 @@ def _fixed_ip(server) -> str | None:
 
 
 # Per-request bound on every Nova/Glance call. Without it a hung CERN API call
-# (e.g. a rebuild POST that stalls before eventually 500-ing) blocks the pool's
-# whole reconcile thread indefinitely. This caps the stall; a slow call fails the
-# one tick and retries next, instead of wedging the loop.
+# (e.g. a rebuild POST that stalls before eventually 500-ing) pins one of the
+# worker threads the reconcile task offloads to (`asyncio.to_thread`) and stalls
+# that pool indefinitely. This caps it; a slow call fails the one tick and retries
+# next, instead of wedging the pool.
 _API_TIMEOUT_S = 30
 
 
@@ -117,7 +118,7 @@ class OpenStackBackend:
         self._synced_ref = ""  # the ref behind the current image_id (sync no-op guard)
         self._image_digest: str | None = None
         self.image_id: str | None = None
-        # Heavy staging (oras pull + Glance upload) runs off the reconcile thread
+        # Heavy staging (oras pull + Glance upload) runs off the reconcile path
         # as a keyed op; the tick only adopts a ready result. A dedicated upload
         # connection keeps the worker's Glance calls off the tick's compute conn.
         self._ops = OpStore()

@@ -3,11 +3,19 @@ plus the CLI's pool fan-out (--all across every pool)."""
 
 from __future__ import annotations
 
+import asyncio
+
 from typer.testing import CliRunner
 
 from conftest import make_runner, make_slot
-from husk.cli import _recycle, huskctl_app
+from husk.cli import _recycle as _arecycle
+from husk.cli import huskctl_app
 from husk.fake_backend import FakeBackend, FakeGitHub
+
+
+def _recycle(*args, **kwargs):
+    """Drive the (now async) helper to completion — it awaits the runner listing."""
+    return asyncio.run(_arecycle(*args, **kwargs))
 
 
 def _names(slots):

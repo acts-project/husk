@@ -117,18 +117,21 @@ class FakeGitHub:
         self.calls: list[tuple] = []
         self._jit = itertools.count(1)
 
-    def list_runners(self) -> list[Runner]:
+    async def list_runners(self) -> list[Runner]:
         if self.raise_on_list:
             raise RuntimeError("injected GitHub list failure")
         return list(self.runners)
 
-    def generate_jitconfig(self, name: str) -> str:
+    async def generate_jitconfig(self, name: str) -> str:
         self.calls.append(("mint", name))
         return f"jit-{name}-{next(self._jit)}"
 
-    def delete_runner(self, runner_id: int) -> None:
+    async def delete_runner(self, runner_id: int) -> None:
         self.calls.append(("delete_runner", runner_id))
         self.runners = [r for r in self.runners if r.id != runner_id]
+
+    async def aclose(self) -> None:
+        """Mirror the real client's shutdown hook (no pool to release here)."""
 
     def ops(self) -> list[str]:
         return [c[0] for c in self.calls]

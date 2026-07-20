@@ -15,6 +15,7 @@ aborts before any classification or mutation. A *raise* must never be read as
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import itertools
 import logging
@@ -26,12 +27,20 @@ from husk.bootreport import parse_bootreport
 from husk.cloudinit import render_cloud_init
 from husk.config import Config
 from husk.demand import DemandRegistry
+from husk.poller import SnapshotRegistry
 from husk.slot import Runner, Slot, SlotState, classify, match_runner
 from husk.snapshot import ControllerState
 from husk.target import Target
 from husk.timing import SlotTiming
 
 log = logging.getLogger("husk.controller")
+
+# How stale the centralized poller's runner snapshot may be before a tick refuses
+# to act on it. A failed poll keeps the last good snapshot (a blip must not stall
+# reconciliation), so this is what still guarantees today's "GitHub is down ⇒ take
+# no action" safety. Generous by design: at the default 30s poll cadence this is
+# several missed polls, so only a sustained outage trips it.
+RUNNER_SNAPSHOT_MAX_AGE_S = 180.0
 
 # Max serial-console reads per bring-up while chasing a slot's husk-bootreport
 # block (the block flushes shortly after the runner registers). At a ~30s poll
@@ -86,6 +95,8 @@ class Controller:
         reload_config: Callable[[], Config | None] | None = None,
         target: Target | None = None,
         demand: DemandRegistry | None = None,
+        registry: SnapshotRegistry | None = None,
+        runner_snapshot_max_age: float = RUNNER_SNAPSHOT_MAX_AGE_S,
     ) -> None:
         self.backend = backend
         self.github = github
@@ -94,12 +105,17 @@ class Controller:
         # Reconcile is re-keyed pool → (target, pool). Today there is exactly one
         # static target per pool, derived from the configured owner/repo; the App
         # migration makes the target set dynamic without this loop changing. The
-        # demand registry is the seam reconcile reads `desired` from — an injected
-        # one lets a future centralized poller be the producer; else a private one
-        # that this same loop fills inline (identical value, Phase 0).
+        # demand registry is the seam reconcile reads `desired` from — a webhook
+        # becomes a second producer in Phase 4 without this loop changing either.
         self.target = target or Target.repo(config.github.repo)
         self.pool = config.backend.name
         self.demand = demand or DemandRegistry()
+        # Runner listings come from the centralized poller via this registry, never
+        # from an inline GitHub call. GitHub *writes* (JIT mint, deregister) are
+        # still issued straight from reconcile — they are per-slot and can't be
+        # batched behind a poll.
+        self.registry = registry or SnapshotRegistry()
+        self._runner_max_age = runner_snapshot_max_age
         # Optional hot-reload hook: called once per tick from run(); returns a
         # freshly loaded Config when the file changed (else None). cli.py wires an
         # mtime-guarded loader; tests leave it None (tick() stays reload-free).
@@ -139,24 +155,6 @@ class Controller:
             counts={st.value: 0 for st in SlotState},
             slots=[],
         )
-
-    # ------------------------------------------------------------------ run
-    def run(self) -> None:
-        """Blocking reconcile loop. Caller is responsible for the lock."""
-        log.info(
-            "huskd starting: backend=%s min_ready=%d max_total=%d poll=%.0fs",
-            self.cfg.backend.name,
-            self.cfg.backend.min_ready,
-            self.cfg.backend.max_total,
-            self.cfg.timeouts.poll_interval_sec,
-        )
-        while True:
-            self._maybe_reload()
-            try:
-                self.tick()
-            except Exception:  # never let a single tick kill the loop
-                log.exception("unhandled error in tick")
-            time.sleep(self.cfg.timeouts.poll_interval_sec)
 
     # -------------------------------------------------------------- hot reload
     def _maybe_reload(self) -> None:
@@ -236,34 +234,57 @@ class Controller:
             )
 
     # ----------------------------------------------------------------- tick
-    def tick(self) -> ControllerState | None:
+    async def tick(self) -> ControllerState | None:
         now = self._clock()
 
         # 0. IMAGE SYNC — ensure each host holds the configured golden image
         #    before any create/rebuild this tick (a no-op once synced; on a ref
         #    change it stages the new image and slots drain onto it below).
-        self._sync_images()
+        await asyncio.to_thread(self._sync_images)
 
         # 1. FAIL-SAFE SNAPSHOT — a raise aborts the whole tick (no mutations).
+        #    Slot data is always read fresh here (never cached): the backend is the
+        #    source of truth for existence, and acting on a stale slot list could
+        #    duplicate or orphan VMs.
         try:
-            slots = self.backend.list_slots()
+            slots = await asyncio.to_thread(self.backend.list_slots)
         except ListSlotsError:
             log.error("list_slots failed; aborting tick (no mutations)", exc_info=True)
             return self.snapshot
-        try:
-            runners: list[Runner] = self.github.list_runners()
-        except Exception:
+
+        # Runner data comes from the centralized poller. Missing (never polled) or
+        # stale (sustained GitHub outage) both abort the tick — the same fail-safe
+        # the old inline `list_runners()` raise gave us. A merely *late* poll is
+        # fine: the snapshot stays usable until it ages out.
+        runners: list[Runner] | None = self.registry.runners(self.target)
+        age = self.registry.age(self.target)
+        if runners is None:
             log.error(
-                "list_runners failed; aborting tick (no mutations)", exc_info=True
+                "no runner snapshot for %s yet; aborting tick (no mutations)",
+                self.target,
+            )
+            return self.snapshot
+        if age is not None and age > self._runner_max_age:
+            log.error(
+                "runner snapshot for %s is %.0fs stale (max %.0fs); "
+                "aborting tick (no mutations)",
+                self.target,
+                age,
+                self._runner_max_age,
             )
             return self.snapshot
 
-        log.debug("tick: %d managed slot(s), %d runner(s)", len(slots), len(runners))
+        log.debug(
+            "tick: %d managed slot(s), %d runner(s) (snapshot %.0fs old)",
+            len(slots),
+            len(runners),
+            age or 0.0,
+        )
 
         self._gc_bookkeeping({s.id for s in slots})
         for s in slots:
             self._first_sight(s, now)
-            self._note_active_transition(s, now)
+            await self._note_active_transition(s, now)
 
         # Account the just-elapsed interval to each slot's prior state (read from
         # first_seen_state before this tick's classify overwrites it).
@@ -279,8 +300,8 @@ class Controller:
         # 2. CLASSIFY
         classified = self._classify_all(slots, runners, now)
         busy = sum(1 for _, _, st in classified if st is SlotState.BUSY)
-        self._track_runner_presence(classified, now)
-        self._capture_bootreports(classified, now)
+        await self._track_runner_presence(classified, now)
+        await self._capture_bootreports(classified, now)
 
         # 3-prep. POOL SIZING — computed BEFORE remediation so an excess slot can
         # be retired at its natural poweroff point (NEEDS_RECYCLE) instead of being
@@ -315,10 +336,10 @@ class Controller:
         # 3. PER-SLOT REMEDIATION (one action max per slot)
         for s, runner, state in classified:
             if s.id in self.pending_start:
-                self._drain_pending_start(s, now)
+                await self._drain_pending_start(s, now)
                 continue
             if state is SlotState.ERROR:
-                self._destroy(s, "error")
+                await self._destroy(s, "error")
             elif state is SlotState.NEEDS_RECYCLE:
                 if surplus_remaining > 0:
                     # This powered-off slot is surplus. Don't rebuild it — either
@@ -330,15 +351,15 @@ class Controller:
                             "retiring excess slot %s at poweroff (sustained surplus)",
                             s.id,
                         )
-                        self._destroy(s, "decommission")
+                        await self._destroy(s, "decommission")
                         did_retire = True
                 else:
-                    self._rebuild_then_start(s, now)
+                    await self._rebuild_then_start(s, now)
             elif state is SlotState.BUSY:
                 if self._state_age(s.id, now) > self.cfg.timeouts.max_job_duration_sec:
                     log.warning("slot %s busy past max_job_duration; stopping", s.id)
-                    self._safe(
-                        lambda: self.backend.stop_slot(s),
+                    await self._safe(
+                        asyncio.to_thread(self.backend.stop_slot, s),
                         f"stop {s.id}",
                         slot_id=s.id,
                     )
@@ -358,25 +379,25 @@ class Controller:
                         s.id,
                         "stale image" if stale else "idle_timeout",
                     )
-                    self._safe(
-                        lambda: self.github.delete_runner(runner.id), "delete_runner"
+                    await self._safe(
+                        self.github.delete_runner(runner.id), "delete_runner"
                     )
             elif state is SlotState.UNHEALTHY:
                 log.warning(
                     "slot %s unhealthy (no runner past grace); rebuilding", s.id
                 )
-                self._rebuild_then_start(s, now)
+                await self._rebuild_then_start(s, now)
             # STARTING: nothing — re-check next tick.
 
         # 4/5. GROW or RAMP DOWN (mutually exclusive — never thrash within a tick).
         # Sizing + surplus hysteresis were computed in 3-prep above; an excess slot
         # that was already off got retired in step 3.
         if desired - total > 0:
-            self._grow(desired - total, now)
+            await self._grow(desired - total, now)
         elif shrink_now and not did_retire:
             # No excess slot was powered off to retire this tick → decommission an
             # idle slot (the no-load downscale path; a no-op if none are idle).
-            self._ramp_down(classified)
+            await self._ramp_down(classified)
             did_retire = True
         if did_retire:
             self._surplus_ticks = 0
@@ -402,14 +423,17 @@ class Controller:
         )
         return self.snapshot
 
-    def observe(self) -> ControllerState:
-        """Read-only classification snapshot for `huskctl status` — no mutations.
+    async def observe(self) -> ControllerState:
+        """Read-only classification snapshot — no mutations.
 
-        Raises through any listing failure (the CLI surfaces it); unlike `tick`,
-        there is nothing to fail safe *about* here since we never mutate."""
+        Raises through a slot-listing failure (the caller surfaces it); unlike
+        `tick`, there is nothing to fail safe *about* here since we never mutate.
+        Runners come from the poller's registry, treating "never polled" as an
+        empty listing rather than an error — an observer should still render the
+        slots it can see."""
         now = self._clock()
-        slots = self.backend.list_slots()
-        runners = self.github.list_runners()
+        slots = await asyncio.to_thread(self.backend.list_slots)
+        runners = self.registry.runners(self.target) or []
         for s in slots:
             self._first_sight(s, now)
         classified = self._classify_all(slots, runners, now)
@@ -479,17 +503,17 @@ class Controller:
         fn = getattr(self.backend, "staging_ops", None)
         return fn() if fn else []
 
-    def _image_ready(self, slot: Slot) -> bool:
+    async def _image_ready(self, slot: Slot) -> bool:
         """Whether the backend can re-image this slot yet. Grows are already gated
         by `capacity()` reporting zero while the golden stages; rebuilds need the
         same gate so a NEEDS_RECYCLE/UNHEALTHY slot doesn't drive `rebuild_slot`
         into a no-image error (and burn a JIT token) every tick during staging.
         Optional on the backend — absent ⇒ ready (fake/manual paths)."""
         fn = getattr(self.backend, "image_ready", None)
-        return fn(slot) if fn else True
+        return await asyncio.to_thread(fn, slot) if fn else True
 
-    def _rebuild_then_start(self, slot: Slot, now: float) -> None:
-        if not self._image_ready(slot):
+    async def _rebuild_then_start(self, slot: Slot, now: float) -> None:
+        if not await self._image_ready(slot):
             log.info(
                 "slot %s needs recycle but golden image still staging; deferring",
                 slot.id,
@@ -498,7 +522,7 @@ class Controller:
         cycle = self.cycle_counter.get(slot.id, slot.cycle) + 1
         name = runner_name(slot.name, cycle)
         try:
-            jit = self.github.generate_jitconfig(name)
+            jit = await self.github.generate_jitconfig(name)
             user_data = render_cloud_init(
                 jit,
                 self.cfg.runner.url,
@@ -506,7 +530,9 @@ class Controller:
                 prebaked=self.cfg.runner.prebaked,
                 scrape_cidr=self.cfg.runner.scrape_cidr,
             )
-            self.backend.rebuild_slot(slot, user_data=user_data, cycle=cycle)
+            await asyncio.to_thread(
+                self.backend.rebuild_slot, slot, user_data=user_data, cycle=cycle
+            )
             self.slot_errors.pop(slot.id, None)  # cleared on a successful rebuild
         except Exception as e:
             log.exception("rebuild of slot %s failed", slot.id)
@@ -525,7 +551,7 @@ class Controller:
         self.bootreport_attempts.pop(slot.id, None)
         log.info("rebuilt slot %s as runner %s (cycle %d)", slot.id, name, cycle)
 
-    def _drain_pending_start(self, slot: Slot, now: float) -> None:
+    async def _drain_pending_start(self, slot: Slot, now: float) -> None:
         """Issue os-start once a rebuild has settled. Nova preserves power state,
         so a slot that was SHUTOFF before rebuild is SHUTOFF again — which would
         re-trigger NEEDS_RECYCLE if we didn't intercept it here first."""
@@ -538,8 +564,8 @@ class Controller:
             return  # still settling
         if slot.status == "SHUTOFF":
             log.info("slot %s rebuild settled to SHUTOFF; os-starting", slot.id)
-            self._safe(
-                lambda: self.backend.start_slot(slot),
+            await self._safe(
+                asyncio.to_thread(self.backend.start_slot, slot),
                 f"start {slot.id}",
                 slot_id=slot.id,
             )
@@ -549,8 +575,8 @@ class Controller:
             log.debug("slot %s rebuilt while ACTIVE; no os-start needed", slot.id)
             self.pending_start.discard(slot.id)  # rebuilt-while-ACTIVE: no start needed
 
-    def _grow(self, want: int, now: float) -> None:
-        cap = self.backend.capacity()
+    async def _grow(self, want: int, now: float) -> None:
+        cap = await asyncio.to_thread(self.backend.capacity)
         budget = min(want, cap.free_instances) if cap.can_create else 0
         log.debug(
             "grow: want=%d capacity(can_create=%s free=%d) -> budget=%d",
@@ -560,14 +586,14 @@ class Controller:
             budget,
         )
         for _ in range(max(0, budget)):
-            self._create_one(now)
+            await self._create_one(now)
 
-    def _create_one(self, now: float) -> None:
+    async def _create_one(self, now: float) -> None:
         vm = vm_name(self.cfg.backend.vm_prefix, next(self._namer))
         name = runner_name(vm, 0)
         log.debug("creating slot %s (runner %s)", vm, name)
         try:
-            jit = self.github.generate_jitconfig(name)
+            jit = await self.github.generate_jitconfig(name)
             user_data = render_cloud_init(
                 jit,
                 self.cfg.runner.url,
@@ -575,7 +601,9 @@ class Controller:
                 prebaked=self.cfg.runner.prebaked,
                 scrape_cidr=self.cfg.runner.scrape_cidr,
             )
-            slot = self.backend.create_slot(user_data=user_data, name=vm, cycle=0)
+            slot = await asyncio.to_thread(
+                self.backend.create_slot, user_data=user_data, name=vm, cycle=0
+            )
         except Exception:
             log.exception("create of slot %s failed", vm)
             return  # one attempt; no retry storm, no orphaned ghost tracked
@@ -585,19 +613,20 @@ class Controller:
         self.timing[slot.id] = SlotTiming(first_seen=now, issued_at=now)
         log.info("created slot %s (%s)", slot.id, vm)
 
-    def _ramp_down(self, classified) -> None:
+    async def _ramp_down(self, classified) -> None:
         idle = [(s, r) for s, r, st in classified if st is SlotState.IDLE]
         if not idle:
             return
         slot, runner = min(idle, key=lambda sr: (sr[0].created_at, sr[0].name))
         log.info("ramping down idle slot %s (sustained surplus)", slot.id)
         if runner is not None:
-            self._safe(lambda: self.github.delete_runner(runner.id), "delete_runner")
-        self._destroy(slot, "decommission")
+            await self._safe(self.github.delete_runner(runner.id), "delete_runner")
+        await self._destroy(slot, "decommission")
 
-    def _destroy(self, slot: Slot, reason: str) -> None:
-        self._safe(
-            lambda: self.backend.destroy_slot(slot, reason=reason), f"destroy {slot.id}"
+    async def _destroy(self, slot: Slot, reason: str) -> None:
+        await self._safe(
+            asyncio.to_thread(self.backend.destroy_slot, slot, reason=reason),
+            f"destroy {slot.id}",
         )
         self._forget(slot.id)
 
@@ -628,7 +657,7 @@ class Controller:
                 self.last_provision_action[slot.id] = now  # fresh grace
                 log.debug("first sight of %s: granted fresh startup grace", slot.id)
 
-    def _track_runner_presence(self, classified, now: float) -> None:
+    async def _track_runner_presence(self, classified, now: float) -> None:
         """Keep the no-runner grace origin anchored to 'last had a runner'.
 
         A JIT runner deregisters at job end (and huskd deletes it on idle-reap),
@@ -658,8 +687,8 @@ class Controller:
                 self.runner_present.discard(s.id)
                 if s.status == "ACTIVE":  # draining toward SHUTOFF, not unhealthy
                     self.last_provision_action[s.id] = now
-                    self._safe(
-                        lambda: self.backend.mark_active(s),
+                    await self._safe(
+                        asyncio.to_thread(self.backend.mark_active, s),
                         f"mark_active {s.id}",
                         slot_id=s.id,
                     )
@@ -667,7 +696,7 @@ class Controller:
                         "slot %s runner gone while ACTIVE; draining (grace reset)", s.id
                     )
 
-    def _capture_bootreports(self, classified, now: float) -> None:
+    async def _capture_bootreports(self, classified, now: float) -> None:
         """Read the husk-bootreport block off each online slot's serial console and
         fold the systemd-analyze phase durations into its SlotTiming.
 
@@ -687,7 +716,7 @@ class Controller:
             attempt = self.bootreport_attempts.get(s.id, 0) + 1
             self.bootreport_attempts[s.id] = attempt
             try:
-                text = self.backend.console_output(s)
+                text = await asyncio.to_thread(self.backend.console_output, s)
             except Exception:  # defensive: the seam promises not to raise
                 log.warning("console_output %s failed", s.id, exc_info=True)
                 continue
@@ -732,7 +761,7 @@ class Controller:
                 _fmt(report.total_seconds),
             )
 
-    def _note_active_transition(self, slot: Slot, now: float) -> None:
+    async def _note_active_transition(self, slot: Slot, now: float) -> None:
         """Restart the startup-grace clock when a slot first reaches ACTIVE.
 
         The clock is otherwise stamped at create/rebuild *issue* time, but a fresh
@@ -753,8 +782,8 @@ class Controller:
             # Persist the grace origin so stateless observers (huskctl status) and
             # a restarted controller agree with us instead of re-deriving grace
             # from the create-time metadata (which would read UNHEALTHY).
-            self._safe(
-                lambda: self.backend.mark_active(slot),
+            await self._safe(
+                asyncio.to_thread(self.backend.mark_active, slot),
                 f"mark_active {slot.id}",
                 slot_id=slot.id,
             )
@@ -814,9 +843,15 @@ class Controller:
         combined.update(self.slot_errors)
         return combined
 
-    def _safe(self, fn, what: str, *, slot_id: str | None = None) -> None:
+    async def _safe(self, awaitable, what: str, *, slot_id: str | None = None) -> None:
+        """Await one fallible action, recording (not raising) its failure.
+
+        Callers hand in the awaitable directly — `asyncio.to_thread(backend.op, …)`
+        for a blocking backend call, or an async GitHub coroutine. Both defer their
+        work until awaited here, so this stays the single place an action's failure
+        is caught and pinned to a slot."""
         try:
-            fn()
+            await awaitable
             if slot_id is not None:
                 self.slot_errors.pop(slot_id, None)  # cleared on success
         except Exception as e:

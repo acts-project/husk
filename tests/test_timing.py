@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from conftest import make_config, make_controller, make_runner, make_slot
+from conftest import make_config, make_controller, make_runner, make_slot, tick
 from husk.fake_backend import FakeBackend, FakeGitHub
 from husk.slot import SlotState
 from husk.timing import SlotTiming
@@ -14,12 +14,12 @@ def test_live_fraction_accumulates(clock):
     github = FakeGitHub(runners=[runner])
     ctrl = make_controller(backend, github, make_config(max_total=1), clock)
 
-    ctrl.tick()  # establishes BUSY at t0, no interval yet
+    tick(ctrl)  # establishes BUSY at t0, no interval yet
     clock.advance(100)
-    ctrl.tick()  # 100s attributed to BUSY
+    tick(ctrl)  # 100s attributed to BUSY
     clock.advance(100)
     github.runners = [make_runner(id=1, name="husk-1-c0", status="online", busy=False)]
-    ctrl.tick()  # 100s attributed to BUSY (state during the interval), now IDLE
+    tick(ctrl)  # 100s attributed to BUSY (state during the interval), now IDLE
 
     t = ctrl.timing["vm-1"]
     assert t.state_seconds["busy"] == 200.0
@@ -34,22 +34,22 @@ def test_cloudinit_and_recycle_measured_on_bringup(clock):
     github = FakeGitHub()
     ctrl = make_controller(backend, github, make_config(max_total=1), clock)
 
-    ctrl.tick()  # SHUTOFF -> rebuild issued (issued_at=t), task=rebuilding
+    tick(ctrl)  # SHUTOFF -> rebuild issued (issued_at=t), task=rebuilding
     issued = ctrl.timing["vm-1"].issued_at
     assert issued is not None
 
     clock.advance(8)  # rebuild settles
     backend.set_status("vm-1", status="SHUTOFF", task_state=None)
-    ctrl.tick()  # pending_start drain -> os-start (fake sets ACTIVE this tick)
+    tick(ctrl)  # pending_start drain -> os-start (fake sets ACTIVE this tick)
 
     clock.advance(2)
     # Next tick observes the SHUTOFF->ACTIVE transition (on_active recorded).
-    ctrl.tick()
+    tick(ctrl)
     assert ctrl.timing["vm-1"].active_at is not None
 
     clock.advance(60)  # cloud-init installs the runner
     github.runners = [make_runner(id=1, name="husk-1-c1", status="online", busy=False)]
-    ctrl.tick()  # runner online -> cloud-init / recycle durations recorded
+    tick(ctrl)  # runner online -> cloud-init / recycle durations recorded
 
     t = ctrl.timing["vm-1"]
     assert t.last_cloudinit_seconds == 60.0  # ACTIVE -> online
@@ -62,9 +62,9 @@ def test_timing_surfaces_in_snapshot(clock):
     github = FakeGitHub(runners=[runner])
     ctrl = make_controller(backend, github, make_config(max_total=1), clock)
 
-    ctrl.tick()
+    tick(ctrl)
     clock.advance(50)
-    snap = ctrl.tick()
+    snap = tick(ctrl)
 
     v = snap.slots[0]
     assert v.live_fraction == 1.0
@@ -127,7 +127,7 @@ def test_bootreport_captured_from_console(clock):
     github = FakeGitHub(runners=[runner])
     ctrl = make_controller(backend, github, make_config(max_total=1), clock)
 
-    snap = ctrl.tick()
+    snap = tick(ctrl)
 
     t = ctrl.timing["vm-1"]
     assert t.last_boot_kernel_seconds == 2.1
@@ -137,7 +137,7 @@ def test_bootreport_captured_from_console(clock):
 
     # Captured once: a subsequent tick must not re-read the console.
     reads = _console_reads(backend)
-    ctrl.tick()
+    tick(ctrl)
     assert _console_reads(backend) == reads
 
 
@@ -148,7 +148,7 @@ def test_bootreport_blame_surfaces_in_snapshot(clock):
     github = FakeGitHub(runners=[runner])
     ctrl = make_controller(backend, github, make_config(max_total=1), clock)
 
-    snap = ctrl.tick()
+    snap = tick(ctrl)
 
     v = snap.slots[0]
     assert v.boot_units[0] == ("cloud-init-local.service", 2.9)
@@ -162,7 +162,7 @@ def test_bootreport_stale_block_rejected_until_new_ts(clock):
     github = FakeGitHub(runners=[runner])
     ctrl = make_controller(backend, github, make_config(max_total=1), clock)
 
-    ctrl.tick()
+    tick(ctrl)
     assert ctrl.timing["vm-1"].last_boot_total_seconds == 11.0
 
     # Re-arm capture exactly as the next bring-up (_rebuild_then_start) does: clear
@@ -171,12 +171,12 @@ def test_bootreport_stale_block_rejected_until_new_ts(clock):
     ctrl.bootreport_captured.discard("vm-1")
     ctrl.bootreport_attempts.pop("vm-1", None)
 
-    ctrl.tick()  # console still shows the old ts -> rejected, timing unchanged
+    tick(ctrl)  # console still shows the old ts -> rejected, timing unchanged
     assert "vm-1" not in ctrl.bootreport_captured
     assert ctrl.timing["vm-1"].last_boot_total_seconds == 11.0
 
     backend.console_text = _block("2026-07-10T12:05:00Z", 22.0)  # newer cycle flushed
-    ctrl.tick()
+    tick(ctrl)
     assert "vm-1" in ctrl.bootreport_captured
     assert ctrl.timing["vm-1"].last_boot_total_seconds == 22.0
 
@@ -192,7 +192,7 @@ def test_bootreport_attempts_bounded(clock):
     ctrl = make_controller(backend, github, make_config(max_total=1), clock)
 
     for _ in range(BOOTREPORT_MAX_ATTEMPTS + 3):
-        ctrl.tick()
+        tick(ctrl)
 
     assert _console_reads(backend) == BOOTREPORT_MAX_ATTEMPTS
     assert ctrl.timing["vm-1"].last_boot_total_seconds is None

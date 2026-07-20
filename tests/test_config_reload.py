@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 
 import pytest
-from conftest import make_config, make_controller
+from conftest import make_config, make_controller, tick
 from husk.fake_backend import FakeBackend, FakeGitHub
 
 
@@ -41,12 +41,12 @@ def test_hot_knobs_take_effect_on_next_tick(clock):
         backend, FakeGitHub(), make_config(min_ready=1, max_total=5), clock
     )
 
-    ctrl.tick()
+    tick(ctrl)
     assert backend.ops().count("create") == 1
 
     ctrl.apply_reloaded_config(make_config(min_ready=3, max_total=5))
     clock.advance(5)
-    ctrl.tick()
+    tick(ctrl)
     # pool was 1, desired now 3 → two more creates this tick
     assert backend.ops().count("create") == 3
 

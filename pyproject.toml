@@ -5,7 +5,10 @@ description = "Ephemeral GitHub Actions runners on CERN OpenStack (controller)"
 requires-python = ">=3.11"
 dependencies = [
     "openstacksdk",
-    "requests",
+    # Async HTTP for the GitHub client: native await + real cancellation via
+    # asyncio.wait_for (replaces the sync `requests` + daemon-thread deadline hack,
+    # which is why `requests` is no longer a direct dependency).
+    "httpx>=0.27",
     "typer>=0.26.8",
     "pydantic-settings>=2.14.2",
     "rich>=13",
@@ -17,7 +20,7 @@ dependencies = [
     # slow image staging off the reconcile thread — replaces hand-rolled backoff.
     "tenacity>=8.2",
     # huskd's single HTTP surface (dashboard + /status /metrics /healthz /events).
-    # Quart owns the event loop; the reconcile loop runs in a background thread.
+    # Quart shares one event loop with the runner poller and the reconcile tasks.
     # hypercorn is the ASGI server Quart's run_task drives.
     "quart>=0.19",
     "hypercorn>=0.16",

@@ -1,6 +1,7 @@
 """The huskd HTTP surface: a single async Quart app (Jinja dashboard + JSON
-status / Prometheus metrics / healthz / SSE), served on the main event loop while
-the reconcile loop runs in a background thread (see `husk.cli._serve`)."""
+status / Prometheus metrics / healthz / SSE), served on the same event loop that
+runs the centralized runner poller and every pool's reconcile task (see
+`husk.cli._serve`)."""
 
 from husk.web.app import (
     STALE_AFTER_SEC,

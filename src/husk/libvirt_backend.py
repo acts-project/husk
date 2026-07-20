@@ -429,7 +429,7 @@ class LibvirtBackend:
 
     def _host_ready(self, host: _HostConn) -> bool:
         """Can this host back a NEW slot yet? In OCI mode the golden is staged
-        asynchronously (off the reconcile thread), so a host is ready only once its
+        asynchronously (off the reconcile path), so a host is ready only once its
         image has landed (`image_digest` known); the manual/local-file path (a
         literal `image_name`) is always ready. Gating capacity + placement on this
         means the controller simply sees zero capacity while staging — it never

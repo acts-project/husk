@@ -4,7 +4,7 @@ without waiting for the idle timeout. Fresh-image idle slots are left alone."""
 
 from __future__ import annotations
 
-from conftest import make_config, make_controller, make_runner, make_slot
+from conftest import make_config, make_controller, make_runner, make_slot, tick
 
 from husk.fake_backend import FakeBackend, FakeGitHub
 
@@ -21,13 +21,13 @@ def _idle_setup(*, image_stale: bool, clock):
 
 def test_stale_idle_slot_is_drained(clock):
     ctrl, github = _idle_setup(image_stale=True, clock=clock)
-    ctrl.tick()
+    tick(ctrl)
     assert ("delete_runner", 7) in github.calls  # deregistered → will recycle
 
 
 def test_fresh_idle_slot_is_not_drained(clock):
     ctrl, github = _idle_setup(image_stale=False, clock=clock)
-    ctrl.tick()
+    tick(ctrl)
     assert "delete_runner" not in github.ops()  # nothing stale, far from idle_timeout
 
 
@@ -37,7 +37,7 @@ def test_sync_hook_absent_backend_is_noop(clock):
     backend = FakeBackend(slots=[slot])
     github = FakeGitHub(runners=[make_runner(id=1, name="husk-1-c0")])
     ctrl = make_controller(backend, github, make_config(), clock)
-    ctrl.tick()  # must not raise
+    tick(ctrl)  # must not raise
 
 
 def test_recycle_deferred_while_image_stages(clock):
@@ -49,7 +49,7 @@ def test_recycle_deferred_while_image_stages(clock):
     github = FakeGitHub()
     ctrl = make_controller(backend, github, make_config(), clock)
 
-    ctrl.tick()
+    tick(ctrl)
 
     assert "rebuild" not in backend.ops()
     assert "mint" not in [c[0] for c in github.calls]
@@ -62,7 +62,7 @@ def test_recycle_proceeds_once_image_ready(clock):
     github = FakeGitHub()
     ctrl = make_controller(backend, github, make_config(), clock)
 
-    ctrl.tick()
+    tick(ctrl)
 
     assert "rebuild" in backend.ops()
     assert ("mint", "husk-1-c5") in github.calls

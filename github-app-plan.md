@@ -104,14 +104,33 @@ and have a working system.
   Phase 1; kept separate because doing the re-keying in the familiar sync model
   de-risks it.
 
-### Phase 1 — Async + centralized poller (target-architecture refactor)
+### Phase 1 — Async + centralized poller (target-architecture refactor) ✅ SHIPPED
 *(still PAT, still one target)*
 - Port the GitHub client `requests` → `httpx`, sync → async; replace the
-  daemon-thread deadline hack (`github.py:20-96`) with `asyncio.wait_for`.
+  daemon-thread deadline hack with `asyncio.wait_for`. **Done** — httpx per-op
+  timeout + `wait_for` wall-clock backstop. `requests` dropped as a direct dep.
 - One centralized async poller task fills the `SnapshotRegistry`; reconcile becomes
   **async tasks** per `(target, pool)` reading the registry. Single async Quart
-  process; drop file state.
-- **Ships:** behavior identical, now async. Verify against Phase 0.
+  process. **Done** — `husk/poller.py`; `MultiPoolController.run(stop)` spawns one
+  asyncio task per pool; Quart + poller + reconcile share one event loop.
+- Backends stay synchronous by design: `Controller.tick()` pushes every backend
+  call through `asyncio.to_thread`, so we keep openstacksdk/libvirt-python rather
+  than hand-rolling REST. That wrapping is load-bearing — an unwrapped blocking
+  call stalls the whole loop. (openstacksdk is sync even though Nova is HTTP;
+  native-async Nova would mean reimplementing keystone auth + microversions, so
+  it's deferred as a possible later optimization.)
+- File state was already gone; nothing to drop.
+
+**Runner-snapshot freshness policy** (new, deliberate — carries into Phases 2–4):
+a failed poll **keeps the last good snapshot** so a GitHub blip can't stall
+reconciliation, while the controller **refuses a snapshot older than
+`RUNNER_SNAPSHOT_MAX_AGE_S` (180s)** and fail-safes the tick. That age check is
+what preserves the old "GitHub is down ⇒ take no action" guarantee now that the
+inline `list_runners()` raise is gone.
+
+- **Ships:** behavior identical, now async — 298 unit tests plus an end-to-end
+  smoke of the real `_serve` composition (poller polling, both pools reconciling
+  independently, all endpoints serving, loop responsive, clean SIGTERM).
 - **Churn:** the one big mechanical rewrite, done while the domain is one PAT
   target so correctness is easy to check.
 

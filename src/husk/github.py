@@ -1,15 +1,31 @@
-"""GitHub Actions runner management — lifted from phase3-recycle.py's gh_*
-primitives and wrapped in a client class. PAT (Bearer) auth; the JIT mint keeps
-its 409→delete→retry idempotency (load-bearing on controller restart)."""
+"""GitHub Actions runner management — async client over `httpx`.
+
+PAT (Bearer) auth; the JIT mint keeps its 409→delete→retry idempotency
+(load-bearing on controller restart).
+
+Two layers bound every call, mirroring what the old sync client did with a
+hand-rolled daemon thread:
+
+* `_HTTP_TIMEOUT_S` is httpx's per-operation timeout (connect/read/write/pool).
+* `_DEADLINE_S` is a wall-clock backstop via `asyncio.wait_for`, for the one thing
+  a per-op timeout can't bound: DNS. CPython resolves names through
+  `socket.getaddrinfo`, which has no timeout of its own and can hang indefinitely
+  after a laptop sleep/wake or a Wi-Fi/VPN flap wedges the resolver.
+
+Unlike the old daemon-thread deadline, `wait_for` genuinely *cancels* socket
+connect/read — it closes the transport rather than abandoning a thread. (The DNS
+case stays abandonment either way: asyncio resolves via its default thread
+executor, so a wedged `getaddrinfo` thread outlives the cancelled coroutine. That
+is a CPython property, not something this design gives up.)
+"""
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import queue
-import threading
-from typing import Any, Callable, TypeVar
+from typing import Any
 
-import requests
+import httpx
 
 from husk.slot import Runner
 
@@ -17,46 +33,13 @@ log = logging.getLogger("husk.github")
 
 GH_API = "https://api.github.com"
 
-# Cap every GitHub call so a hung/black-holed request can't wedge a reconcile tick.
-# This matters most under multi-pool: pools tick sequentially in one process, so an
-# unbounded GitHub call in one pool would stall every other pool's reconcile.
+# Cap every GitHub call so a hung/black-holed request can't wedge a reconcile
+# task. Pools reconcile concurrently on one event loop, so an unbounded call in
+# one pool must never stall another's ticks (or the HTTP surface).
 _HTTP_TIMEOUT_S = 30
 
-# Backstop for the one thing _HTTP_TIMEOUT_S can't bound: DNS resolution.
-# urllib3 calls the bare `socket.getaddrinfo()` before the requests timeout ever
-# applies, and that call has no timeout of its own — it can hang indefinitely,
-# most commonly after a laptop sleep/wake or a Wi-Fi/VPN flap wedges the
-# resolver. Give the normal connect/read timeout a healthy margin, then abandon
-# the call outright so one wedged lookup can't stall the reconcile loop forever.
+# Wall-clock backstop over the whole request — see the module docstring (DNS).
 _DEADLINE_S = _HTTP_TIMEOUT_S + 15
-
-T = TypeVar("T")
-
-
-def _call_with_deadline(fn: Callable[[], T], *, timeout: float, what: str) -> T:
-    """Run fn() on a throwaway daemon thread and enforce a hard wall-clock
-    deadline. Python has no way to interrupt a stuck C-level syscall (like a
-    wedged DNS lookup) from outside the thread running it, so on timeout we
-    abandon the thread rather than wait for it — it dies on its own whenever
-    the syscall eventually returns."""
-    outcome: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
-
-    def _run() -> None:
-        try:
-            outcome.put((True, fn()))
-        except BaseException as exc:  # re-raised on the caller's thread below
-            outcome.put((False, exc))
-
-    threading.Thread(target=_run, name=f"github-{what}", daemon=True).start()
-    try:
-        ok, value = outcome.get(timeout=timeout)
-    except queue.Empty:
-        raise requests.exceptions.Timeout(
-            f"{what} exceeded {timeout:.0f}s deadline (DNS/connect hang?)"
-        ) from None
-    if not ok:
-        raise value
-    return value
 
 
 class GitHubError(Exception):
@@ -71,38 +54,52 @@ class GitHubClient:
         token: str,
         labels: list[str],
         runner_group_id: int,
-        session: requests.Session | None = None,
+        client: httpx.AsyncClient | None = None,
     ) -> None:
         self.repo = repo
         self.labels = labels
         self.runner_group_id = runner_group_id
-        self._s = session or requests.Session()
-        self._s.headers.update(
-            {
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            }
-        )
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if client is None:
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(_HTTP_TIMEOUT_S), headers=headers
+            )
+        else:  # injected (tests): keep its transport, add our auth headers
+            self._client = client
+            self._client.headers.update(headers)
 
-    def _request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
-        """Single choke point for outbound calls: every request gets the same
-        connect/read timeout plus the DNS-hang deadline backstop."""
-        kwargs.setdefault("timeout", _HTTP_TIMEOUT_S)
-        return _call_with_deadline(
-            lambda: self._s.request(method, url, **kwargs),
-            timeout=_DEADLINE_S,
-            what=f"{method} {url}",
-        )
+    async def aclose(self) -> None:
+        """Release the connection pool. Called once at daemon shutdown."""
+        await self._client.aclose()
+
+    async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        """Single choke point for outbound calls: httpx's per-op timeout plus the
+        wall-clock deadline backstop.
+
+        The deadline surfaces as `httpx.TimeoutException` (a `RequestError`) so
+        every caller's existing `httpx.HTTPError` handler wraps it in the same
+        contextual `GitHubError` as any other transport failure."""
+        try:
+            return await asyncio.wait_for(
+                self._client.request(method, url, **kwargs), timeout=_DEADLINE_S
+            )
+        except (TimeoutError, asyncio.TimeoutError) as e:
+            raise httpx.TimeoutException(
+                f"{method} {url} exceeded {_DEADLINE_S:.0f}s deadline (DNS/connect hang?)"
+            ) from e
 
     # ------------------------------------------------------------------ reads
-    def _list_raw(self) -> list[dict]:
+    async def _list_raw(self) -> list[dict]:
         try:
-            r = self._request(
+            r = await self._request(
                 "GET", f"{GH_API}/repos/{self.repo}/actions/runners?per_page=100"
             )
             r.raise_for_status()
-        except requests.RequestException as e:
+        except httpx.HTTPError as e:
             raise GitHubError(f"list runners failed: {e}") from e
         runners = r.json().get("runners", [])
         log.debug(
@@ -116,20 +113,20 @@ class GitHubClient:
         )
         return runners
 
-    def list_runners(self) -> list[Runner]:
+    async def list_runners(self) -> list[Runner]:
         return [
             Runner(id=x["id"], name=x["name"], status=x["status"], busy=bool(x["busy"]))
-            for x in self._list_raw()
+            for x in await self._list_raw()
         ]
 
-    def find_runner(self, name: str) -> dict | None:
-        for x in self._list_raw():
+    async def find_runner(self, name: str) -> dict | None:
+        for x in await self._list_raw():
             if x["name"] == name:
                 return x
         return None
 
     # ----------------------------------------------------------------- writes
-    def generate_jitconfig(self, name: str) -> str:
+    async def generate_jitconfig(self, name: str) -> str:
         """Mint a single-use JIT config. Idempotent: a lingering same-name
         registration (interrupted run / restart) is deleted and the mint retried."""
         body = {
@@ -141,30 +138,30 @@ class GitHubClient:
         url = f"{GH_API}/repos/{self.repo}/actions/runners/generate-jitconfig"
         log.debug("POST generate-jitconfig name=%s labels=%s", name, self.labels)
         try:
-            r = self._request("POST", url, json=body)
+            r = await self._request("POST", url, json=body)
             if r.status_code == 409:
-                existing = self.find_runner(name)
+                existing = await self.find_runner(name)
                 if existing:
                     log.info(
                         "runner %s already exists (%s); deleting and retrying",
                         name,
                         existing.get("status"),
                     )
-                    self.delete_runner(existing["id"])
-                r = self._request("POST", url, json=body)
-        except requests.RequestException as e:
+                    await self.delete_runner(existing["id"])
+                r = await self._request("POST", url, json=body)
+        except httpx.HTTPError as e:
             raise GitHubError(f"generate-jitconfig failed: {e}") from e
         if r.status_code != 201:
             raise GitHubError(f"JIT mint failed: HTTP {r.status_code}: {r.text[:300]}")
         log.debug("minted JIT for runner %s", name)
         return r.json()["encoded_jit_config"]
 
-    def delete_runner(self, runner_id: int) -> None:
+    async def delete_runner(self, runner_id: int) -> None:
         try:
-            r = self._request(
+            r = await self._request(
                 "DELETE", f"{GH_API}/repos/{self.repo}/actions/runners/{runner_id}"
             )
-        except requests.RequestException as e:
+        except httpx.HTTPError as e:
             raise GitHubError(f"delete runner {runner_id} failed: {e}") from e
         if r.status_code not in (204, 404):
             raise GitHubError(
@@ -172,11 +169,11 @@ class GitHubClient:
             )
         log.debug("DELETE runner %d -> HTTP %d", runner_id, r.status_code)
 
-    def reap_offline(self) -> list[str]:
+    async def reap_offline(self) -> list[str]:
         """Delete every offline runner — clears leftover/dead JIT registrations."""
         reaped = []
-        for x in self._list_raw():
+        for x in await self._list_raw():
             if x["status"] == "offline":
-                self.delete_runner(x["id"])
+                await self.delete_runner(x["id"])
                 reaped.append(x["name"])
         return reaped

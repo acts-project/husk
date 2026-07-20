@@ -3,12 +3,13 @@ other's runners, and one pool's failure can't suppress the others' snapshots."""
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
 import threading
 import time
 
-from conftest import FakeClock, make_config, make_slot
+from conftest import FakeClock, make_config, make_slot, pump, tick_all
 from husk.controller import Controller
 from husk.fake_backend import FakeBackend, FakeGitHub
 from husk.multipool import MultiPoolController
@@ -31,7 +32,7 @@ def _pool(name, prefix, *, github=None, slots=None, runners=None, **cfg_kw):
 def test_pools_size_independently():
     a, backend_a, _ = _pool("pool-a", "husk-a", min_ready=1, max_total=2)
     b, backend_b, _ = _pool("pool-b", "husk-b", min_ready=2, max_total=3)
-    MultiPoolController([a, b]).tick_all()
+    tick_all(MultiPoolController([a, b]))
 
     assert len(backend_a.slots) == 1 and len(backend_b.slots) == 2
     assert all(s.name.startswith("husk-a-") for s in backend_a.slots)
@@ -60,7 +61,7 @@ def test_no_cross_pool_runner_deletion():
         github=shared,
         slots=[make_slot(id="b1", name="husk-b-1", status="ACTIVE")],
     )
-    MultiPoolController([a, b]).tick_all()
+    tick_all(MultiPoolController([a, b]))
 
     deleted = [c for c in shared.calls if c[0] == "delete_runner"]
     assert deleted == [("delete_runner", 1)]  # only pool-a's own runner, by prefix
@@ -73,7 +74,7 @@ def test_one_pool_raise_does_not_block_others(monkeypatch):
     monkeypatch.setattr(a, "tick", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
 
     facade = MultiPoolController([a, b])
-    facade.tick_all()
+    tick_all(facade)
 
     # snapshots() reads each pool's in-memory state (no file).
     snaps = {s.backend: s for s in facade.snapshots()}
@@ -91,8 +92,10 @@ def _fast_poll(ctrl, seconds=0.01):
 
 
 def test_stalled_pool_does_not_block_another():
-    # The whole point of per-pool reconcile threads: a pool wedged mid-tick (a
-    # down libvirt host) must not stall another pool's ticks or freeze its snapshot.
+    # The point of per-pool reconcile TASKS plus to_thread'd backend calls: a pool
+    # wedged in a blocking backend call (a frozen libvirt host) must not stall the
+    # event loop, another pool's ticks, or its snapshot. The wedge below blocks a
+    # worker thread exactly the way a hung Nova/libvirt call does.
     a, _, _ = _pool("pool-a", "husk-a", min_ready=1)
     b, _, _ = _pool("pool-b", "husk-b", min_ready=1)
     _fast_poll(a)
@@ -101,26 +104,28 @@ def test_stalled_pool_does_not_block_another():
     release = threading.Event()
     orig_tick = a.tick
 
-    def wedged_tick():
-        release.wait(5)  # hold pool-a's thread as a frozen host would
-        return orig_tick()
+    async def wedged_tick():
+        await asyncio.to_thread(release.wait, 5)
+        return await orig_tick()
 
     a.tick = wedged_tick
-
     facade = MultiPoolController([a, b])
-    thread = threading.Thread(target=facade.run, name="test-run", daemon=True)
-    thread.start()
-    try:
+
+    async def go():
+        stop = asyncio.Event()
+        for c in (a, b):
+            await pump(c)  # warm both registries as the real poller would
+        task = asyncio.create_task(facade.run(stop))
         deadline = time.monotonic() + 3
         while b.snapshot.generation < 1 and time.monotonic() < deadline:
-            time.sleep(0.005)
+            await asyncio.sleep(0.005)
         assert b.snapshot.generation >= 1  # pool-b reconciled independently
         assert a.snapshot.generation == 0  # pool-a still stuck in its own tick
-    finally:
         release.set()
-        facade.stop()
-        thread.join(timeout=5)
-    assert not thread.is_alive()  # stop() drains both the driver and pool threads
+        stop.set()
+        await asyncio.wait_for(task, timeout=5)  # stop() drains every pool task
+
+    asyncio.run(go())
 
 
 def test_reload_matches_by_name_without_structural_warning(caplog):

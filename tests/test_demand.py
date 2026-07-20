@@ -4,7 +4,14 @@ the old inline math)."""
 
 from __future__ import annotations
 
-from conftest import FakeClock, make_config, make_controller, make_runner, make_slot
+from conftest import (
+    FakeClock,
+    make_config,
+    make_controller,
+    make_runner,
+    make_slot,
+    tick,
+)
 from husk.demand import DemandRegistry
 from husk.fake_backend import FakeBackend, FakeGitHub
 from husk.target import Target
@@ -33,7 +40,7 @@ def test_tick_publishes_desired_matching_snapshot():
     cfg = make_config(min_ready=1, max_total=3)
     ctrl = make_controller(backend, github, cfg, FakeClock())
 
-    snap = ctrl.tick()
+    snap = tick(ctrl)
 
     assert snap.desired_total == 2  # busy(1) + min_ready(1)
     published = ctrl.demand.get(ctrl.target, ctrl.pool)

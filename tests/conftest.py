@@ -22,6 +22,7 @@ from husk.config import (
 )
 from husk.controller import Controller
 from husk.fake_backend import FakeBackend, FakeGitHub
+from husk.poller import SnapshotRegistry
 from husk.slot import Runner, Slot
 
 
@@ -116,7 +117,55 @@ def clock() -> FakeClock:
 def make_controller(
     backend: FakeBackend, github: FakeGitHub, config: Config, clock
 ) -> Controller:
-    return Controller(backend, github, config, clock=clock)
+    return Controller(backend, github, config, clock=clock, registry=SnapshotRegistry())
+
+
+async def pump(ctrl: Controller) -> None:
+    """Stand in for the RunnerPoller: refresh this controller's target snapshot
+    from its fake GitHub.
+
+    A listing failure is swallowed exactly as the real poller swallows it, leaving
+    the previous snapshot (or nothing at all) in the registry — which is what makes
+    `tick` fail-safe on a cold start with a broken GitHub."""
+    try:
+        runners = await ctrl.github.list_runners()
+    except Exception:
+        return
+    ctrl.registry.publish_runners(ctrl.target, runners)
+
+
+def tick(ctrl: Controller):
+    """Drive one full reconcile: poll, then run the async tick to completion.
+
+    Tests call this instead of `ctrl.tick()` now that reconcile is a coroutine and
+    runner data arrives via the registry rather than an inline GitHub call."""
+
+    async def go():
+        await pump(ctrl)
+        return await ctrl.tick()
+
+    return asyncio.run(go())
+
+
+def observe(ctrl: Controller):
+    """Read-only counterpart of `tick` (poll, then classify without mutating)."""
+
+    async def go():
+        await pump(ctrl)
+        return await ctrl.observe()
+
+    return asyncio.run(go())
+
+
+def tick_all(facade) -> None:
+    """Drive every pool of a MultiPoolController once, polling each first."""
+
+    async def go():
+        for c in facade.controllers:
+            await pump(c)
+        await facade.tick_all()
+
+    asyncio.run(go())
 
 
 def _free_port() -> int:
@@ -130,8 +179,8 @@ def _free_port() -> int:
 @contextlib.contextmanager
 def serve_in_thread(provider):
     """Run the real Quart app over `provider` on a background event loop, yielding
-    its base URL. Mirrors how huskd serves it (reconcile on a thread, server on a
-    loop) but inverted for tests: here the server is on the side thread."""
+    its base URL. huskd serves this app on its main loop; tests invert that and
+    put the server on a side thread so the test body stays synchronous."""
     from husk.web import make_app, serve_app
 
     port = _free_port()

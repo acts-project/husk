@@ -8,7 +8,6 @@ import json
 import logging
 import os
 import signal
-import threading
 import time
 from pathlib import Path
 from typing import Annotated, Callable, Optional
@@ -379,8 +378,12 @@ def run(
         # One process-wide image coordinator: the registry pull is single-flighted
         # per content digest and the controller cache is shared across all pools.
         from husk.image_sync import ImageSync
+        from husk.poller import RunnerPoller, SnapshotRegistry
 
         image_sync = ImageSync(shared.image_cache_dir or None)
+        # One registry for the whole daemon: the centralized poller writes each
+        # target's runner listing here and every pool's reconcile task reads it.
+        registry = SnapshotRegistry()
         controllers = []
         for cfg in cfgs:
             try:
@@ -398,7 +401,7 @@ def run(
                 cfg,
                 controller=dataclasses.replace(cfg.controller, http_addr=""),
             )
-            controllers.append(Controller(backend, github, sub))
+            controllers.append(Controller(backend, github, sub, registry=registry))
         if not controllers:
             typer.echo("no pools could be started", err=True)
             raise typer.Exit(code=1)
@@ -406,10 +409,21 @@ def run(
             controllers,
             reload_configs=_configs_reloader(config, secrets_dir),
         )
+        # One listing per distinct target, not per pool: the runner API is
+        # target-wide, so pools sharing a target share the poll. Cadence follows
+        # the most eager pool so no pool ever reads a snapshot older than its own
+        # tick interval.
+        listers = {}
+        for ctrl in controllers:
+            listers.setdefault(ctrl.target, ctrl.github.list_runners)
+        poller = RunnerPoller(
+            registry,
+            listers,
+            interval=min(c.cfg.timeouts.poll_interval_sec for c in controllers),
+        )
+        githubs = [c.github for c in controllers]
         if once:
-            facade.tick_all()
-            for snap in facade.snapshots():
-                _print_status(snap)
+            asyncio.run(_once(facade, poller, githubs))
         else:
             if not shared.http_addr:
                 typer.echo("controller.http_addr must be set", err=True)
@@ -425,6 +439,8 @@ def run(
             asyncio.run(
                 _serve(
                     facade,
+                    poller,
+                    githubs,
                     shared.http_addr,
                     ssh_targets=ssh_targets,
                     advertise_addr=shared.advertise_addr or shared.http_addr,
@@ -434,16 +450,34 @@ def run(
         lock.release()
 
 
+async def _once(facade: MultiPoolController, poller, githubs: list) -> None:
+    """Single reconcile pass: warm the registry, tick every pool, print, close."""
+    try:
+        await poller.poll_once()
+        await facade.tick_all()
+        for snap in facade.snapshots():
+            _print_status(snap)
+    finally:
+        for gh in githubs:
+            await gh.aclose()
+
+
 async def _serve(
     facade: MultiPoolController,
+    poller,
+    githubs: list,
     http_addr: str,
     *,
     ssh_targets: dict[tuple[str, str], str] | None = None,
     advertise_addr: str = "",
 ) -> None:
-    """Run the reconcile loop on a background thread while Quart serves every
-    endpoint on this event loop. SIGINT/SIGTERM trip the shutdown event, which
-    stops hypercorn (via `shutdown_trigger`) and then the reconcile loop."""
+    """Run the whole daemon on this one event loop: the centralized runner poller,
+    every pool's reconcile task, and Quart serving each endpoint. SIGINT/SIGTERM
+    trip the shutdown event, which stops hypercorn (via `shutdown_trigger`) and
+    then drains the poller and reconcile tasks.
+
+    Blocking backend work never runs here — `Controller.tick()` pushes it through
+    `asyncio.to_thread` — so a wedged hypervisor stalls only its own pool."""
     from husk.guest_scrape import GuestScraper
     from husk.web import make_app, parse_addr, serve_app
 
@@ -453,8 +487,13 @@ async def _serve(
         loop.add_signal_handler(sig, stop.set)
 
     scraper = GuestScraper(ssh_targets) if ssh_targets else None
-    thread = threading.Thread(target=facade.run, name="husk-reconcile", daemon=True)
-    thread.start()
+    # Warm the registry before the first ticks, so no pool has to fail-safe its
+    # opening tick purely because nothing has been polled yet.
+    await poller.poll_once()
+    tasks = [
+        asyncio.create_task(poller.run(stop), name="husk-poller"),
+        asyncio.create_task(facade.run(stop), name="husk-reconcile"),
+    ]
     try:
         host, port = parse_addr(http_addr)
         display_host = "127.0.0.1" if host == "0.0.0.0" else host
@@ -471,8 +510,10 @@ async def _serve(
             shutdown_trigger=stop.wait,
         )
     finally:
-        facade.stop()
-        thread.join(timeout=5)
+        stop.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for gh in githubs:
+            await gh.aclose()
         if scraper is not None:
             scraper.close()  # drop the multiplexed SSH control sockets
 
@@ -569,11 +610,18 @@ def reap(
     cfgs = _load_all(config, secrets_dir)
     # reap_offline is repo-wide and label-agnostic, so any pool's client does it.
     _, github = _build(cfgs[0])
-    names = github.reap_offline()
+
+    async def go():
+        try:
+            return await github.reap_offline()
+        finally:
+            await github.aclose()
+
+    names = asyncio.run(go())
     typer.echo(f"reaped {len(names)} offline runner(s): {names}")
 
 
-def _recycle(backend, github, *, names, all_slots, force, dry_run):
+async def _recycle(backend, github, *, names, all_slots, force, dry_run):
     """Select and stop slots so huskd rebuilds them on its next tick.
 
     Stopping a slot drives it to SHUTOFF, which the controller classifies as
@@ -586,7 +634,7 @@ def _recycle(backend, github, *, names, all_slots, force, dry_run):
 
     current = backend.list_slots()  # may raise ListSlotsError → caller aborts
     try:
-        runners = github.list_runners()
+        runners = await github.list_runners()
     except Exception:
         runners = []  # busy detection is best-effort; without it, don't block
 
@@ -679,15 +727,22 @@ def recycle(
         backend, github = _build(cfg)
         if multi:
             typer.echo(f"── {cfg.backend.name} ──")
+
+        async def go(backend=backend, github=github):
+            try:
+                return await _recycle(
+                    backend,
+                    github,
+                    names=names or [],
+                    all_slots=all_slots,
+                    force=force,
+                    dry_run=dry_run,
+                )
+            finally:
+                await github.aclose()
+
         try:
-            acted, skipped, unknown = _recycle(
-                backend,
-                github,
-                names=names or [],
-                all_slots=all_slots,
-                force=force,
-                dry_run=dry_run,
-            )
+            acted, skipped, unknown = asyncio.run(go())
         except Exception as e:
             # One pool failing (e.g. a wedged libvirt host) must not abort the
             # rest of a fleet-wide recycle; report and keep going.
