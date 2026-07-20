@@ -312,8 +312,14 @@ class OpenStackBackend:
         logged and ignored."""
         try:
             live = {s.image_id for s in self.list_slots() if s.image_id}
-        except Exception:
+        except ListSlotsError:
             return  # can't enumerate slots → don't risk deleting a referenced image
+        # Deliberately NOT `except Exception`: ListSlotsError is the contract for
+        # "couldn't enumerate", and bailing quietly on it is right. Anything else is
+        # a bug in our own listing code, and swallowing it here would disable GC
+        # silently and permanently. Let it out — the controller's sync_images call
+        # logs it with a traceback and carries on, so a bug is visible without
+        # costing a tick.
         keep = set(live)
         if self.image_id:
             keep.add(self.image_id)

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import dataclasses
 
+import pytest
+
 from husk.config import BackendConfig
 from husk.image_sync import ResolvedImage
 from husk.openstack_backend import GLANCE_PREFIX, OpenStackBackend
@@ -176,3 +178,42 @@ def test_slot_image_stale_only_in_oci_mode():
 
     b._backend_ref = ""  # legacy image_name mode → nothing to roll onto
     assert b._slot(FakeServer("s", "img-old")).image_stale is False
+
+
+def test_gc_bails_quietly_when_slots_cannot_be_enumerated():
+    """ListSlotsError is the contract for "couldn't enumerate". Deleting a golden
+    without knowing which are referenced could pull an image out from under a
+    running server, so GC must do nothing."""
+    from husk.backend import ListSlotsError
+
+    b = _backend()
+    b.image_id = "img-cur"
+    b.conn.image.images_list = [FakeImage("img-orphan", f"{GLANCE_PREFIX}eeeeeeeeeeee")]
+
+    def boom(details=True):
+        raise ListSlotsError("nova 503")
+
+    b.conn.compute.servers = boom
+    b._gc_glance()  # must not raise
+    assert b.conn.image.deleted == []
+
+
+def test_a_bug_building_a_slot_is_not_swallowed_by_gc():
+    """A raise from the enumeration CALL is "couldn't enumerate" and becomes
+    ListSlotsError. A raise while building a Slot from a server is a bug in our
+    own code, and swallowing it here would disable Glance GC silently and
+    permanently — it has to reach the caller, which logs it with a traceback.
+
+    (Not hypothetical: an unset attribute did exactly this, and only a test
+    asserting on the deletion caught it.)"""
+
+    class Malformed:
+        """Owned by this pool, but missing what `_slot` needs."""
+
+        id = "s-broken"
+        name = "husk-1"
+        metadata = {"managed-by": "husk", "husk-pool": "os"}
+
+    b = _backend(servers=[Malformed()])
+    with pytest.raises(AttributeError):
+        b._gc_glance()
