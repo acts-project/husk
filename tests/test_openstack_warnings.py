@@ -28,9 +28,7 @@ def _backend(*, meta_raises: bool):
     b = OpenStackBackend.__new__(OpenStackBackend)
     b.cfg = BackendConfig(name="os", type="openstack", min_ready=1, max_total=1)
     b._warnings = {}
-    b._untagged = set()
     b._pool = b.cfg.name
-    b._prefix = b.cfg.vm_prefix
 
     def set_server_metadata(server_id, **kw):
         if meta_raises:

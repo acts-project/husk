@@ -102,13 +102,9 @@ class OpenStackBackend:
         # runner matches their prefix — and rebuilds them out from under their
         # owner. See _owns().
         self._pool = cfg.name
-        self._prefix = cfg.vm_prefix
         # Non-fatal per-slot issues (swallowed metadata-write failures) for the
         # dashboard — slot_id -> (epoch, message). See slot_warnings().
         self._warnings: dict[str, tuple[float, str]] = {}
-        # Server ids adopted by prefix because they predate the pool tag; the tag
-        # is backfilled on their next mark_active.
-        self._untagged: set[str] = set()
         self.conn = openstack.connect(cloud=cfg.cloud, api_timeout=_API_TIMEOUT_S)
         flavor = self.conn.compute.find_flavor(cfg.flavor_name)
         if not flavor:
@@ -191,20 +187,13 @@ class OpenStackBackend:
     def _owns(self, server) -> bool:
         """Whether this server belongs to THIS pool.
 
-        Ownership is the `husk-pool` metadata tag. Servers created before that tag
-        existed carry no pool, and must not become invisible — nothing would ever
-        reconcile or delete them and they'd bill forever — so a legacy server is
-        claimed by name prefix instead. `vm_prefix` is unique per pool (enforced by
-        `load_configs`), so exactly one pool adopts each legacy server. The tag is
-        backfilled on the next `mark_active`, making the fallback transitional."""
+        Ownership is the `husk-pool` metadata tag, and only that: several pools
+        share one OpenStack project, so `managed-by=husk` alone is not ownership.
+        A husk server without the tag is not adopted — huskd stamps it at create,
+        so an untagged one is foreign or hand-made, and silently adopting it would
+        mean rebuilding something nobody asked us to manage."""
         meta = getattr(server, "metadata", None) or {}
-        if meta.get("managed-by") != MANAGED_BY:
-            return False
-        pool = meta.get(POOL_KEY)
-        if pool is not None:
-            return pool == self._pool
-        name = getattr(server, "name", "") or ""
-        return bool(self._prefix) and name.startswith(self._prefix)
+        return meta.get("managed-by") == MANAGED_BY and meta.get(POOL_KEY) == self._pool
 
     def list_slots(self) -> list[Slot]:
         try:
@@ -212,21 +201,6 @@ class OpenStackBackend:
         except Exception as e:  # auth expiry, 5xx, network — MUST raise, never []
             raise ListSlotsError(f"list servers failed: {e}") from e
         slots = [self._slot(s) for s in servers if self._owns(s)]
-        # Legacy servers (no pool tag) this pool adopted by prefix — worth seeing,
-        # since it means the backfill hasn't run for them yet.
-        self._untagged = {
-            s.id
-            for s in servers
-            if self._owns(s) and not (getattr(s, "metadata", None) or {}).get(POOL_KEY)
-        }
-        if self._untagged:
-            log.info(
-                "adopted %d untagged server(s) by vm_prefix %r; the %s tag is "
-                "backfilled as each reaches ACTIVE",
-                len(self._untagged),
-                self._prefix,
-                POOL_KEY,
-            )
         # Drop warnings for slots that no longer exist (keeps the dict bounded).
         live = {s.id for s in slots}
         self._warnings = {k: v for k, v in self._warnings.items() if k in live}
@@ -431,21 +405,9 @@ class OpenStackBackend:
 
     def mark_active(self, slot: Slot) -> None:
         try:
-            # Backfill the pool tag on legacy servers adopted by prefix, so
-            # ownership stops depending on the name-prefix fallback. Free: this
-            # metadata write already happens once per bring-up.
-            extra = {POOL_KEY: self._pool} if slot.id in self._untagged else {}
             self.conn.compute.set_server_metadata(
-                slot.id, **{"husk-provisioned-at": f"{time.time():.0f}", **extra}
+                slot.id, **{"husk-provisioned-at": f"{time.time():.0f}"}
             )
-            if extra:
-                self._untagged.discard(slot.id)
-                log.info(
-                    "backfilled %s=%s on legacy server %s",
-                    POOL_KEY,
-                    self._pool,
-                    slot.id,
-                )
             log.debug("marked %s ACTIVE; reset husk-provisioned-at", slot.id)
             self._warnings.pop(slot.id, None)
         except Exception as e:

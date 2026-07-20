@@ -48,9 +48,7 @@ def _backend(pool: str, prefix: str, servers: list) -> OpenStackBackend:
     b = OpenStackBackend.__new__(OpenStackBackend)
     b.cfg = cfg
     b._pool = pool
-    b._prefix = prefix
     b._warnings = {}
-    b._untagged = set()
     b._backend_ref = ""
     b.image_id = "image-current"
     b.conn = types.SimpleNamespace(
@@ -85,44 +83,13 @@ def test_unmanaged_servers_are_still_ignored():
     assert b.list_slots() == []
 
 
-# ------------------------------------------------------------------- legacy
-LEGACY = _server("old-1", "husk-gpu-a-7", {"managed-by": MANAGED_BY})
-
-
-def test_legacy_untagged_server_is_adopted_by_prefix():
-    """It must NOT become invisible — nothing would reconcile or delete it, and
-    it would bill forever."""
-    b = _backend("gpu-a", "husk-gpu-a", [LEGACY])
-    assert [s.id for s in b.list_slots()] == ["old-1"]
-    assert b._untagged == {"old-1"}
-
-
-def test_a_legacy_server_is_adopted_by_exactly_one_pool():
-    """vm_prefix is unique per pool (enforced by load_configs), so the fallback
-    can't hand the same server to two owners."""
-    a = _backend("gpu-a", "husk-gpu-a", [LEGACY])
-    other = _backend("gpu-b", "husk-gpu-b", [LEGACY])
-    assert [s.id for s in a.list_slots()] == ["old-1"]
-    assert other.list_slots() == []
-
-
-def test_mark_active_backfills_the_pool_tag():
-    b = _backend("gpu-a", "husk-gpu-a", [LEGACY])
-    slot = b.list_slots()[0]
-    b.mark_active(slot)
-    (sid, kw) = b._writes[-1]
-    assert sid == "old-1"
-    assert kw[POOL_KEY] == "gpu-a"  # ownership no longer rests on the prefix
-    assert "husk-provisioned-at" in kw  # and the original write still happens
-    assert b._untagged == set()
-
-
-def test_mark_active_does_not_rewrite_an_already_tagged_server():
-    b = _backend("gpu-a", "husk-gpu-a", [TAGGED_A])
-    slot = b.list_slots()[0]
-    b.mark_active(slot)
-    (_, kw) = b._writes[-1]
-    assert POOL_KEY not in kw  # no needless metadata write every bring-up
+def test_an_untagged_husk_server_is_not_adopted():
+    """huskd stamps the tag at create, so an untagged server is foreign or
+    hand-made — adopting it would mean rebuilding something nobody asked us to
+    manage. No back-compat path: nothing is running yet."""
+    untagged = _server("old-1", "husk-gpu-a-7", {"managed-by": MANAGED_BY})
+    b = _backend("gpu-a", "husk-gpu-a", [untagged])
+    assert b.list_slots() == []
 
 
 def test_list_slots_still_raises_rather_than_returning_empty():
