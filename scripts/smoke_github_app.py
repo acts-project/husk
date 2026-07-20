@@ -17,7 +17,14 @@ since listing runners needs just `administration:read`.
 
 Run:
     HUSK_APP_ID=123456 HUSK_APP_KEY=/path/husk-app.pem \\
-        uv run python scripts/smoke_github_app.py [--mint] [--group NAME]
+        uv run python scripts/smoke_github_app.py [--mint] [--group NAME] \\
+            [--repo-targets owner/repo,owner/other]
+
+Mint scope follows the design, not raw capability: an Organization install is
+served by ORG-level runners, so repo-level JIT write is not checked there (that
+would invite `Administration: write` across the whole org). A personal install
+is checked at repo level, as are any repos named in --repo-targets — i.e. the
+ones you plan to put in `allowed_repos`.
 
 A 403 is the interesting failure: the hint printed alongside names the permission
 that is probably missing. Note the scope asymmetry — org runner management has a
@@ -156,6 +163,15 @@ async def main() -> int:
     group_name = None
     if "--group" in sys.argv:
         group_name = sys.argv[sys.argv.index("--group") + 1]
+    # Repos you intend to list in `allowed_repos` — these get the repo-LEVEL
+    # checks even when they live inside an org that is otherwise org-served.
+    repo_targets: set[str] = set()
+    if "--repo-targets" in sys.argv:
+        repo_targets = {
+            s.strip()
+            for s in sys.argv[sys.argv.index("--repo-targets") + 1].split(",")
+            if s.strip()
+        }
 
     if not app_id or not pem:
         print("set HUSK_APP_ID and HUSK_APP_KEY (path to the App's private-key PEM)")
@@ -270,7 +286,20 @@ async def main() -> int:
                         group_id=group_id or 1,
                     )
 
-            for full in repos[:3]:  # a sample is enough to prove the permission
+            # Which repos get the repo-LEVEL check is a design question, not a
+            # coverage one. An org install is served by org-level runners, so
+            # demanding repo-level JIT write across every org repo would be
+            # testing (and inviting) `Administration: write` on the whole org —
+            # far broader than the org runner permission husk actually needs.
+            # So: mint at the scope husk would really use — org-level for an
+            # Organization account, repo-level for a personal one — plus any
+            # repo named explicitly via --repo-targets (a planned allowed_repos
+            # entry, which may legitimately sit inside an org).
+            repo_mint = {r for r in repos if r in repo_targets}
+            if kind != "Organization":
+                repo_mint |= set(repos[:3])
+
+            for full in repos[:3]:  # a sample is enough to prove read access
                 await probe(
                     client,
                     rep,
@@ -279,6 +308,7 @@ async def main() -> int:
                     tok,
                     HINTS["repo-runners"],
                 )
+            for full in sorted(repo_mint):
                 if do_mint:
                     await mint_and_delete(
                         client,
@@ -289,6 +319,12 @@ async def main() -> int:
                         HINTS["repo-mint"],
                         group_id=None,
                     )
+            if kind == "Organization" and not repo_mint:
+                print(
+                    "        (org install → org-level runners; repo-level JIT not\n"
+                    "         required here. Use --repo-targets to check a repo you\n"
+                    "         intend to put in allowed_repos.)"
+                )
 
     print("\n" + "=" * 60)
     if rep.failures:
