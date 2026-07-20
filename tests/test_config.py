@@ -239,40 +239,180 @@ def test_image_cache_dir_lives_on_controller(tmp_path, monkeypatch):
     assert cfgs[0].controller == cfgs[1].controller  # shared across pools
 
 
-def test_stray_backend_image_cache_dir_is_ignored(tmp_path, monkeypatch):
-    # Clean cutover: image_cache_dir moved out of [pool.backend]; a leftover one is
-    # silently dropped (pydantic extra="ignore") rather than erroring.
+def test_stray_backend_image_cache_dir_is_rejected(tmp_path, monkeypatch):
+    # image_cache_dir moved out of [pool.backend] onto [controller]. A leftover one
+    # must fail the load, not be silently dropped: an ignored key looks like it took
+    # effect, and the operator only finds out from a cache in the wrong place.
     monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
     toml = _MULTI_TOML.replace(
         "min_ready = 2\n", 'min_ready = 2\nimage_cache_dir = "/ignored"\n'
     )
     p = tmp_path / "multi.toml"
     p.write_text(toml)
-    cfgs = load_configs(str(p))  # must not raise
-    assert not hasattr(cfgs[0].backend, "image_cache_dir")
-    assert cfgs[0].controller.image_cache_dir == ""
+    with pytest.raises(Exception, match="image_cache_dir"):
+        load_configs(str(p))
+
+
+def test_a_misspelt_key_is_rejected(tmp_path, monkeypatch):
+    """The whole point of extra="forbid": `min_redy = 5` used to leave min_ready at
+    its default and run a silently undersized pool."""
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    p = tmp_path / "typo.toml"
+    p.write_text(_TOML.format(extra="") + "min_redy = 5\n")
+    with pytest.raises(Exception, match="min_redy"):
+        load_configs(str(p))
+
+
+def test_an_unknown_top_level_table_is_rejected(tmp_path, monkeypatch):
+    """Nested tables are covered by extra="forbid", but the settings model itself
+    must stay lenient (its env source sees every HUSK_* var), so the file's top
+    level gets its own check."""
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    p = tmp_path / "stray.toml"
+    p.write_text(_TOML.format(extra="") + '\n[access]\nallowed_orgs = ["acme"]\n')
+    with pytest.raises(RuntimeError, match="unknown top-level table 'access'"):
+        load_configs(str(p))
+
+
+def test_unrelated_husk_env_vars_do_not_break_the_load(tmp_path, monkeypatch):
+    """The counterweight to the check above: HUSK_* vars that aren't config (log
+    level, smoke-test knobs) must not be mistaken for stray settings."""
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    monkeypatch.setenv("HUSK_LOG_LEVEL", "DEBUG")
+    monkeypatch.setenv("HUSK_SMOKE_HOST", "gpubox")
+    assert load_config(_write(tmp_path)).backend.name == "openstack-cern"
+
+
+def test_a_missing_config_file_says_so(tmp_path):
+    with pytest.raises(RuntimeError, match="config file not found"):
+        load_configs(str(tmp_path / "nope.toml"))
 
 
 def test_no_pool_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
     p = tmp_path / "empty.toml"
-    p.write_text('[github]\napp_id = 1\n[access]\nallowed_orgs = ["acme"]\n')
+    p.write_text("[github]\napp_id = 1\n")
     with pytest.raises(RuntimeError, match="no \\[\\[pool\\]\\] defined"):
         load_configs(str(p))
+
+
+def _pools(*names: str) -> str:
+    """A minimal but *valid* multi-pool config with the given pool names."""
+    head = "[github]\napp_id = 1\n"
+    body = "".join(
+        f'[[pool]]\nname = "{n}"\ntarget = {{ org = "acme" }}\n'
+        f'[pool.runner]\nversion="1"\nlabels=["{n}"]\n'
+        "[pool.backend]\n"
+        'cloud="cern"\nimage_name="img"\nflavor_name="m2.small"\nnetwork_name="net"\n'
+        for n in names
+    )
+    return head + body
 
 
 def test_duplicate_pool_name_rejected(tmp_path, monkeypatch):
     monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
     p = tmp_path / "dup.toml"
-    p.write_text(
-        "[github]\napp_id = 1\n"
-        '[[pool]]\nname = "dup"\ntarget = { org = "acme" }\n'
-        '[pool.runner]\nversion="1"\nlabels=["a"]\n'
-        '[[pool]]\nname = "dup"\ntarget = { org = "acme" }\n'
-        '[pool.runner]\nversion="1"\nlabels=["b"]\n'
-    )
+    p.write_text(_pools("dup", "dup"))
     with pytest.raises(RuntimeError, match="duplicate pool name"):
         load_configs(str(p))
+
+
+# ---------------------------------------------------------------- validation
+# These all used to load fine and fail later — at serve time, at backend
+# construction (which needs libvirt-python or a live cloud), or not at all. huskd
+# runs unattended under k8s, so each one has to be a load-time error instead.
+def _pool_toml(tmp_path, *, runner: str = "", backend: str = "") -> str:
+    """The base config with extra keys spliced into its [pool.runner] (which is
+    followed by [pool.backend]) and appended to [pool.backend] (which ends it)."""
+    toml = _TOML.format(extra="")
+    if runner:
+        toml = toml.replace(
+            'labels = ["self-hosted"]\n', f'labels = ["self-hosted"]\n{runner}\n'
+        )
+    p = tmp_path / "c.toml"
+    p.write_text(toml + (f"{backend}\n" if backend else ""))
+    return str(p)
+
+
+@pytest.mark.parametrize(
+    "backend, match",
+    [
+        ('type = "libvrt"', "libvirt"),  # typo'd backend → silently OpenStack
+        ("min_ready = 5\nmax_total = 2", "exceeds max_total"),
+        ("max_total = 0", "greater than or equal to 1"),
+        ("min_ready = -1", "greater than or equal to 0"),
+    ],
+)
+def test_backend_numbers_and_type_are_checked(tmp_path, monkeypatch, backend, match):
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    with pytest.raises(Exception, match=match):
+        load_configs(_pool_toml(tmp_path, backend=backend))
+
+
+def test_openstack_fields_on_a_libvirt_pool_are_rejected(tmp_path, monkeypatch):
+    """The base config is OpenStack; flipping only `type` leaves cloud/flavor/network
+    behind, which the libvirt backend would ignore without a word."""
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    with pytest.raises(Exception, match="OpenStack-only"):
+        load_configs(_pool_toml(tmp_path, backend='type = "libvirt"'))
+
+
+def test_an_openstack_pool_needs_its_flavor_and_network(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    bare = _TOML.format(extra="").replace('flavor_name = "m2.small"\n', "")
+    p = tmp_path / "c.toml"
+    p.write_text(bare)
+    with pytest.raises(Exception, match="needs flavor_name"):
+        load_configs(str(p))
+
+
+def test_scrape_cidr_must_be_a_cidr(tmp_path, monkeypatch):
+    # It lands in an nftables rule verbatim, so a bad one breaks the guest firewall
+    # rather than the config.
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    with pytest.raises(Exception, match="scrape_cidr"):
+        load_configs(
+            _pool_toml(
+                tmp_path,
+                runner='prebaked = true\nscrape_cidr = "137.138.0.0/notanetwork"',
+            )
+        )
+
+
+def test_a_valid_ipv6_scrape_cidr_is_accepted(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    cfg = load_config(
+        _pool_toml(
+            tmp_path,
+            runner='prebaked = true\nscrape_cidr = "2001:1458:d00:b::/64"',
+        )
+    )
+    assert cfg.runner.scrape_cidr == "2001:1458:d00:b::/64"
+
+
+@pytest.mark.parametrize("addr", ["9100:", "127.0.0.1:notaport", "127.0.0.1:99999"])
+def test_http_addr_is_validated_at_load_not_at_serve(tmp_path, monkeypatch, addr):
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    p = tmp_path / "c.toml"
+    p.write_text(_TOML.format(extra="") + f'\n[controller]\nhttp_addr = "{addr}"\n')
+    with pytest.raises(Exception, match="http_addr"):
+        load_configs(str(p))
+
+
+@pytest.mark.parametrize("addr", ["0.0.0.0:9100", ":9100", "9100"])
+def test_bindable_addrs_are_accepted(tmp_path, monkeypatch, addr):
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    p = tmp_path / "c.toml"
+    p.write_text(_TOML.format(extra="") + f'\n[controller]\nhttp_addr = "{addr}"\n')
+    assert load_config(str(p)).controller.http_addr == addr
+
+
+def test_a_bad_private_key_path_names_the_path(tmp_path, monkeypatch):
+    """The k8s case: the Secret isn't mounted, or not readable by huskd's uid. This
+    used to surface as a bare FileNotFoundError from the read."""
+    monkeypatch.delenv("HUSK_GITHUB__PRIVATE_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="could not be read"):
+        load_config(_write(tmp_path, extra='private_key_path = "/no/such/key.pem"'))
 
 
 # ------------------------------------------------------------------- libvirt

@@ -467,9 +467,10 @@ class LibvirtBackend:
         never stalls the reconcile loop. Cheap when nothing changed: it
         short-circuits a host whose effective ref is already adopted.
 
-        Hosts on the manual/local-file path (no ref) are skipped entirely. The
-        backend-level ref can be hot-reloaded; per-host `image_ref` overrides are
-        read once at construction (changing one needs a restart)."""
+        Hosts on the manual/local-file path (no ref) are skipped entirely. The ref
+        comparison below is what makes a rollout work across a restart: the new
+        process reads the new ref from config and re-stages against whatever the
+        hosts already have (config is never hot-reloaded — see multipool)."""
         if cfg is not None and (cfg.image_ref or "") != self._backend_ref:
             log.info(
                 "image ref changed: %r -> %r (staging in the background)",

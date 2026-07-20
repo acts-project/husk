@@ -16,11 +16,9 @@ aborts before any classification or mutation. A *raise* must never be read as
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import itertools
 import logging
 import time
-from typing import Callable
 
 from husk.backend import ListSlotsError
 from husk.bootreport import parse_bootreport
@@ -47,26 +45,6 @@ RUNNER_SNAPSHOT_MAX_AGE_S = 180.0
 # this is ~5 min of retry before giving up — bounds Nova console-API calls.
 BOOTREPORT_MAX_ATTEMPTS = 10
 
-# Config knobs that are safe to change while the loop runs: the controller reads
-# each of these fresh from self.cfg on every tick, so swapping them between ticks
-# takes effect immediately with no rebuild. Everything else (backend type/hosts,
-# github creds, runner labels, lock/http/state paths) is captured at build time by
-# the backend/github/server objects and needs a restart — apply_reloaded_config
-# warns about and ignores changes to those rather than half-applying them.
-_HOT_RELOAD: dict[str, tuple[str, ...]] = {
-    # image_ref is hot: a new ref is picked up by sync_images on the next tick,
-    # which stages the new golden and drains slots onto it (see image-pipeline.md
-    # Phase C). Per-host image_ref overrides are still restart-only.
-    "backend": ("min_ready", "max_total", "image_ref"),
-    "controller": ("shrink_ticks",),
-    "timeouts": (
-        "poll_interval_sec",
-        "idle_timeout_sec",
-        "startup_grace_sec",
-        "max_job_duration_sec",
-    ),
-}
-
 
 def vm_name(prefix: str, n: int) -> str:
     """Unique VM name. CERN registers VM names in DNS (LANDB) and rejects dupes,
@@ -92,7 +70,6 @@ class Controller:
         config: Config,
         *,
         clock=time.monotonic,
-        reload_config: Callable[[], Config | None] | None = None,
         target: Target,
         demand: DemandRegistry | None = None,
         registry: SnapshotRegistry | None = None,
@@ -117,10 +94,11 @@ class Controller:
         # batched behind a poll.
         self.registry = registry or SnapshotRegistry()
         self._runner_max_age = runner_snapshot_max_age
-        # Optional hot-reload hook: called once per tick from run(); returns a
-        # freshly loaded Config when the file changed (else None). cli.py wires an
-        # mtime-guarded loader; tests leave it None (tick() stays reload-free).
-        self._reload_config = reload_config
+        # `self.cfg` is fixed for the life of the process: huskd does not reload the
+        # config file. Changing anything means a restart, which is cheap and safe —
+        # every slot is re-adopted from backend metadata (husk-pool/husk-cycle/
+        # husk-provisioned-at) on the first tick, and a BUSY slot is classified from
+        # GitHub's runner listing, so a running job is never disturbed.
 
         self.first_seen_state: dict[str, tuple[SlotState, float]] = {}
         self.last_provision_action: dict[str, float] = {}
@@ -156,67 +134,6 @@ class Controller:
             counts={st.value: 0 for st in SlotState},
             slots=[],
         )
-
-    # -------------------------------------------------------------- hot reload
-    def _maybe_reload(self) -> None:
-        """Pick up an edited config file between ticks (no restart needed).
-
-        The loader is mtime-guarded and swallows its own parse errors, so a bad
-        edit leaves the running config in place rather than killing the loop."""
-        if self._reload_config is None:
-            return
-        try:
-            new = self._reload_config()
-        except Exception:
-            log.warning("config reload failed; keeping current config", exc_info=True)
-            return
-        if new is not None:
-            self.apply_reloaded_config(new)
-
-    def apply_reloaded_config(self, new: Config) -> None:
-        """Adopt the hot-reloadable knobs from a freshly loaded config; warn about
-        (and ignore) any structural change that needs a restart to take effect."""
-        cur = self.cfg
-        changes: list[str] = []
-        replacements: dict[str, object] = {}
-        for section, fields in _HOT_RELOAD.items():
-            cur_sec, new_sec = getattr(cur, section), getattr(new, section)
-            updates = {
-                f: getattr(new_sec, f)
-                for f in fields
-                if getattr(cur_sec, f) != getattr(new_sec, f)
-            }
-            if updates:
-                changes += [
-                    f"{section}.{f}: {getattr(cur_sec, f)} -> {v}"
-                    for f, v in updates.items()
-                ]
-                replacements[section] = dataclasses.replace(cur_sec, **updates)
-
-        # Structural diff: normalize `new` by forcing the hot fields back to their
-        # current values, then compare whole-config. Any remaining difference is a
-        # field we can't safely swap live (backend/hosts, github, runner, paths).
-        normalized = new
-        for section, fields in _HOT_RELOAD.items():
-            cur_sec = getattr(cur, section)
-            normalized = dataclasses.replace(
-                normalized,
-                **{
-                    section: dataclasses.replace(
-                        getattr(normalized, section),
-                        **{f: getattr(cur_sec, f) for f in fields},
-                    )
-                },
-            )
-        if normalized != cur:
-            log.warning(
-                "config reload: structural changes ignored (restart huskd to apply: "
-                "backend/hosts, github, runner, or controller paths/ports)"
-            )
-
-        if replacements:
-            self.cfg = dataclasses.replace(self.cfg, **replacements)
-            log.info("config reload applied: %s", "; ".join(changes))
 
     def _sync_images(self) -> None:
         """Hand the backend the current image config so it can stage the golden

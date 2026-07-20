@@ -11,12 +11,12 @@ in "Phase 4"); this document un-defers that work with a concrete design.
 > cache, content-addressed by qcow2 digest. From there:
 > - **libvirt** (`LibvirtBackend.sync_images`): scp's the golden to each host pool
 >   by digest; stamps the digest into domain metadata; drains slots onto a new ref
->   on hot-reload; GC's orphaned goldens.
+>   after a restart; GC's orphaned goldens.
 > - **OpenStack** (`OpenStackBackend.sync_images`): uploads the qcow2 to Glance as
 >   `husk-golden-<digest>` (idempotent on digest), rotates the current image id,
 >   drains stale slots through the recycle loop on a ref change, and GC's
 >   superseded Glance goldens. The **same qcow2 serves both backends** — the goal
->   in Goal 4. `image_ref` is hot-reloadable on both.
+>   in Goal 4. On both, a new `image_ref` is picked up when huskd restarts.
 >
 > The runner/podman stack is still installed at cloud-init time when a slot boots a
 > *stock* base (`prebaked = false`); pointing `image_ref` at a golden + setting
@@ -47,7 +47,7 @@ in "Phase 4"); this document un-defers that work with a concrete design.
 | Image substrate | **qcow2** | Backing file for libvirt COW overlays *and* uploadable to Glance — one artifact, both backends. |
 | Registry / transport | **public ghcr.io via ORAS** | OCI artifacts give us tags + content-addressed digests for free; public ⇒ no pull creds. |
 | Pull location | **ORAS on the controller** | huskd pulls once, fans out over its existing SSH channel + the OpenStack SDK. Hosts need no oras/creds. |
-| Rollout trigger | **config-pinned tag/digest** | Rides the existing config hot-reload (`controller: hot-reload config knobs on-tick`). Explicit, auditable. |
+| Rollout trigger | **config-pinned tag/digest** | Edit the ref, restart huskd; `sync_images` diffs it against what the hosts/Glance already hold. Explicit, auditable. |
 | OpenStack scope | **base (non-GPU) variant only** | OpenStack is the CPU-runner path; GPU is libvirt/bare-metal. The GPU image ships only to libvirt hosts. |
 | Image vs cloud-init | **image = slow/static capability; cloud-init = dynamic/tunable policy** | See boundary below. |
 | Firewall | **capability baked, policy in cloud-init** | The ruleset is the one security knob meant to change without an image rebuild. |
@@ -133,7 +133,7 @@ per-slot, per-job, or meant to change without a rebuild.
 ## Delivery & sync (huskd, control machine)
 
 Driven by a **config-pinned image ref per backend** (replacing the fixed
-`image_name` filename). On config change (hot-reload):
+`image_name` filename). On a config change (picked up at the next huskd start):
 
 1. `oras pull` the ref once to a controller-local cache.
 2. **libvirt:** push the qcow2 to each host's pool dir over the existing SSH
@@ -192,8 +192,8 @@ live per-slot overlay — overwriting it in place corrupts running slots. So:
   to the current. `Slot.image_stale` is set when they diverge, and the controller
   drains stale idle slots (rebuild adopts the new golden) — same drain path on both
   backends. libvirt `_gc_goldens` removes unreferenced backing files; OpenStack
-  `_gc_glance` deletes superseded `husk-golden-*` Glance images. `image_ref` is
-  hot-reloadable (per-host libvirt overrides remain restart-only).
+  `_gc_glance` deletes superseded `husk-golden-*` Glance images. A changed
+  `image_ref` takes effect on the next huskd start (huskd never reloads config).
 
 Each phase is independently useful: A produces artifacts you can place by hand
 (exactly the manual step today, just reproducible); B automates delivery against

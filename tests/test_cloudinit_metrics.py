@@ -116,9 +116,13 @@ prebaked = false
 scrape_cidr = "10.0.0.0/8"
 [pool.backend]
 type = "openstack"
+cloud = "cern"
+image_name = "ALMA10 - x86_64"
+flavor_name = "m2.small"
+network_name = "CERN_NETWORK"
 min_ready = 1
 max_total = 2
 """
     )
-    with pytest.raises(RuntimeError, match="scrape_cidr requires prebaked"):
+    with pytest.raises(Exception, match="scrape_cidr requires prebaked"):
         load_configs(str(cfg))

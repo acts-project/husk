@@ -24,6 +24,65 @@ def _slug(name: str) -> str:
     return s or "pool"
 
 
+# The tables this file may define. Anything else at the top level is a typo
+# (`[controler]`, `[[pools]]`) that pydantic's env-facing `extra="ignore"` cannot
+# catch — see `_check_top_level`.
+_TOP_LEVEL = {"github", "controller", "pool"}
+
+# domain:bus:device.function, as libvirt's <hostdev> wants it (0000:01:00.0).
+_PCI_RE = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$", re.I)
+
+
+def _check_top_level(path: str) -> None:
+    """Reject unknown top-level tables before pydantic runs.
+
+    The settings model has to keep `extra="ignore"`, because its *env* source sees
+    every `HUSK_*` var in the environment — including ones that are not config at
+    all (`HUSK_LOG_LEVEL`, `HUSK_SMOKE_*`). That leniency would also swallow a
+    misspelt table, so the TOML file gets its own strict pass here. Nested tables
+    are covered by `extra="forbid"` on the models themselves.
+    """
+    import tomllib
+
+    try:
+        with open(path, "rb") as f:
+            raw = tomllib.load(f)
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"config file not found: {path} (huskd needs one; pass --config, or "
+            "check the ConfigMap is mounted where you think it is)"
+        ) from None
+    except tomllib.TOMLDecodeError as e:
+        raise RuntimeError(f"{path} is not valid TOML: {e}") from None
+    if unknown := sorted(set(raw) - _TOP_LEVEL):
+        # The overwhelmingly likely cause is the old flat format, so name it rather
+        # than making someone diff against the example.
+        hint = (
+            " — this looks like the old flat format; wrap [runner]/[backend]/"
+            "[timeouts] under a [[pool]] (with a name). See config.example.toml"
+            if {"runner", "backend"} & set(unknown)
+            else f" — expected one of {', '.join(sorted(_TOP_LEVEL))}"
+        )
+        raise RuntimeError(
+            f"{path}: unknown top-level {'tables' if len(unknown) > 1 else 'table'} "
+            f"{', '.join(repr(k) for k in unknown)}{hint}"
+        )
+
+
+def _check_addr(label: str, addr: str) -> str:
+    """Validate a `host:port` bind address at load time rather than at serve time.
+
+    Mirrors `husk.web.app.parse_addr` (bare `:9100` / `9100` means all interfaces),
+    reimplemented here so config stays free of the web/Quart import.
+    """
+    _, _, port = addr.strip().rpartition(":")
+    if not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise ValueError(
+            f"{label} {addr!r} must be host:port with a valid port, e.g. 0.0.0.0:9100"
+        )
+    return addr.strip()
+
+
 def _ssh_target_from_uri(uri: str) -> str:
     """Derive the `user@host` SSH target from a `qemu+ssh://user@host/system` URI
     (used for host-side qemu-img/genisoimage when `ssh_target` isn't set
@@ -194,9 +253,11 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
     isolation invariant). pydantic-settings is imported lazily here so the rest of
     the package stays pydantic-free.
     """
+    import ipaddress
     from pathlib import Path
+    from typing import Literal
 
-    from pydantic import BaseModel, Field, model_validator
+    from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
     from pydantic_settings import (
         BaseSettings,
         PydanticBaseSettingsSource,
@@ -204,13 +265,25 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         TomlConfigSettingsSource,
     )
 
-    class _Github(BaseModel):
+    _check_top_level(path)
+
+    class _Strict(BaseModel):
+        """Base for every config table: an unknown key is an error, not a default.
+
+        Silently ignoring a typo is the worst failure mode for a config that runs
+        unattended — `min_redy = 5` would leave min_ready at 1 and look healthy.
+        Under k8s this turns a bad ConfigMap into a crash-loop with a message
+        naming the key, instead of a fleet that is quietly the wrong size."""
+
+        model_config = ConfigDict(extra="forbid")
+
+    class _Github(_Strict):
         app_id: int
         # PEM contents (env HUSK_GITHUB__PRIVATE_KEY); never in TOML
         private_key: str | None = None
         private_key_path: str | None = None  # file / k8s Secret mount
 
-    class _Target(BaseModel):
+    class _Target(_Strict):
         """`target = { org = "acts-project", group = "husk" }` or
         `target = { repo = "owner/name" }`.
 
@@ -241,34 +314,76 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         def resolved(self) -> Target:
             return Target.org(self.org) if self.org else Target.repo(self.repo)
 
-    class _Runner(BaseModel):
+    class _Runner(_Strict):
         version: str
-        labels: list[str]
+        labels: list[str] = Field(min_length=1)
         gpu: bool = False
         prebaked: bool = False
         scrape_cidr: str = ""
 
-    class _Host(BaseModel):
+        @field_validator("scrape_cidr")
+        @classmethod
+        def _is_a_cidr(cls, v: str) -> str:
+            # This string becomes an nftables rule verbatim; a malformed one would
+            # surface as a broken guest firewall, not a config error.
+            if v:
+                ipaddress.ip_network(v, strict=False)  # raises → validation error
+            return v
+
+    class _Host(_Strict):
         name: str
         libvirt_uri: str
         ssh_target: str | None = None  # derived from the URI when omitted
         storage_pool: str = "husk"  # libvirt storage pool (NOT the husk [[pool]])
         network: str = "default"
-        memory_mb: int = 4096
-        vcpus: int = 4
+        memory_mb: int = Field(4096, gt=0)
+        vcpus: int = Field(4, gt=0)
         gpu_pci_addresses: list[str] = []
-        max_slots: int | None = None
+        max_slots: int | None = Field(None, gt=0)
         image_name: str | None = None
         image_ref: str | None = None
 
-    class _Backend(BaseModel):
+        @field_validator("libvirt_uri")
+        @classmethod
+        def _is_a_libvirt_uri(cls, v: str) -> str:
+            # A URI with no recognisable transport makes `_ssh_target_from_uri`
+            # return "", which LibvirtBackend._ssh reads as "run it locally" — a
+            # typo would silently execute against the wrong machine.
+            if not urlparse(v).scheme.startswith("qemu"):
+                raise ValueError(
+                    f"libvirt_uri {v!r} must be a qemu URI, e.g. "
+                    "qemu+ssh://user@host/system (or qemu:///system for local)"
+                )
+            return v
+
+        @field_validator("gpu_pci_addresses")
+        @classmethod
+        def _are_pci_addresses(cls, v: list[str]) -> list[str]:
+            for addr in v:
+                if not _PCI_RE.match(addr):
+                    raise ValueError(
+                        f"gpu_pci_address {addr!r} must be domain:bus:device.function, "
+                        "e.g. 0000:01:00.0 (see `lspci -D`)"
+                    )
+            return v
+
+        @model_validator(mode="after")
+        def _capacity_is_declared_one_way(self):
+            if self.gpu_pci_addresses and self.max_slots is not None:
+                raise ValueError(
+                    f"host {self.name!r}: set either gpu_pci_addresses (one slot per "
+                    "GPU) or max_slots (CPU capacity), not both"
+                )
+            return self
+
+    class _Backend(_Strict):
         name: str = ""  # defaults to the pool name
-        type: str = "openstack"
+        type: Literal["openstack", "libvirt"] = "openstack"
         vm_prefix: str = ""  # defaults to husk-<slug(pool name)>
         image_name: str = ""
         image_ref: str = ""
-        min_ready: int = 1
-        max_total: int = 2
+        min_ready: int = Field(1, ge=0)
+        max_total: int = Field(2, ge=1)
         # OpenStack-only (optional for the libvirt backend)
         cloud: str = ""
         flavor_name: str = ""
@@ -278,25 +393,118 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         # libvirt-only (optional for the OpenStack backend)
         hosts: list[_Host] = []
 
-    class _Timeouts(BaseModel):
-        poll_interval_sec: float = 30
-        idle_timeout_sec: float = 1800
-        startup_grace_sec: float = 300
-        max_job_duration_sec: float = 21600
+        @model_validator(mode="after")
+        def _ready_fits_in_total(self):
+            if self.min_ready > self.max_total:
+                raise ValueError(
+                    f"min_ready ({self.min_ready}) exceeds max_total "
+                    f"({self.max_total}) — the warm pool can never reach it"
+                )
+            return self
 
-    class _Pool(BaseModel):
+    class _Timeouts(_Strict):
+        poll_interval_sec: float = Field(30, gt=0)
+        idle_timeout_sec: float = Field(1800, gt=0)
+        startup_grace_sec: float = Field(300, gt=0)
+        max_job_duration_sec: float = Field(21600, gt=0)
+
+    class _Pool(_Strict):
         name: str  # pool identity → backend.name + default vm_prefix
         target: _Target  # the one org/repo this pool serves
         runner: _Runner
         backend: _Backend = Field(default_factory=_Backend)
         timeouts: _Timeouts = Field(default_factory=_Timeouts)
 
-    class _Controller(BaseModel):
+        @model_validator(mode="after")
+        def _backend_fields_match_its_type(self):
+            """Cross-check the pool against the backend it names.
+
+            `type` selects which fields mean anything; without this, OpenStack keys
+            on a libvirt pool (or the reverse) parse fine and are then ignored at
+            runtime, so the pool comes up subtly misconfigured instead of failing.
+            These run here, not in the backend constructors, because those need
+            libvirt-python / a live cloud connection — neither of which a config
+            typo should have to wait for."""
+            b, r = self.backend, self.runner
+            if b.type == "libvirt":
+                if stray := [
+                    k
+                    for k in ("cloud", "flavor_name", "network_name", "keypair")
+                    if getattr(b, k)
+                ]:
+                    raise ValueError(
+                        f"{', '.join(stray)} are OpenStack-only, but this pool is "
+                        'type = "libvirt"'
+                    )
+                if not b.hosts:
+                    raise ValueError(
+                        'type = "libvirt" needs at least one [[pool.backend.hosts]]'
+                    )
+                seen: set[str] = set()
+                for h in b.hosts:
+                    if h.name in seen:
+                        raise ValueError(f"duplicate host name {h.name!r}")
+                    seen.add(h.name)
+                    # Every host needs an image from somewhere: its own override, or
+                    # the backend's OCI ref / qcow2 name.
+                    if not (h.image_ref or h.image_name or b.image_ref or b.image_name):
+                        raise ValueError(
+                            f"host {h.name!r}: no image source — set [pool.backend]."
+                            "image_ref (OCI) or image_name (a qcow2 already in the "
+                            "host's storage pool)"
+                        )
+                if r.gpu and not any(h.gpu_pci_addresses for h in b.hosts):
+                    raise ValueError(
+                        "runner.gpu = true but no host declares gpu_pci_addresses — "
+                        "the slots would boot without a GPU attached"
+                    )
+            else:
+                if b.hosts:
+                    raise ValueError(
+                        'hosts are libvirt-only, but this pool is type = "openstack"'
+                    )
+                if missing := [
+                    k
+                    for k in ("cloud", "flavor_name", "network_name")
+                    if not getattr(b, k)
+                ]:
+                    raise ValueError(f'type = "openstack" needs {", ".join(missing)}')
+                if not (b.image_ref or b.image_name):
+                    raise ValueError(
+                        "no image source: set [pool.backend].image_ref (OCI) or "
+                        "image_name (a Glance image name)"
+                    )
+            # node_exporter only exists in the golden image, so scrape_cidr on a
+            # stock-image pool would open :9100 to a port with nothing behind it.
+            # Fail loudly rather than silently not collecting the metrics someone
+            # just asked for.
+            if r.scrape_cidr and not r.prebaked:
+                raise ValueError(
+                    "scrape_cidr requires prebaked = true (node_exporter is baked "
+                    "into the golden image; a stock image has none)"
+                )
+            return self
+
+    class _Controller(_Strict):
         lock_path: str = "/tmp/huskd.lock"
         http_addr: str = "127.0.0.1:9100"
-        shrink_ticks: int = 3
+        shrink_ticks: int = Field(3, ge=1)
         advertise_addr: str = ""
         image_cache_dir: str = ""
+
+        @field_validator("http_addr")
+        @classmethod
+        def _http_addr_is_bindable(cls, v: str) -> str:
+            # Otherwise a bad port raises a bare ValueError from parse_addr at
+            # serve time — after the lock is taken and the pools have started.
+            if not v.strip():
+                raise ValueError("http_addr must be set (it is huskd's only surface)")
+            return _check_addr("http_addr", v)
+
+        @field_validator("advertise_addr")
+        @classmethod
+        def _advertise_addr_is_a_host_port(cls, v: str) -> str:
+            return _check_addr("advertise_addr", v) if v.strip() else v
 
     class _Settings(BaseSettings):
         model_config = SettingsConfigDict(
@@ -337,7 +545,16 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
     # App and mints short-lived per-installation tokens.
     private_key = s.github.private_key
     if not private_key and s.github.private_key_path:
-        private_key = Path(s.github.private_key_path).read_text()
+        try:
+            private_key = Path(s.github.private_key_path).read_text()
+        except OSError as e:
+            # Almost always a k8s Secret that isn't mounted, or is mounted 0400 for
+            # a different uid. Say which, rather than raising a bare OSError.
+            raise RuntimeError(
+                f"[github].private_key_path {s.github.private_key_path!r} could not "
+                f"be read: {e.strerror} — check the Secret is mounted there and "
+                "readable by the huskd uid"
+            ) from None
     if not private_key or "PRIVATE KEY" not in private_key:
         raise RuntimeError(
             "GitHub App private key not configured: set HUSK_GITHUB__PRIVATE_KEY "
@@ -346,22 +563,12 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         )
 
     if not s.pool:
-        hint = ""
-        try:  # nudge the common case: an old flat [backend]/[runner] config
-            import tomllib
-
-            with open(path, "rb") as f:
-                raw = tomllib.load(f)
-            if "backend" in raw or "runner" in raw:
-                hint = (
-                    " — this looks like the old flat format; wrap [runner]/[backend]/"
-                    "[timeouts] under a [[pool]] (with a name). See config.example.toml"
-                )
-        except Exception:
-            pass
+        # The old-flat-format case is already caught upstream by `_check_top_level`,
+        # which sees the stray [runner]/[backend] tables; this is the genuinely
+        # empty file.
         raise RuntimeError(
             "no [[pool]] defined: huskd needs at least one pool (each with its own "
-            "[pool.runner] and [pool.backend])" + hint
+            "[pool.runner] and [pool.backend])"
         )
 
     # Shared across every pool — one App identity + target set, one lock/http
@@ -386,15 +593,6 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
             f"duplicate vm_prefix across pools: {prefixes} — pools must mint "
             "distinct VM/runner names (GitHub runner APIs are repo-wide)"
         )
-    # node_exporter only exists in the golden image, so scrape_cidr on a stock-image
-    # pool would open :9100 to a port with nothing behind it. Fail loudly rather
-    # than silently not collecting the metrics someone just asked for.
-    for c in configs:
-        if c.runner.scrape_cidr and not c.runner.prebaked:
-            raise RuntimeError(
-                f"pool {c.backend.name}: scrape_cidr requires prebaked = true "
-                "(node_exporter is baked into the golden image; a stock image has none)"
-            )
     return configs
 
 

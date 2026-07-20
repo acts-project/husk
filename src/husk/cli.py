@@ -10,7 +10,7 @@ import os
 import signal
 import time
 from pathlib import Path
-from typing import Annotated, Callable, Optional
+from typing import Annotated, Optional
 
 import typer
 
@@ -66,48 +66,33 @@ def _setup_logging(level: Optional[str]) -> None:
     logging.getLogger("husk").setLevel(husk_level)
 
 
+def _config_error(e: Exception) -> str:
+    """Render a load failure as one line per problem.
+
+    pydantic's own ValidationError repr is five lines per error with a docs URL —
+    unreadable in a container log, where this is the last thing anyone sees before
+    the crash-loop. Flatten it to `pool.1.backend.type: <message>` instead."""
+    errors = getattr(e, "errors", None)
+    if not callable(errors):
+        return str(e)
+    lines = []
+    for err in errors():
+        # Drop pydantic's synthetic tags for union/validator frames; what is left is
+        # the config path the operator actually wrote.
+        loc = ".".join(str(p) for p in err["loc"] if p != "__root__")
+        msg = err["msg"].removeprefix("Value error, ")
+        lines.append(f"  {loc}: {msg}" if loc else f"  {msg}")
+    return "\n".join(lines)
+
+
 def _load_all(config: Path, secrets_dir: Optional[Path]) -> list[Config]:
     try:
         return load_configs(
             str(config), secrets_dir=str(secrets_dir) if secrets_dir else None
         )
     except Exception as e:
-        typer.echo(f"config error: {e}", err=True)
+        typer.echo(f"config error in {config}:\n{_config_error(e)}", err=True)
         raise typer.Exit(code=2)
-
-
-def _configs_reloader(
-    config: Path, secrets_dir: Optional[Path]
-) -> "Callable[[], Optional[list[Config]]]":
-    """mtime-guarded multi-pool reloader for the MultiPoolController (returns the
-    full per-pool list, or None when unchanged / unparseable)."""
-    path = str(config)
-    last: dict[str, float | None] = {"mtime": None}
-
-    def reload() -> Optional[list[Config]]:
-        try:
-            mtime = os.stat(path).st_mtime
-        except OSError:
-            return None
-        if last["mtime"] is None:
-            last["mtime"] = mtime
-            return None
-        if mtime == last["mtime"]:
-            return None
-        last["mtime"] = mtime
-        try:
-            cfgs = load_configs(
-                path, secrets_dir=str(secrets_dir) if secrets_dir else None
-            )
-            logging.getLogger("husk.multipool").info("config file changed; reloading")
-            return cfgs
-        except Exception:
-            logging.getLogger("husk.multipool").warning(
-                "config reload skipped: %s could not be loaded", path, exc_info=True
-            )
-            return None
-
-    return reload
 
 
 def _tokens(cfg: Config):
@@ -362,6 +347,28 @@ def _print_status(snap: ControllerState | None) -> None:
     typer.echo(_table(headers, rows))
 
 
+# ------------------------------------------------------------------ validate
+@huskctl_app.command("validate")
+@huskd_app.command("validate")
+def validate(
+    config: _ConfigOpt = Path("config.toml"),
+    secrets_dir: _SecretsOpt = None,
+) -> None:
+    """Parse and check the config, then exit 0 (valid) or 2 (not).
+
+    Touches nothing external — no cloud, no libvirt, no GitHub — so it is safe as a
+    k8s initContainer or a CI step: a bad ConfigMap fails the rollout before the
+    daemon ever takes the lock."""
+    cfgs = _load_all(config, secrets_dir)
+    for c in cfgs:
+        b = c.backend
+        typer.echo(
+            f"{b.name}: {b.type} target={c.target} prefix={b.vm_prefix} "
+            f"min_ready={b.min_ready} max_total={b.max_total}"
+        )
+    typer.echo(f"ok: {len(cfgs)} pool(s) in {config}")
+
+
 # --------------------------------------------------------------------- huskd
 @huskd_app.command()
 def run(
@@ -384,8 +391,8 @@ def run(
         typer.echo(str(e), err=True)
         raise typer.Exit(code=1)
     try:
-        # One Controller per pool. The facade owns the loop + HTTP + reload, so the
-        # sub-controllers get a blanked http_addr and no reload hook. A pool that
+        # One Controller per pool. The facade owns the loop + HTTP, so the
+        # sub-controllers get a blanked http_addr. A pool that
         # can't be built (bad backend config, unreachable cloud) is skipped with a
         # loud error rather than taking the whole daemon down — the other pools run.
         # One process-wide image coordinator: the registry pull is single-flighted
@@ -433,7 +440,6 @@ def run(
         discovery = TargetDiscovery(tokens, [c.target for c in controllers])
         facade = MultiPoolController(
             controllers,
-            reload_configs=_configs_reloader(config, secrets_dir),
             discover=discovery.discover,
             # One listing per distinct target, not per pool: the runner API is
             # target-wide, so pools sharing a target share the poll.

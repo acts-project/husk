@@ -119,7 +119,7 @@ huskd pulls the image by its config-pinned `image_ref` and fans it out (libvirt:
 scp to each host's pool by digest; OpenStack: upload to Glance) — idempotent on
 digest, and it never overwrites an in-use backing file. To adopt a new build,
 point each pool's `image_ref` at the new tag/digest in your config (e.g.
-`config.multi.toml`) and reload; slots pick it up on their next recycle. See
+`config.multi.toml`) and restart huskd; slots pick it up on their next recycle. See
 [`image-pipeline.md`](image-pipeline.md#versioning-rollout-drain) for the
 drain/rollout mechanics.
 

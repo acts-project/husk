@@ -5,6 +5,18 @@
 # This example runs TWO pools at once: an OpenStack CPU pool and a libvirt GPU
 # pool. A single-backend setup is just one [[pool]] (see config.libvirt.example.toml).
 #
+# This file is read ONCE, at startup — huskd does not hot-reload it. Any change
+# means restarting huskd, which is cheap and safe: there is no state file, every
+# slot is re-adopted from backend metadata on the first tick, and a slot running a
+# job is left alone. Under k8s, put a checksum annotation over the ConfigMap on the
+# pod template so editing it actually triggers a rolling restart.
+#
+# Check this file without touching a cloud, a hypervisor or GitHub:
+#   huskd validate -c config.toml     # exit 0 = valid, 2 = not, one line per problem
+# Unknown keys are errors, not defaults — a typo fails the load rather than quietly
+# leaving the default in place. Run it as a k8s initContainer so a bad ConfigMap
+# fails the rollout instead of starting a misconfigured daemon.
+#
 # Log verbosity: --log-level DEBUG (or -l), or $HUSK_LOG_LEVEL (default INFO).
 # The App private key is NOT stored here. It is resolved in priority order:
 #   1. $HUSK_GITHUB__PRIVATE_KEY    (the PEM contents, e.g. from a secret store)
@@ -69,8 +81,8 @@ max_total = 2
 image_name = "ALMA10 - x86_64"
 #  (b) image_ref: an OCI golden built by build-images.yml on ghcr — the SAME artifact the
 #      libvirt hosts use. huskd oras-pulls it and uploads it to Glance as
-#      husk-golden-<digest> (idempotent); hot-reloads + drains on a ref change. Pair with
-#      [pool.runner] prebaked = true.
+#      husk-golden-<digest> (idempotent); drains onto a new ref after a restart. Pair
+#      with [pool.runner] prebaked = true.
 # image_ref = "ghcr.io/acts-project/husk-base:v1"
 
 [pool.timeouts]

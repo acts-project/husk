@@ -52,6 +52,10 @@ version = "2.334.0"
 labels = ["self-hosted", "cpu"]
 [pool.backend]
 type = "openstack"
+cloud = "cern"
+image_name = "ALMA10 - x86_64"
+flavor_name = "m2.small"
+network_name = "CERN_NETWORK"
 [[pool]]
 name = "libvirt-gpu"
 target = { org = "acts-project", group = "husk" }
@@ -60,6 +64,11 @@ version = "2.334.0"
 labels = ["self-hosted", "gpu"]
 [pool.backend]
 type = "libvirt"
+image_ref = "ghcr.io/acts-project/husk-gpu:v1"
+[[pool.backend.hosts]]
+name = "gpubox"
+libvirt_uri = "qemu+ssh://paul@GpuBox/system"
+gpu_pci_addresses = ["0000:01:00.0"]
 """
 
 

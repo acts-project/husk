@@ -4,8 +4,8 @@ A thin facade over N validated `Controller` instances (one per pool). The
 `Controller` is unchanged in spirit: each owns its backend + GitHub client +
 per-slot bookkeeping (keyed by globally-unique `slot.id`), so the pools share
 nothing implicitly. The facade only owns what is genuinely process-wide: the
-reconcile tasks and the config reload. Snapshots stay in memory on each Controller
-(`snapshots()` gathers them); the HTTP layer reads that provider directly.
+reconcile tasks. Snapshots stay in memory on each Controller (`snapshots()`
+gathers them); the HTTP layer reads that provider directly.
 
 Every pool is known at startup — each `[[pool]]` names the one target it serves —
 so the only thing that moves at runtime is whether that target is *servable*: is
@@ -29,32 +29,28 @@ all on the single event loop that also serves HTTP and runs the centralized
 freeze the snapshot the dashboard renders for it — provided its blocking work
 stays off the loop, which is why every backend call inside `Controller.tick()`
 goes through `asyncio.to_thread`. Each pool's `tick()` is wrapped so an unexpected
-raise can't kill its task. The config reload runs as one more task (reading the
-file once and dispatching hot knobs to every pool) rather than N re-parses, and
-does its file I/O in a thread. A `stop()` event makes every loop's sleep
-interruptible so shutdown is prompt.
+raise can't kill its task. A `stop()` event makes every loop's sleep interruptible
+so shutdown is prompt.
+
+The config file is read exactly once, at startup. There is no hot reload: changing
+anything means restarting huskd, which is cheap (no state file — slots are
+re-adopted from backend metadata on the first tick) and means the running config
+is always exactly what the file says, with no half-applied hybrid.
 """
 
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import logging
 from typing import Awaitable, Callable
 
 from husk.aio import sleep_or_stop
-from husk.config import Config
 from husk.controller import Controller
 from husk.discovery import Discovery
 from husk.snapshot import ControllerState
 from husk.target import Target
 
 log = logging.getLogger("husk.multipool")
-
-# How often the reload task re-checks the config file for hot-reloadable knobs.
-# Cheap (an mtime stat), so a small fixed cadence keeps edits picked up promptly
-# without coupling to any pool's poll interval.
-_RELOAD_INTERVAL_S = 5.0
 
 # How often to re-run target discovery. Installs change on human timescales, and
 # each sweep costs an API call per installation, so this is deliberately slow
@@ -67,7 +63,6 @@ class MultiPoolController:
         self,
         controllers: list[Controller],
         *,
-        reload_configs: Callable[[], list[Config] | None] | None = None,
         discover: Callable[[], Awaitable[Discovery]] | None = None,
         attach: Callable[[Controller], None] | None = None,
         detach: Callable[[Target], None] | None = None,
@@ -79,7 +74,6 @@ class MultiPoolController:
         # only thing that moves at runtime is whether its target is *servable*.
         self._all = list(controllers)
         self._controllers: list[Controller] = [] if discover else list(controllers)
-        self._reload = reload_configs
         self._discover = discover
         self._attach = attach
         self._detach = detach
@@ -112,8 +106,9 @@ class MultiPoolController:
     async def run(self, stop: asyncio.Event | None = None) -> None:
         """Drive every pool until `stop` is set. Runs on the caller's event loop.
 
-        Spawns one reconcile task per pool plus the reload task, then awaits them.
-        The caller holds the single process lock for this coroutine's lifetime."""
+        Spawns one reconcile task per pool (plus the discovery loop), then awaits
+        them. The caller holds the single process lock for this coroutine's
+        lifetime."""
         self._stop = stop or asyncio.Event()
         log.info(
             "huskd starting: %d pool(s) configured: %s",
@@ -122,14 +117,19 @@ class MultiPoolController:
         )
         for c in self._controllers:
             self._spawn(c)
-        own = [asyncio.create_task(self._reload_loop(), name="husk-reload")]
+        # Waiting on `stop` is what holds run() open: the pool tasks come and go
+        # under discovery, and discovery itself is optional, so neither can be the
+        # thing we await.
+        own: list[asyncio.Task] = [
+            asyncio.create_task(self._stop.wait(), name="husk-stop")
+        ]
         if self._discover is not None:
             own.append(
                 asyncio.create_task(self._discovery_loop(), name="husk-discovery")
             )
         try:
-            # The pool tasks come and go under discovery, so wait on the loop's own
-            # long-lived tasks and let `stop` end the pool tasks alongside them.
+            # Wait on the loop's own long-lived tasks and let `stop` end the pool
+            # tasks alongside them.
             await asyncio.gather(*own)
         finally:
             for t in [*own, *self._tasks.values()]:
@@ -322,16 +322,6 @@ class MultiPoolController:
                 "closing github client for %s failed", self._unit(ctrl), exc_info=True
             )
 
-    async def _reload_loop(self) -> None:
-        """Re-read the config file on a fixed cadence, off the event loop."""
-        assert self._stop is not None
-        try:
-            while not self._stop.is_set():
-                await asyncio.to_thread(self._maybe_reload)
-                await sleep_or_stop(self._stop, _RELOAD_INTERVAL_S)
-        except asyncio.CancelledError:
-            pass
-
     def stop(self) -> None:
         """Signal `run()` and every pool loop to exit (wakes their sleeps)."""
         if self._stop is not None:
@@ -353,44 +343,3 @@ class MultiPoolController:
             log.exception(
                 "pool %s: tick raised; other pools continue", self._name(ctrl)
             )
-
-    # ---------------------------------------------------------------- reload
-    def _maybe_reload(self) -> None:
-        """Hot-reload each pool's knobs from the config file (mtime-guarded by the
-        loader). Pools are matched by `backend.name`; adding/removing a pool needs
-        a restart (warned, ignored)."""
-        if self._reload is None:
-            return
-        try:
-            new = self._reload()
-        except Exception:
-            log.warning("config reload failed; keeping current config", exc_info=True)
-            return
-        if not new:
-            return
-        # Match against EVERY configured pool, not just the live ones: a pool
-        # that is currently draining must still pick up new knobs, or it would
-        # come back with stale config when its target returns.
-        by_name = {self._name(c): c for c in self._all}
-        new_names = {cfg.backend.name for cfg in new}
-        if new_names != set(by_name):
-            log.warning(
-                "pool set changed (%s -> %s); restart huskd to add/remove pools",
-                sorted(by_name),
-                sorted(new_names),
-            )
-        for cfg in new:
-            ctrl = by_name.get(cfg.backend.name)
-            if ctrl is None:
-                continue  # a new pool — restart-only (warned above)
-            # Normalize the one section the facade owns: http_addr is blanked on
-            # every sub-controller, so feeding the file's real value back would
-            # spuriously trip apply_reloaded_config's structural-change warning on
-            # every reload. Keep the *new* hot knobs (min_ready/max_total,
-            # controller.shrink_ticks) and reuse the shared github object as-is.
-            norm = dataclasses.replace(
-                cfg,
-                controller=dataclasses.replace(cfg.controller, http_addr=""),
-                github=ctrl.cfg.github,
-            )
-            ctrl.apply_reloaded_config(norm)

@@ -50,9 +50,9 @@ max_total = 2                          # one GPU host, one GPU → 1 (raise as t
 # Image source — pick ONE:
 #  (a) image_ref: an OCI artifact built by build-images.yml and published to
 #      ghcr. The controller `oras pull`s it once to a local cache and scp's it to
-#      every host pool (named by content digest). Pin a tag or a digest. Editing
-#      this while huskd runs hot-reloads: the new image is staged and idle slots
-#      drain onto it (running jobs finish first), old goldens are GC'd.
+#      every host pool (named by content digest). Pin a tag or a digest. To roll
+#      out a new build, edit this and restart huskd: the new image is staged and
+#      idle slots drain onto it (running jobs finish first), old goldens are GC'd.
 image_ref = "ghcr.io/acts-project/husk-gpu:v1"
 #
 #  (b) image_name: a qcow2 filename you placed in each host's pool dir yourself

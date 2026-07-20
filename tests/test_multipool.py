@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import logging
 import threading
 import time
 
@@ -128,19 +127,24 @@ def test_stalled_pool_does_not_block_another():
     asyncio.run(go())
 
 
-def test_reload_matches_by_name_without_structural_warning(caplog):
-    a, _, _ = _pool("pool-a", "husk-a", min_ready=1, max_total=2)
-    # The reload yields the file's REAL controller http_addr; the facade must
-    # normalize it (facade owns http) so no spurious "structural changes" warning.
-    new = dataclasses.replace(
-        make_config(min_ready=3, max_total=5),
-        backend=dataclasses.replace(a.cfg.backend, min_ready=3, max_total=5),
-        controller=dataclasses.replace(a.cfg.controller, http_addr="127.0.0.1:9100"),
-    )
-    facade = MultiPoolController([a], reload_configs=lambda: [new])
+def test_run_stays_alive_without_a_discovery_loop():
+    """`run()` is held open by its wait on `stop`, nothing else.
 
-    with caplog.at_level(logging.WARNING):
-        facade._maybe_reload()
+    Both of the other long-lived tasks are optional now — discovery is only
+    spawned when a discover hook is passed, and there is no config-reload task at
+    all. Without the explicit stop-wait, `run()` would gather an empty task list,
+    return instantly, and cancel every pool loop in its `finally`."""
+    a, _, _ = _pool("pool-a", "husk-a", min_ready=1)
+    _fast_poll(a)
 
-    assert a.cfg.backend.min_ready == 3 and a.cfg.backend.max_total == 5
-    assert "structural changes ignored" not in caplog.text
+    async def go():
+        stop = asyncio.Event()
+        await pump(a)
+        task = asyncio.create_task(MultiPoolController([a]).run(stop))
+        # Give run() every chance to return early; it must still be pending.
+        await asyncio.sleep(0.05)
+        assert not task.done(), "run() returned before stop was set"
+        stop.set()
+        await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(go())
