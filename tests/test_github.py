@@ -121,8 +121,8 @@ def test_org_group_name_resolves_to_id() -> None:
 
 
 def test_unknown_org_group_falls_back_to_default() -> None:
-    # A free-plan org can't create groups at all, so an unknown name must degrade
-    # rather than fail the mint.
+    # huskd serves orgs it does not administer, so the group named in its config
+    # may not exist there. That must degrade, not fail the mint.
     groups = {"runner_groups": [{"id": 1, "name": "Default"}]}
     client = _client(
         lambda r: httpx.Response(200, json=groups), target=ORG, runner_group="husk"

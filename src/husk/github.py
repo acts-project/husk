@@ -29,7 +29,7 @@ from husk.target import Target
 log = logging.getLogger("husk.github")
 
 # Every org has the Default group at id 1; it's the fallback when a configured
-# group name doesn't exist (e.g. a free-plan org, which can't create groups).
+# group name doesn't exist on a given target.
 DEFAULT_RUNNER_GROUP_ID = 1
 
 
@@ -83,8 +83,11 @@ class GitHubClient:
         """Resolve the configured group NAME to an id for this target.
 
         None for repo scope (no such concept). For org scope, an unknown name
-        falls back to Default rather than failing: a group is an isolation nicety,
-        not a correctness requirement, and free-plan orgs cannot create one."""
+        falls back to Default rather than failing. This matters more as the App
+        spreads: huskd serves orgs it does not administer, so a group named in
+        *huskd's* config simply may not exist over there. A group is an isolation
+        nicety, not a correctness requirement — refusing to mint runners because
+        of one would be the wrong trade."""
         if self.target.kind != "org":
             return None
         if self._group_id is not None:

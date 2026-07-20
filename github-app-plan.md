@@ -145,8 +145,8 @@ Shipped as described below, plus:
   `husk-gpu-acts-project`) so names can't collide; with a single target both are
   left untouched, because changing `vm_prefix` would orphan every running VM.
 - Runner-group resolution **degrades rather than fails**: an unknown name (or a
-  failed listing) falls back to Default/1. Free-plan orgs can't create groups at
-  all, so a hard failure here would be wrong.
+  failed listing) falls back to Default/1 — huskd serves orgs it does not
+  administer, so a group named in its own config may simply not exist there.
 - One `InstallationTokenProvider` process-wide, serialized on a lock so N pools
   sharing a target don't stampede the mint endpoint.
 - `huskctl reap`/`recycle` are now target-scoped: reap iterates every target;

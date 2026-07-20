@@ -64,9 +64,10 @@ class RunnerConfig:
     version: str
     labels: list[str]
     # Runner-group NAME, not id: group ids are not portable across orgs, so the
-    # client resolves this per target (falling back to Default/1 when the org has
-    # no such group — e.g. a free-plan org, which can't create custom groups).
-    # Ignored on repo-scoped targets, which have no runner groups.
+    # client resolves this per target, falling back to Default/1 where no group of
+    # this name exists (huskd serves orgs it does not administer, so the group it
+    # wants may simply not be there). Ignored on repo-scoped targets, which have
+    # no runner groups.
     runner_group: str = "Default"
     gpu: bool = False  # GPU pools: cloud-init activates the NVIDIA driver + CDI
     prebaked: bool = False  # golden-image pools: skip the install steps (baked in)
