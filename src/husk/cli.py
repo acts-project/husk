@@ -129,45 +129,18 @@ def _backend_for(cfg: Config, image_sync=None):
     return OpenStackBackend(cfg.backend, image_sync=image_sync)
 
 
-def _build(cfg: Config, image_sync=None, *, tokens=None, target):
-    """One (backend, github client) pair for a pool, scoped to one target."""
+def _build(cfg: Config, image_sync=None, *, tokens=None):
+    """One (backend, github client) pair for a pool, scoped to the target it serves."""
     from husk.github import GitHubClient
 
     backend = _backend_for(cfg, image_sync=image_sync)
     github = GitHubClient(
-        target=target,
+        target=cfg.target,
         tokens=tokens or _tokens(cfg),
         labels=cfg.runner.labels,
         runner_group=cfg.runner.runner_group,
     )
     return backend, github
-
-
-def _target_naming(cfg: Config, target, n_targets: int) -> dict:
-    """Per-`(target, pool)` identity overrides for the backend config.
-
-    Runner names are how husk tells its own slots apart (`match_runner` is
-    prefix-based) and the runner APIs are target-wide, so two targets sharing a
-    backend MUST mint distinct names.
-
-    `n_targets` is the size of the **allowlist**, not of the discovered set. The
-    discovered set moves as people install and uninstall, and a `vm_prefix` that
-    changed underneath a running slot would orphan it (it stops matching the
-    prefix and becomes invisible to reconcile). Keying off config makes the name a
-    slot is born with the name it keeps.
-
-    With a single allowed target both are deliberately left alone, so a
-    single-target deployment keeps the plain `husk-gpu` names its live VMs already
-    carry. Widening the allowlist from one entry to two therefore renames the
-    pools: that is a restart-and-drain migration, not a hot edit."""
-    from husk.config import _slug
-
-    if n_targets < 2:
-        return {}
-    return {
-        "name": f"{cfg.backend.name}@{target.name}",
-        "vm_prefix": f"{cfg.backend.vm_prefix}-{_slug(target.name)}",
-    }
 
 
 def _select_pool(cfgs: list[Config], pool: Optional[str]) -> Config:
@@ -425,11 +398,7 @@ def run(
         # One registry for the whole daemon: the centralized poller writes each
         # target's runner listing here and every pool's reconcile task reads it.
         registry = SnapshotRegistry()
-        tokens = _tokens(cfgs[0])  # shared App credential (targets are process-wide)
-        allowed = cfgs[0].access.allowed
-        # The reconcile unit is (target, pool) — one Controller each — and the
-        # target set is discovered (installations ∩ allowlist), not configured.
-        # `_make_pools` is what the facade calls when a target appears.
+        tokens = _tokens(cfgs[0])  # shared App credential (one App, many targets)
         poller = RunnerPoller(
             registry,
             {},
@@ -437,44 +406,35 @@ def run(
             # older than its own tick interval.
             interval=min(c.timeouts.poll_interval_sec for c in cfgs),
         )
-
-        allowed_size = len(allowed)
-
-        def make_pools(target) -> list[Controller]:
-            out: list[Controller] = []
-            for cfg in cfgs:
-                label = f"{target}/{cfg.backend.name}"
-                try:
-                    backend, github = _build(
-                        cfg, image_sync=image_sync, tokens=tokens, target=target
-                    )
-                except Exception as e:
-                    typer.echo(
-                        f"pool {label!r} failed to start, skipping: {e}", err=True
-                    )
-                    logging.getLogger("husk").error(
-                        "pool %s failed to build; skipping", label, exc_info=True
-                    )
-                    continue
-                sub = dataclasses.replace(
-                    cfg,
-                    controller=dataclasses.replace(cfg.controller, http_addr=""),
-                    backend=dataclasses.replace(
-                        cfg.backend,
-                        **_target_naming(cfg, target, allowed_size),
-                    ),
+        # One Controller per [[pool]] — each names the one target it serves. A pool
+        # that can't be built (bad backend config, unreachable cloud) is skipped
+        # with a loud error rather than taking the whole daemon down.
+        controllers = []
+        for cfg in cfgs:
+            label = f"{cfg.target}/{cfg.backend.name}"
+            try:
+                backend, github = _build(cfg, image_sync=image_sync, tokens=tokens)
+            except Exception as e:
+                typer.echo(f"pool {label!r} failed to start, skipping: {e}", err=True)
+                logging.getLogger("husk").error(
+                    "pool %s failed to build; skipping", label, exc_info=True
                 )
-                out.append(
-                    Controller(backend, github, sub, target=target, registry=registry)
-                )
-            return out
+                continue
+            sub = dataclasses.replace(
+                cfg, controller=dataclasses.replace(cfg.controller, http_addr="")
+            )
+            controllers.append(
+                Controller(backend, github, sub, target=cfg.target, registry=registry)
+            )
+        if not controllers:
+            typer.echo("no pools could be started", err=True)
+            raise typer.Exit(code=1)
 
-        discovery = TargetDiscovery(tokens, allowed)
+        discovery = TargetDiscovery(tokens, [c.target for c in controllers])
         facade = MultiPoolController(
-            [],
+            controllers,
             reload_configs=_configs_reloader(config, secrets_dir),
             discover=discovery.discover,
-            build=make_pools,
             # One listing per distinct target, not per pool: the runner API is
             # target-wide, so pools sharing a target share the poll.
             attach=lambda c: poller.add_target(c.target, c.github.list_runners),
@@ -695,10 +655,12 @@ def reap(
         from husk.discovery import discover_targets
 
         out: list[tuple[str, list[str]]] = []
-        targets = await discover_targets(tokens, cfgs[0].access.allowed)
+        targets = await discover_targets(tokens, [c.target for c in cfgs])
         if not targets:
             typer.echo(
-                "no targets: the App is not installed on any allowed org/repo", err=True
+                "no servable targets: the App is not installed on any target named "
+                "by a [[pool]]",
+                err=True,
             )
         clients = [
             GitHubClient(
@@ -840,24 +802,27 @@ def recycle(
     # Discovered once and reused across pools: recycle is target-agnostic (it acts
     # on slots), and the targets only matter for best-effort busy detection.
     try:
-        targets = asyncio.run(discover_targets(tokens, cfgs[0].access.allowed))
+        targets = asyncio.run(discover_targets(tokens, [c.target for c in cfgs]))
     except Exception as e:
         typer.echo(f"target discovery failed: {e}", err=True)
         raise typer.Exit(code=1)
     total_acted, any_unknown, any_err = 0, False, False
     for cfg in pools:
         backend = _backend_for(cfg)
-        # One client per target: a pool's slots may have been minted against any
-        # of them, so busy detection has to look at all.
-        githubs = [
-            GitHubClient(
-                target=tg,
-                tokens=tokens,
-                labels=cfg.runner.labels,
-                runner_group=cfg.runner.runner_group,
-            )
-            for tg in targets
-        ]
+        # A pool's slots are always minted against the one target it serves, so
+        # busy detection needs exactly that target's runner listing.
+        githubs = (
+            [
+                GitHubClient(
+                    target=cfg.target,
+                    tokens=tokens,
+                    labels=cfg.runner.labels,
+                    runner_group=cfg.runner.runner_group,
+                )
+            ]
+            if cfg.target in targets
+            else []  # not servable → skip the listing, recycle on slots alone
+        )
         if multi:
             typer.echo(f"── {cfg.backend.name} ──")
 

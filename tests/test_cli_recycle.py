@@ -44,10 +44,9 @@ _TWO_POOLS = """
 [github]
 app_id = 123456
 
-[access]
-allowed_orgs = ["acts-project"]
 [[pool]]
 name = "openstack-cpu"
+target = { org = "acts-project", group = "husk" }
 [pool.runner]
 version = "2.334.0"
 labels = ["self-hosted", "cpu"]
@@ -55,6 +54,7 @@ labels = ["self-hosted", "cpu"]
 type = "openstack"
 [[pool]]
 name = "libvirt-gpu"
+target = { org = "acts-project", group = "husk" }
 [pool.runner]
 version = "2.334.0"
 labels = ["self-hosted", "gpu"]

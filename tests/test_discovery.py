@@ -1,9 +1,9 @@
-"""Target discovery: installations ∩ allowlist.
+"""Target availability: are the configured targets actually installed?
 
-This is huskd's entire access-control story — the App is installable by anyone,
-so a bug here means either serving an account nobody allowed, or refusing one
-that was. The partial-sweep flag matters just as much: it is what stops a
-transient GitHub failure from being read as "this target went away"."""
+Each [[pool]] names the one target it serves; this decides whether that target is
+servable right now. A bug here either serves something nobody configured, or
+drains a pool that was fine. The `complete` flag matters just as much: it is what
+stops a transient GitHub failure reading as "no longer installed"."""
 
 from __future__ import annotations
 
@@ -12,11 +12,14 @@ import asyncio
 import httpx
 import pytest
 
-from husk.discovery import Allowlist, DiscoveryError, TargetDiscovery
+from husk.discovery import DiscoveryError, TargetDiscovery
+from husk.target import Target
+
+ORG = Target.org("acts-project")
+REPO = Target.repo("paulgessinger/husk-test")
 
 ORG_INSTALL = {"id": 11, "account": {"login": "acts-project", "type": "Organization"}}
 USER_INSTALL = {"id": 22, "account": {"login": "paulgessinger", "type": "User"}}
-STRANGER = {"id": 33, "account": {"login": "randomorg", "type": "Organization"}}
 
 
 def _run(coro):
@@ -24,8 +27,6 @@ def _run(coro):
 
 
 class FakeTokens:
-    """Stands in for InstallationTokenProvider. Records repo listings requested."""
-
     def __init__(self, installs, *, fail=False) -> None:
         self._installs = installs
         self._fail = fail
@@ -41,8 +42,7 @@ class FakeTokens:
         return f"ghs_{iid}"
 
 
-def _discovery(tokens, allow, repos_by_token=None, *, repo_status=200):
-    """Wire a TargetDiscovery to a mocked /installation/repositories."""
+def _discovery(tokens, targets, repos_by_token=None, *, repo_status=200):
     repos_by_token = repos_by_token or {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -56,48 +56,53 @@ def _discovery(tokens, allow, repos_by_token=None, *, repo_status=200):
 
     return TargetDiscovery(
         tokens,
-        allow,
+        targets,
         client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
 
 
-# ------------------------------------------------------------------- allowlist
-def test_allowed_org_becomes_an_org_target():
-    d = _discovery(FakeTokens([ORG_INSTALL]), Allowlist(orgs=("acts-project",)))
+# ----------------------------------------------------------------- org scope
+def test_installed_org_target_is_available():
+    d = _discovery(FakeTokens([ORG_INSTALL]), [ORG])
     result = _run(d.discover())
     assert [t.key for t in result.targets] == ["org:acts-project"]
     assert result.complete
 
 
-def test_installation_not_on_the_allowlist_is_ignored():
-    d = _discovery(
-        FakeTokens([ORG_INSTALL, STRANGER]), Allowlist(orgs=("acts-project",))
-    )
-    assert [t.key for t in _run(d.discover()).targets] == ["org:acts-project"]
+def test_uninstalled_org_target_is_not_available():
+    d = _discovery(FakeTokens([]), [ORG])
+    assert _run(d.discover()).targets == ()
 
 
 def test_matching_is_case_insensitive_but_keeps_configured_spelling():
-    """GitHub logins are case-insensitive; `vm_prefix` is derived from the target
-    name, so the *configured* spelling has to win or names would churn."""
-    install = {"id": 1, "account": {"login": "ACTS-Project"}}
-    d = _discovery(FakeTokens([install]), Allowlist(orgs=("acts-project",)))
+    """GitHub logins are case-insensitive; the configured spelling has to win,
+    since it is what names the pool's slots."""
+    d = _discovery(FakeTokens([{"id": 1, "account": {"login": "ACTS-Project"}}]), [ORG])
     assert [t.key for t in _run(d.discover()).targets] == ["org:acts-project"]
 
 
-def test_org_only_allowlist_never_lists_repositories():
-    """The repo listing is one API call per installation; skip it when no repo
-    could possibly match."""
+def test_org_targets_never_list_repositories():
+    """One API call per installation saved: an org target's availability is
+    settled by the installation list alone."""
     tokens = FakeTokens([ORG_INSTALL])
-    d = _discovery(tokens, Allowlist(orgs=("acts-project",)))
-    _run(d.discover())
+    _run(_discovery(tokens, [ORG]).discover())
     assert tokens.token_calls == []
 
 
-# ----------------------------------------------------------------- repo scope
-def test_allowed_repo_becomes_a_repo_target():
+def test_duplicate_targets_are_checked_once():
+    """Several pools commonly serve one target (a gpu and a cpu pool for the same
+    org) — that should not double the API work."""
+    tokens = FakeTokens([USER_INSTALL])
+    d = _discovery(tokens, [REPO, REPO], {"ghs_22": ["paulgessinger/husk-test"]})
+    assert len(_run(d.discover()).targets) == 1
+    assert tokens.token_calls == [22]
+
+
+# ---------------------------------------------------------------- repo scope
+def test_repo_target_available_when_installed_and_granted():
     d = _discovery(
         FakeTokens([USER_INSTALL]),
-        Allowlist(repos=("paulgessinger/husk-test",)),
+        [REPO],
         {"ghs_22": ["paulgessinger/husk-test", "paulgessinger/other"]},
     )
     assert [t.key for t in _run(d.discover()).targets] == [
@@ -105,32 +110,24 @@ def test_allowed_repo_becomes_a_repo_target():
     ]
 
 
-def test_allowlisted_repo_the_install_did_not_grant_is_not_served():
-    """Defense in depth: the installer picks repos AND huskd's operator lists
+def test_repo_target_the_install_did_not_grant_is_not_available():
+    """Defense in depth: the installer picks the repos AND the operator configures
     them. Either alone is not enough."""
     d = _discovery(
-        FakeTokens([USER_INSTALL]),
-        Allowlist(repos=("paulgessinger/husk-test",)),
-        {"ghs_22": ["paulgessinger/something-else"]},
+        FakeTokens([USER_INSTALL]), [REPO], {"ghs_22": ["paulgessinger/something-else"]}
     )
     assert _run(d.discover()).targets == ()
 
 
-def test_repo_allowlist_does_not_leak_to_the_owners_other_repos():
-    d = _discovery(
-        FakeTokens([USER_INSTALL]),
-        Allowlist(repos=("paulgessinger/husk-test",)),
-        {"ghs_22": ["paulgessinger/a", "paulgessinger/b", "paulgessinger/husk-test"]},
-    )
-    assert [t.key for t in _run(d.discover()).targets] == [
-        "repo:paulgessinger/husk-test"
-    ]
+def test_repo_target_whose_owner_has_no_install_is_not_available():
+    d = _discovery(FakeTokens([ORG_INSTALL]), [REPO])
+    assert _run(d.discover()).targets == ()
 
 
 def test_org_and_repo_targets_coexist():
     d = _discovery(
         FakeTokens([ORG_INSTALL, USER_INSTALL]),
-        Allowlist(orgs=("acts-project",), repos=("paulgessinger/husk-test",)),
+        [ORG, REPO],
         {"ghs_22": ["paulgessinger/husk-test"]},
     )
     assert [t.key for t in _run(d.discover()).targets] == [
@@ -139,37 +136,20 @@ def test_org_and_repo_targets_coexist():
     ]
 
 
-# -------------------------------------------------------------------- failure
+# ------------------------------------------------------------------- failure
 def test_unreadable_installation_list_raises():
-    """Nothing could be determined at all — the caller must keep its current set."""
-    d = _discovery(FakeTokens([], fail=True), Allowlist(orgs=("acts-project",)))
+    """Nothing could be determined — the caller must keep its current set."""
+    d = _discovery(FakeTokens([], fail=True), [ORG])
     with pytest.raises(DiscoveryError, match="could not list installations"):
         _run(d.discover())
 
 
 def test_failed_repo_listing_makes_the_sweep_partial_not_empty():
     """The org target still resolves; the sweep is flagged so the supervisor
-    won't read the missing repo target as a removal."""
+    won't read the missing repo target as an uninstall."""
     d = _discovery(
-        FakeTokens([ORG_INSTALL, USER_INSTALL]),
-        Allowlist(orgs=("acts-project",), repos=("paulgessinger/husk-test",)),
-        repo_status=500,
+        FakeTokens([ORG_INSTALL, USER_INSTALL]), [ORG, REPO], repo_status=500
     )
     result = _run(d.discover())
     assert [t.key for t in result.targets] == ["org:acts-project"]
     assert not result.complete
-
-
-# ------------------------------------------------------------------ allowlist
-def test_allowlist_rejects_a_repo_in_the_org_list():
-    with pytest.raises(ValueError, match="allowed_repos"):
-        Allowlist(orgs=("owner/name",))
-
-
-def test_allowlist_rejects_a_bare_login_in_the_repo_list():
-    with pytest.raises(ValueError, match="owner/name"):
-        Allowlist(repos=("acts-project",))
-
-
-def test_allowlist_size_counts_both_lists():
-    assert len(Allowlist(orgs=("a", "b"), repos=("c/d",))) == 3

@@ -75,16 +75,22 @@ and drop `repo` / `pat` / `pat_path` / `pat_env`.
 app_id = 123456
 private_key_path = "/etc/husk/husk-app.pem" # or HUSK_GITHUB__PRIVATE_KEY
 
-[access]                                     # THE restriction — huskd's allowlist
-allowed_orgs  = ["acts-project"]             # whole org  → org-level runners
-allowed_repos = ["paulgessinger/husk-test"]  # this repo  → repo-level runners
-
-[pool.gpu]
+[[pool]]                                     # each pool names the ONE target it serves
+name   = "gpu"
+target = { org = "acts-project", group = "husk" }   # org-level runners
 # ...backend + runner config as today...
-runner_group = "husk"                        # was runner_group_id (now a name)
-serve_targets = ["org:acts-project"]         # optional; default = all allowed targets
-min_ready = 0                                # sensible default for personal repos
+
+[[pool]]
+name   = "test"
+target = { repo = "paulgessinger/husk-test" }       # that repo only
 ```
+
+**Superseded (2026-07-20):** the design above originally had an `[access]`
+allowlist fanned out over every pool. It was replaced by explicit per-pool
+binding, because warm capacity cannot be shared across targets — a JIT runner
+belongs to exactly one org/repo — so fan-out silently multiplied `min_ready` and
+over-subscribed scarce hardware, while org scope already covers the common
+"many repos" case with one target. See `targets-and-capacity.md`.
 
 ## Phases
 

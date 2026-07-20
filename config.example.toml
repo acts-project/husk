@@ -14,15 +14,13 @@
 app_id = 123456                        # from the App's settings page
 private_key_path = "/etc/husk/husk-app.pem"   # or env HUSK_GITHUB__PRIVATE_KEY (PEM contents)
 
-[access]                               # huskd's allowlist -- THE restriction.
-# The App is installable by anyone, so this is what decides who huskd serves.
-# Discovery intersects live installations with these two lists; an install that
-# matches neither is ignored (never auto-declined). The entry TYPE picks scope:
-#   allowed_orgs  -- whole org -> org-level runners, one warm pool for every repo
-#   allowed_repos -- owner/name -> runners for exactly that repo, nothing else
-# A repo is served only if the installation granted it AND it is listed here.
-allowed_orgs  = ["acts-project"]
-allowed_repos = []
+# Each [[pool]] names the ONE target it serves:
+#   target = { org  = "acts-project", group = "husk" }   # org-level runners
+#   target = { repo = "owner/name" }                     # that repo only
+# `group` is an org-only concept (repo scope has no runner groups), so the schema
+# only lets you write one where it means something. A pool is served when the App
+# is installed on that org / that repo was granted to the install; otherwise the
+# pool drains and idles.
 
 [controller]                           # shared: one lock / state / http per daemon
 lock_path = "/tmp/huskd.lock"
@@ -41,11 +39,11 @@ shrink_ticks = 3                       # sustained-surplus ticks before ramp-dow
 # APIs are repo-wide, so isolation relies on pool-unique VM/runner names + labels.
 [[pool]]
 name = "openstack-cpu"
+target = { org = "acts-project", group = "husk" }
 
 [pool.runner]
 version = "2.334.0"
 labels = ["self-hosted", "linux", "x64", "husk-cpu"]   # jobs route here via these labels
-runner_group = "husk"
 # prebaked = true  # set ONLY when image_ref points at a husk golden: cloud-init then
 #                  # skips the runner/podman install and `version` must match the image.
 # In-guest metrics (observability.md). Opens :9100 (node_exporter, baked into the
@@ -84,11 +82,11 @@ max_job_duration_sec = 21600          # 6h — stop (not destroy) busy slots bey
 # ───────────────────────────── pool 2: libvirt GPU ──────────────────────────
 [[pool]]
 name = "libvirt-gpu"
+target = { org = "acts-project", group = "husk" }
 
 [pool.runner]
 version = "2.334.0"
 labels = ["self-hosted", "linux", "x64", "gpu"]   # jobs route here via "gpu"
-runner_group = "husk"
 gpu = true                             # activate the NVIDIA driver (modprobe + CDI) each boot
 prebaked = true                        # husk-gpu golden: skip install (version must match the image)
 # In-guest metrics (observability.md). On libvirt the guest is on a private net

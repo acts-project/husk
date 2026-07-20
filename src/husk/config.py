@@ -13,7 +13,7 @@ import re
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
-from husk.discovery import Allowlist
+from husk.target import Target
 
 log = logging.getLogger("husk.config")
 
@@ -52,35 +52,19 @@ class GithubConfig:
 
 
 @dataclass(frozen=True)
-class AccessConfig:
-    """huskd's allowlist — THE restriction on who this daemon serves.
-
-    The App is installable by any account, so the gate is here rather than on
-    GitHub's side. Discovery intersects the live installations with these two
-    lists; the entry's type picks the runner scope (org entry → org-level runners,
-    repo entry → runners for exactly that repo). See `husk.discovery`."""
-
-    allowed: Allowlist
-
-    @property
-    def max_targets(self) -> int:
-        """Upper bound on the discovered target set, known at startup.
-
-        Per-target naming keys off this rather than the live target count: the
-        discovered set changes as people install/uninstall, and a `vm_prefix` that
-        moved underneath a running slot would orphan it."""
-        return len(self.allowed)
-
-
-@dataclass(frozen=True)
 class RunnerConfig:
     version: str
     labels: list[str]
     # Runner-group NAME, not id: group ids are not portable across orgs, so the
     # client resolves this per target, falling back to Default/1 where no group of
     # this name exists (huskd serves orgs it does not administer, so the group it
-    # wants may simply not be there). Ignored on repo-scoped targets, which have
-    # no runner groups.
+    # wants may simply not be there).
+    #
+    # In TOML this lives inside the pool's *target* table — `target = { org =
+    # "acts-project", group = "husk" }` — because runner groups are an org-only
+    # concept, and nesting it there makes "group on a repo target" unrepresentable
+    # rather than silently ignored. The loader flattens it to here, next to the
+    # other knobs the GitHub client consumes.
     runner_group: str = "Default"
     gpu: bool = False  # GPU pools: cloud-init activates the NVIDIA driver + CDI
     prebaked: bool = False  # golden-image pools: skip the install steps (baked in)
@@ -179,7 +163,12 @@ class ControllerConfig:
 @dataclass(frozen=True)
 class Config:
     github: GithubConfig
-    access: AccessConfig
+    # The ONE target this pool serves. Explicit per pool rather than a global
+    # allowlist fanned out across pools: warm capacity cannot be shared between
+    # targets (a JIT runner is registered to exactly one org/repo), so fan-out
+    # silently multiplied min_ready and over-subscribed scarce hardware. Org scope
+    # already covers the common "many repos" case with a single target.
+    target: Target
     runner: RunnerConfig
     backend: BackendConfig
     timeouts: TimeoutsConfig = field(default_factory=TimeoutsConfig)
@@ -207,7 +196,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
     """
     from pathlib import Path
 
-    from pydantic import BaseModel, Field
+    from pydantic import BaseModel, Field, model_validator
     from pydantic_settings import (
         BaseSettings,
         PydanticBaseSettingsSource,
@@ -221,15 +210,40 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         private_key: str | None = None
         private_key_path: str | None = None  # file / k8s Secret mount
 
-    class _Access(BaseModel):
-        # huskd's allowlist. Discovery intersects live installations with these.
-        allowed_orgs: list[str] = []
-        allowed_repos: list[str] = []
+    class _Target(BaseModel):
+        """`target = { org = "acts-project", group = "husk" }` or
+        `target = { repo = "owner/name" }`.
+
+        The key names the scope, so there is no `kind:name` string to parse, and
+        `group` can only be written where it means something — runner groups are
+        an org-only concept."""
+
+        org: str | None = None
+        repo: str | None = None
+        group: str = "Default"
+
+        @model_validator(mode="after")
+        def _exactly_one_scope(self):
+            if bool(self.org) == bool(self.repo):
+                raise ValueError(
+                    "target needs exactly one of org / repo, e.g. "
+                    '{ org = "acts-project" } or { repo = "owner/name" }'
+                )
+            if self.repo and "/" not in self.repo:
+                raise ValueError(f"target repo {self.repo!r} must be owner/name")
+            if self.org and "/" in self.org:
+                raise ValueError(
+                    f"target org {self.org!r} looks like a repo — use "
+                    '{ repo = "owner/name" }'
+                )
+            return self
+
+        def resolved(self) -> Target:
+            return Target.org(self.org) if self.org else Target.repo(self.repo)
 
     class _Runner(BaseModel):
         version: str
         labels: list[str]
-        runner_group: str = "Default"
         gpu: bool = False
         prebaked: bool = False
         scrape_cidr: str = ""
@@ -272,6 +286,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
 
     class _Pool(BaseModel):
         name: str  # pool identity → backend.name + default vm_prefix
+        target: _Target  # the one org/repo this pool serves
         runner: _Runner
         backend: _Backend = Field(default_factory=_Backend)
         timeouts: _Timeouts = Field(default_factory=_Timeouts)
@@ -291,7 +306,6 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
             extra="ignore",
         )
         github: _Github
-        access: _Access = Field(default_factory=_Access)
         controller: _Controller = Field(default_factory=_Controller)
         pool: list[_Pool] = []
 
@@ -331,31 +345,6 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
             "App settings page generated)"
         )
 
-    try:
-        allowed = Allowlist(
-            orgs=tuple(s.access.allowed_orgs), repos=tuple(s.access.allowed_repos)
-        )
-    except ValueError as e:
-        raise RuntimeError(f"[access]: {e}") from e
-    if not allowed:
-        raise RuntimeError(
-            "empty [access] allowlist: huskd serves nothing until an org or repo is "
-            'allowed, e.g. allowed_orgs = ["acts-project"] or '
-            'allowed_repos = ["owner/name"]'
-        )
-    # An allowed repo under an allowed org is redundant: the org's runners already
-    # serve every repo in it, so the repo entry only adds a second, narrower pool
-    # competing for the same jobs.
-    for r in allowed.repos:
-        owner = r.split("/", 1)[0]
-        if allowed.org_for(owner) is not None:
-            log.warning(
-                "[access]: allowed_repos entry %r is redundant — %r is already an "
-                "allowed org, whose org-level runners serve that repo",
-                r,
-                owner,
-            )
-
     if not s.pool:
         hint = ""
         try:  # nudge the common case: an old flat [backend]/[runner] config
@@ -378,7 +367,6 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
     # Shared across every pool — one App identity + target set, one lock/http
     # per daemon.
     github = GithubConfig(app_id=s.github.app_id, private_key=private_key)
-    access = AccessConfig(allowed=allowed)
     controller = ControllerConfig(
         lock_path=s.controller.lock_path,
         http_addr=s.controller.http_addr,
@@ -387,19 +375,11 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         image_cache_dir=s.controller.image_cache_dir,
     )
 
-    configs = [_pool_config(p, github, access, controller) for p in s.pool]
+    configs = [_pool_config(p, github, controller) for p in s.pool]
 
     names = [c.backend.name for c in configs]
     if len(set(names)) != len(names):
         raise RuntimeError(f"duplicate pool name across [[pool]] entries: {names}")
-    # `@` separates pool from target in a live unit's name (`gpu@acts-project`),
-    # which is how config reload maps a unit back to its [[pool]]. Keep it reserved.
-    for n in names:
-        if "@" in n:
-            raise RuntimeError(
-                f"pool name {n!r} may not contain '@': huskd reserves it to name "
-                "per-target units (pool@target)"
-            )
     prefixes = [c.backend.vm_prefix for c in configs]
     if len(set(prefixes)) != len(prefixes):
         raise RuntimeError(
@@ -418,9 +398,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
     return configs
 
 
-def _pool_config(
-    p, github: GithubConfig, access: AccessConfig, controller: ControllerConfig
-) -> Config:
+def _pool_config(p, github: GithubConfig, controller: ControllerConfig) -> Config:
     """Assemble one pool's runtime `Config` from its parsed pydantic model `p`."""
     b = p.backend
     backend = BackendConfig(
@@ -455,11 +433,13 @@ def _pool_config(
     )
     return Config(
         github=github,
-        access=access,
+        target=p.target.resolved(),
         runner=RunnerConfig(
             version=p.runner.version,
             labels=list(p.runner.labels),
-            runner_group=p.runner.runner_group,
+            # Flattened from the target table: groups are org-only, so that is
+            # the only place the schema lets you write one.
+            runner_group=p.target.group,
             gpu=p.runner.gpu,
             prebaked=p.runner.prebaked,
             scrape_cidr=p.runner.scrape_cidr,

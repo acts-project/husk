@@ -1,8 +1,10 @@
-"""Target lifecycle: spawn on discovery, drain on removal.
+"""Pool lifecycle: reconcile while the target is servable, drain when it isn't.
 
-The dangerous direction is removal — a bug here destroys live VMs and kills
-running jobs. So most of this file is about what must NOT happen: no teardown on
-a failed sweep, none on a partial one, and never on a busy slot."""
+Each pool names one target. This covers what happens as that target's
+availability changes. The dangerous direction is losing it — a bug there
+destroys live VMs and kills running jobs — so most of this file is about what
+must NOT happen: no teardown on a failed check, none on a partial one, and never
+on a busy slot."""
 
 from __future__ import annotations
 
@@ -25,21 +27,22 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _controller(target, *, slots=None, runners=None, name="gpu"):
+def _pool(target, *, name="gpu", slots=None, runners=None):
     cfg = make_config(min_ready=0, max_total=2)
-    cfg = dataclasses.replace(cfg, backend=dataclasses.replace(cfg.backend, name=name))
-    gh = FakeGitHub(runners=runners or [])
+    cfg = dataclasses.replace(
+        cfg, target=target, backend=dataclasses.replace(cfg.backend, name=name)
+    )
     return Controller(
         FakeBackend(slots=slots),
-        gh,
+        FakeGitHub(runners=runners or []),
         cfg,
         target=target,
         registry=SnapshotRegistry(),
     )
 
 
-class Discoverer:
-    """A scriptable discovery source: each call returns the next scripted sweep."""
+class Checker:
+    """A scriptable availability source: each call returns the next scripted sweep."""
 
     def __init__(self, *sweeps) -> None:
         self._sweeps = list(sweeps)
@@ -53,13 +56,11 @@ class Discoverer:
         return sweep
 
 
-def _facade(discoverer, built, **kw):
-    """A facade whose `build` hands back pre-made controllers per target."""
+def _facade(checker, pools, **kw):
     attached, detached = [], []
     facade = MultiPoolController(
-        [],
-        discover=discoverer,
-        build=lambda t: list(built.get(t.key, [])),
+        list(pools),
+        discover=checker,
         attach=attached.append,
         detach=detached.append,
         **kw,
@@ -71,151 +72,147 @@ def _sweep(*targets, complete=True):
     return Discovery(targets=tuple(targets), complete=complete)
 
 
-# ----------------------------------------------------------------- spawn side
-def test_discovered_target_creates_its_pools():
-    ctrl = _controller(ORG)
-    facade, attached, _ = _facade(Discoverer(_sweep(ORG)), {ORG.key: [ctrl]})
+# ------------------------------------------------------------------ enabling
+def test_a_pool_starts_when_its_target_is_available():
+    p = _pool(ORG)
+    facade, attached, _ = _facade(Checker(_sweep(ORG)), [p])
+    assert facade.controllers == []  # nothing runs before the first check
     _run(facade.discover_once())
-    assert facade.controllers == [ctrl]
+    assert facade.controllers == [p]
     # The poller has to learn about it too, or its snapshot is never refreshed.
-    assert attached == [ctrl]
+    assert attached == [p]
 
 
-def test_a_target_is_not_rebuilt_on_every_sweep():
-    ctrl = _controller(ORG)
-    d = Discoverer(_sweep(ORG))
-    facade, _, _ = _facade(d, {ORG.key: [ctrl]})
+def test_a_pool_whose_target_is_unavailable_never_starts():
+    p = _pool(ORG)
+    facade, attached, _ = _facade(Checker(_sweep()), [p])
+    _run(facade.discover_once())
+    assert facade.controllers == []
+    assert attached == []
+
+
+def test_a_pool_is_not_re_enabled_on_every_sweep():
+    p = _pool(ORG)
+    facade, attached, _ = _facade(Checker(_sweep(ORG)), [p])
     _run(facade.discover_once())
     _run(facade.discover_once())
-    assert facade.controllers == [ctrl]  # still exactly one unit, not two
+    assert facade.controllers == [p]
+    assert attached == [p]
 
 
-def test_a_target_appearing_later_is_added():
-    org, repo = _controller(ORG), _controller(REPO)
-    d = Discoverer(_sweep(ORG), _sweep(ORG, REPO))
-    facade, _, _ = _facade(d, {ORG.key: [org], REPO.key: [repo]})
+def test_only_the_pools_whose_target_is_available_run():
+    org, repo = _pool(ORG, name="gpu"), _pool(REPO, name="cpu")
+    facade, _, _ = _facade(Checker(_sweep(ORG)), [org, repo])
+    _run(facade.discover_once())
+    assert facade.controllers == [org]
+
+
+def test_a_target_becoming_available_later_starts_its_pool():
+    org, repo = _pool(ORG, name="gpu"), _pool(REPO, name="cpu")
+    facade, _, _ = _facade(Checker(_sweep(ORG), _sweep(ORG, REPO)), [org, repo])
     _run(facade.discover_once())
     _run(facade.discover_once())
     assert {c.target for c in facade.controllers} == {ORG, REPO}
 
 
-def test_a_target_that_cannot_be_built_is_retried_not_dropped():
-    """A pool whose backend is unreachable at first must not be lost forever."""
-    ctrl = _controller(ORG)
-    calls = {"n": 0}
-
-    def build(t):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise RuntimeError("cloud unreachable")
-        return [ctrl]
-
-    facade = MultiPoolController([], discover=Discoverer(_sweep(ORG)), build=build)
+def test_two_pools_on_one_target_share_a_single_poller_registration():
+    """The runner API is target-wide, so the listing is per target, not per pool."""
+    a, b = _pool(ORG, name="gpu"), _pool(ORG, name="cpu")
+    facade, _, detached = _facade(Checker(_sweep(ORG), _sweep()), [a, b])
     _run(facade.discover_once())
-    assert facade.controllers == []
+    assert len(facade.controllers) == 2
     _run(facade.discover_once())
-    assert facade.controllers == [ctrl]
+    # Detach exactly once, and only after the LAST pool on that target is gone.
+    assert detached == [ORG]
 
 
-# ------------------------------------------------------------------ drain side
-def test_removed_target_stops_reconciling_and_destroys_idle_slots():
-    slot = make_slot(id="s-1", name="husk-1")
-    ctrl = _controller(ORG, slots=[slot])
-    d = Discoverer(_sweep(ORG), _sweep())
-    facade, _, detached = _facade(d, {ORG.key: [ctrl]})
+# ------------------------------------------------------------------ draining
+def test_losing_a_target_stops_reconciling_and_destroys_idle_slots():
+    p = _pool(ORG, slots=[make_slot(id="s-1", name="husk-1")])
+    facade, _, detached = _facade(Checker(_sweep(ORG), _sweep()), [p])
     _run(facade.discover_once())
     _run(facade.discover_once())
     assert facade.controllers == []
     assert detached == [ORG]
-    assert "destroy" in ctrl.backend.ops()
+    assert "destroy" in p.backend.ops()
 
 
 def test_drain_leaves_a_busy_slot_alone_and_retries():
     """Losing a target must not kill someone's in-flight job."""
-    slot = make_slot(id="s-1", name="husk-1")
     busy = make_runner(id=1, name="husk-1-c0", status="online", busy=True)
-    ctrl = _controller(ORG, slots=[slot], runners=[busy])
-    d = Discoverer(_sweep(ORG), _sweep())
-    facade, _, _ = _facade(d, {ORG.key: [ctrl]})
+    p = _pool(ORG, slots=[make_slot(id="s-1", name="husk-1")], runners=[busy])
+    facade, _, _ = _facade(Checker(_sweep(ORG), _sweep()), [p])
     _run(facade.discover_once())
     _run(facade.discover_once())
-    assert "destroy" not in ctrl.backend.ops()
-    assert ORG.key in facade._draining  # still pending, retried next sweep
+    assert "destroy" not in p.backend.ops()
+    assert facade._draining  # still pending, retried next sweep
 
-    # Job finishes → the runner goes idle → the next sweep completes the drain.
-    ctrl.github.runners = []
+    p.github.runners = []  # job finishes → runner goes idle
     _run(facade.discover_once())
-    assert "destroy" in ctrl.backend.ops()
-    assert ORG.key not in facade._draining
-
-
-def test_failed_discovery_never_removes_a_target():
-    """A GitHub 500 must not be read as "every install vanished"."""
-    slot = make_slot(id="s-1", name="husk-1")
-    ctrl = _controller(ORG, slots=[slot])
-    d = Discoverer(_sweep(ORG), RuntimeError("github is down"))
-    facade, _, _ = _facade(d, {ORG.key: [ctrl]})
-    _run(facade.discover_once())
-    _run(facade.discover_once())
-    assert facade.controllers == [ctrl]
-    assert "destroy" not in ctrl.backend.ops()
-
-
-def test_partial_sweep_never_removes_a_target():
-    """Absence from an incomplete sweep is not evidence of removal."""
-    slot = make_slot(id="s-1", name="husk-1")
-    ctrl = _controller(REPO, slots=[slot])
-    d = Discoverer(_sweep(REPO), _sweep(complete=False))
-    facade, _, _ = _facade(d, {REPO.key: [ctrl]})
-    _run(facade.discover_once())
-    _run(facade.discover_once())
-    assert facade.controllers == [ctrl]
-    assert "destroy" not in ctrl.backend.ops()
-
-
-def test_partial_sweep_may_still_add():
-    org, repo = _controller(ORG), _controller(REPO)
-    d = Discoverer(_sweep(ORG), _sweep(ORG, REPO, complete=False))
-    facade, _, _ = _facade(d, {ORG.key: [org], REPO.key: [repo]})
-    _run(facade.discover_once())
-    _run(facade.discover_once())
-    assert {c.target for c in facade.controllers} == {ORG, REPO}
-
-
-def test_target_returning_mid_drain_is_revived_not_rebuilt():
-    """Its slots are still there, so re-adopting beats destroy-and-rebuild."""
-    slot = make_slot(id="s-1", name="husk-1")
-    busy = make_runner(id=1, name="husk-1-c0", status="online", busy=True)
-    ctrl = _controller(ORG, slots=[slot], runners=[busy])
-    d = Discoverer(_sweep(ORG), _sweep(), _sweep(ORG))
-    facade, _, _ = _facade(d, {ORG.key: [ctrl]})
-    _run(facade.discover_once())
-    _run(facade.discover_once())
-    assert facade.controllers == []
-    _run(facade.discover_once())
-    assert facade.controllers == [ctrl]  # the SAME controller, slot intact
+    assert "destroy" in p.backend.ops()
     assert facade._draining == {}
-    assert "destroy" not in ctrl.backend.ops()
 
 
 def test_drain_deregisters_the_runner_before_destroying_the_slot():
-    slot = make_slot(id="s-1", name="husk-1")
     idle = make_runner(id=7, name="husk-1-c0", status="online", busy=False)
-    ctrl = _controller(ORG, slots=[slot], runners=[idle])
-    d = Discoverer(_sweep(ORG), _sweep())
-    facade, _, _ = _facade(d, {ORG.key: [ctrl]})
+    p = _pool(ORG, slots=[make_slot(id="s-1", name="husk-1")], runners=[idle])
+    facade, _, _ = _facade(Checker(_sweep(ORG), _sweep()), [p])
     _run(facade.discover_once())
     _run(facade.discover_once())
-    assert ("delete_runner", 7) in [(c[0], c[1]) for c in ctrl.github.calls]
-    assert "destroy" in ctrl.backend.ops()
+    assert ("delete_runner", 7) in [(c[0], c[1]) for c in p.github.calls]
+    assert "destroy" in p.backend.ops()
 
 
 def test_a_backend_that_cannot_list_is_retried_rather_than_assumed_empty():
     """ "Can't tell" must never be read as "nothing to clean up"."""
-    ctrl = _controller(ORG)
-    ctrl.backend.raise_on_list = True
-    d = Discoverer(_sweep(ORG), _sweep())
-    facade, _, _ = _facade(d, {ORG.key: [ctrl]})
+    p = _pool(ORG)
+    p.backend.raise_on_list = True
+    facade, _, _ = _facade(Checker(_sweep(ORG), _sweep()), [p])
     _run(facade.discover_once())
     _run(facade.discover_once())
-    assert ORG.key in facade._draining  # held open, not silently completed
+    assert facade._draining  # held open, not silently completed
+
+
+def test_a_target_returning_mid_drain_revives_the_same_pool():
+    """Its slots are still there, so re-adopting beats destroy-and-rebuild."""
+    busy = make_runner(id=1, name="husk-1-c0", status="online", busy=True)
+    p = _pool(ORG, slots=[make_slot(id="s-1", name="husk-1")], runners=[busy])
+    facade, _, _ = _facade(Checker(_sweep(ORG), _sweep(), _sweep(ORG)), [p])
+    _run(facade.discover_once())
+    _run(facade.discover_once())
+    assert facade.controllers == []
+    _run(facade.discover_once())
+    assert facade.controllers == [p]  # the SAME controller, slot intact
+    assert facade._draining == {}
+    assert "destroy" not in p.backend.ops()
+
+
+# --------------------------------------------------------------- not-removal
+def test_a_failed_availability_check_never_drains():
+    """A GitHub 500 must not be read as "the App was uninstalled"."""
+    p = _pool(ORG, slots=[make_slot(id="s-1", name="husk-1")])
+    facade, _, _ = _facade(Checker(_sweep(ORG), RuntimeError("github is down")), [p])
+    _run(facade.discover_once())
+    _run(facade.discover_once())
+    assert facade.controllers == [p]
+    assert "destroy" not in p.backend.ops()
+
+
+def test_a_partial_sweep_never_drains():
+    """Absence from an incomplete sweep is not evidence of an uninstall."""
+    p = _pool(REPO, slots=[make_slot(id="s-1", name="husk-1")])
+    facade, _, _ = _facade(Checker(_sweep(REPO), _sweep(complete=False)), [p])
+    _run(facade.discover_once())
+    _run(facade.discover_once())
+    assert facade.controllers == [p]
+    assert "destroy" not in p.backend.ops()
+
+
+def test_a_partial_sweep_may_still_enable():
+    org, repo = _pool(ORG, name="gpu"), _pool(REPO, name="cpu")
+    facade, _, _ = _facade(
+        Checker(_sweep(ORG), _sweep(ORG, REPO, complete=False)), [org, repo]
+    )
+    _run(facade.discover_once())
+    _run(facade.discover_once())
+    assert {c.target for c in facade.controllers} == {ORG, REPO}

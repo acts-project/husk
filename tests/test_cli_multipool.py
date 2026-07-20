@@ -47,13 +47,12 @@ _CONFIG = """
 [github]
 app_id = 123456
 
-[access]
-allowed_orgs = ["acts-project"]
 [controller]
 http_addr = "{http_addr}"
 
 [[pool]]
 name = "openstack-cpu"
+target = {{ org = "acts-project", group = "husk" }}
 [pool.runner]
 version = "2.334.0"
 labels = ["self-hosted", "husk-cpu"]
@@ -62,6 +61,7 @@ type = "openstack"
 
 [[pool]]
 name = "libvirt-gpu"
+target = {{ org = "acts-project", group = "husk" }}
 [pool.runner]
 version = "2.334.0"
 labels = ["self-hosted", "gpu"]
@@ -88,7 +88,6 @@ def test_build_forwards_shared_image_sync(tmp_path, monkeypatch):
     import husk.openstack_backend as ob
     from husk.cli import _build
     from husk.config import load_configs
-    from husk.target import Target
 
     captured = []
 
@@ -110,7 +109,7 @@ def test_build_forwards_shared_image_sync(tmp_path, monkeypatch):
 
     sentinel = object()
     for cfg in cfgs:
-        _build(cfg, image_sync=sentinel, target=Target.org("acts-project"))
+        _build(cfg, image_sync=sentinel)
     assert captured == [sentinel, sentinel]  # one shared instance, both backends
 
 

@@ -2,102 +2,94 @@
 
 How huskd decides *where* runners go, and what stops two of them fighting over
 the same hardware. Written up after the GitHub-App migration (Phases 0–3), which
-turned the target set from one configured repo into a discovered, dynamic set.
+turned huskd from a single-repo PAT autoscaler into a GitHub App serving pools
+that each name the org or repo they belong to.
 
 ## The two axes
 
-huskd's reconcile unit is a pair:
+- A **pool** is a *runner type* — labels plus a backend. "The GPU pool."
+- A **target** is a *place to put runners* — an org or a repo.
 
-- A **pool** is a *runner type* — labels plus a backend. "The GPU pool." Declared
-  as a `[[pool]]` in config.
-- A **target** is a *place to put runners* — an org or a repo. Discovered at
-  runtime from the App's installations, intersected with the allowlist.
+**Each `[[pool]]` names the one target it serves:**
 
-```
-                targets  (discovered: installations ∩ allowlist)
-                ┌────────────────────┬──────────────────────────┐
-                │ org:acts-project   │ repo:paulgessinger/…     │
-      ┌─────────┼────────────────────┼──────────────────────────┤
-pools │ gpu     │ (org:acts, gpu)    │ (repo:pg/…, gpu)         │
-      │ cpu     │ (org:acts, cpu)    │ (repo:pg/…, cpu)         │
-      └─────────┴────────────────────┴──────────────────────────┘
-                        each cell = one Controller + one asyncio task
+```toml
+[[pool]]
+name   = "gpu"
+target = { org = "acts-project", group = "husk" }   # org-level runners
+
+[[pool]]
+name   = "test"
+target = { repo = "paulgessinger/husk-test" }       # that repo only
 ```
 
-Every cell is an independent `Controller` with its own backend instance, GitHub
-client, and reconcile task. **Today every pool serves every discovered target**
-— the grid is fully populated. (`serve_targets`, a per-pool subset, is designed
-but not built; see "Open" below.)
+The key names the scope, so there is no `kind:name` string to parse. `group` sits
+inside the target table because **runner groups are an org-only concept** — repo
+scope has none — so the schema only lets you write one where it can mean
+something, instead of accepting it on a repo pool and silently ignoring it. The
+loader flattens it onto `runner.runner_group`, which is what the GitHub client
+consumes.
+
+### Why explicit, and not a global allowlist fanned out over pools
+
+An earlier design had an `[access]` allowlist and ran **every pool against every
+discovered target**. It was replaced, for one reason:
+
+> **Warm capacity cannot be shared across targets.** A JIT runner registration
+> belongs to exactly one org or repo, so a warm slot for org A physically cannot
+> pick up org B's job.
+
+Fan-out therefore never amortized. Every extra target cost a *full* `min_ready`
+of permanently idle VMs, which silently over-subscribed scarce hardware — a GPU
+pool with `min_ready = 1` serving two orgs needs two GPUs, and libvirt's capacity
+check would refuse the second, leaving one org starved and retrying forever.
+
+And it bought little: **org scope already covers the common case.** One
+`org:acts-project` target serves every repo in the org with one warm pool.
+Multi-target only spans separate *accounts*, which is rare and inherently costly.
+
+What was given up is zero-touch onboarding — a new org now needs a `[[pool]]` and
+a restart, rather than just installing the App. That was the honest trade: the
+cost was always being paid, just not declared.
 
 ### `Target`
-
-```python
-Target(kind="org",  name="acts-project")            # key: "org:acts-project"
-Target(kind="repo", name="paulgessinger/husk-test") # key: "repo:paulgessinger/husk-test"
-```
 
 | | org scope | repo scope |
 |---|---|---|
 | API base | `/orgs/{login}` | `/repos/{owner}/{name}` |
 | serves | every repo in the org | exactly that repo |
-| runner groups | yes, resolved by name per target | none — groups don't exist here |
+| runner groups | yes, resolved by name per target | none |
 | permission | `Organization > Self-hosted runners` | `Repository > Administration: write` |
 
-Org scope is the scalable default: one warm pool serves the whole org. Repo scope
-exists because **personal accounts have no org-level runners**, so it is the only
-way to serve a personal account's repos.
+Repo scope exists because **personal accounts have no org-level runners**, so it
+is the only way to serve a personal account's repos.
 
-## How runners are assigned to targets
+## Availability, not discovery
 
-There is **no global allocator**. Each `(target, pool)` unit sizes itself
-independently, from its own view of its own target:
+The target set is configured; what moves at runtime is whether each target is
+*servable*:
 
-```
-desired = min(max_total, busy + min_ready)
-```
+- **org target** — is the App installed on that org?
+- **repo target** — is it installed on the owner, **and** did that install grant
+  this repo? Both must hold: the installer chose the repo, and the operator
+  configured it. Either alone is not enough.
 
-where `busy` counts that target's runners currently running a job. So
-`min_ready` and `max_total` are **per unit, not per pool**. This is the single
-most surprising consequence of the target grid, and it multiplies:
-
-> A pool with `min_ready = 1, max_total = 3`, serving 4 discovered targets, holds
-> **4 idle slots** warm and can grow to **12** — not 1 and 3.
-
-That is intentional (a warm slot for org A cannot pick up org B's job — GitHub
-routes by registration, not by huskd), but it means widening the allowlist
-widens your resting footprint. Size `min_ready` with the target count in mind.
+A pool whose target isn't servable simply doesn't run. huskd never declines an
+installation — that is destructive and irreversible, and an unrecognized install
+already gets no runners.
 
 ## What stops two units fighting
 
-Two units sharing one backend must not manage each other's slots, and must not
-both claim the same physical hardware. Three mechanisms, and they are **not
+Two pools sharing one backend must not manage each other's slots, and must not
+both claim the same physical hardware. Two mechanisms, and they are **not
 uniform across backends**.
 
 ### 1. Name isolation
 
 Runner names are `f"{vm_name}-c{cycle}"` and `match_runner` is prefix-based, so
-distinct units must mint distinct names. With more than one allowlist entry, the
-target is folded into the pool's identity:
-
-```
-pool name : gpu          ->  gpu@acts-project
-vm_prefix : husk-gpu     ->  husk-gpu-acts-project
-```
-
-With exactly **one** allowlist entry, names are left plain (`husk-gpu`). This is
-deliberate: changing a `vm_prefix` under a running VM orphans it — the slot stops
-matching the prefix and becomes invisible to reconcile.
-
-Two consequences worth internalising:
-
-- Naming keys off the **allowlist size** (static, from config), *not* the live
-  discovered count. Otherwise an install or uninstall would silently rename
-  pools and orphan every running slot.
-- **Going from one allowlist entry to two renames the pools.** That is a
-  restart-and-drain migration, not a hot edit.
-
-`@` is reserved in configured pool names, because config reload splits on it to
-map a live unit back to its `[[pool]]`.
+distinct pools must mint distinct names. `load_configs` enforces unique pool
+names *and* unique `vm_prefix`, which is all that is needed now that a pool maps
+to exactly one target — there is no target-folded renaming, and no migration
+hazard from the target set changing shape.
 
 ### 2. Slot ownership — who does `list_slots()` return?
 
@@ -108,12 +100,10 @@ and `list_slots()` returns only domains matching this backend's pool
 (`libvirt_backend.py`). Two units on one host see only their own domains.
 
 **OpenStack — scoped, via `husk-pool` metadata.** Servers are stamped with a
-`husk-pool` tag at create, and `_owns()` filters on it. Servers created *before*
-that tag existed are claimed by **name prefix** instead — `vm_prefix` is unique
-per pool (enforced by `load_configs`), so exactly one pool adopts each legacy
-server, and the tag is backfilled on its next `mark_active`. The fallback is
-transitional, and deliberately not a strict filter: an untagged server that
-became invisible would be reconciled and deleted by nobody, and bill forever.
+`husk-pool` tag at create, and `_owns()` requires it: `managed-by = husk` alone
+is not ownership. A husk server without the tag is *not* adopted — huskd always
+stamps it, so an untagged one is foreign or hand-made, and adopting it would mean
+rebuilding something nobody asked huskd to manage.
 
 > ### Historical: the collision this fixed
 >
@@ -148,30 +138,31 @@ free slot-units from that, and `create_slot` raises rather than overcommitting.
 cannot silently consume a unit forever.)
 
 **OpenStack** capacity is project quota (`total_instances_used` vs the instance
-limit), which is naturally global — so quota is shared correctly across units
-even though *ownership* is not. Quota exhaustion is a clean failure; the
-ownership gap above is the dangerous one.
+limit), which is naturally global, so pools sharing a project share quota
+correctly. Quota exhaustion is a clean failure — a create is refused, and the
+pool retries.
 
 ## Lifecycle
 
-Discovery runs every 60s. `MultiPoolController.discover_once()` diffs the result
-against the live set: new targets get built and spawned; departed targets drain.
+The availability check runs every 60s. `MultiPoolController.discover_once()`
+compares the servable set against the running pools: a pool whose target became
+available starts; one whose target went away drains.
 
-Adding is easy. **Removal destroys VMs, so it is guarded three ways:**
+Starting is easy. **Draining destroys VMs, so it is guarded:**
 
 | Situation | Behaviour |
 |---|---|
-| Discovery raises (GitHub 5xx) | Nothing changes; target set held as-is |
-| Sweep is *partial* (one install's repo listing failed) | May only **add** — absence is not evidence of removal |
+| Check raises (GitHub 5xx) | Nothing changes; live pools held as-is |
+| Sweep is *partial* (an install's repo listing failed) | May only **enable** — absence is not evidence of an uninstall |
 | Target genuinely gone | Stop reconciling immediately, then drain |
 | Draining, slot **idle** | Deregister runner, destroy slot |
 | Draining, slot **busy** | Left running, retried next sweep — the job finishes |
-| Target reappears mid-drain | **Revived**: same Controller, slots intact, no rebuild |
+| Target returns mid-drain | **Revived**: same Controller, slots intact, no rebuild |
 | Backend can't list slots | Drain held open, never read as "nothing to clean up" |
 
-The `complete` flag on a discovery sweep exists solely for row 2. Without it, one
-installation's failed repo listing would look identical to that repo having been
-removed, and a transient 500 would tear down live runners.
+The `complete` flag exists solely for row 2. Without it, one installation's
+failed repo listing would look identical to that repo having been revoked, and a
+transient 500 would tear down live runners.
 
 ## Where the data lives
 
@@ -192,11 +183,10 @@ opposite directions of information:
 
 ## Open
 
-- **Explicit pool→target binding** (decided 2026-07-20, not yet built). Each
-  `[[pool]]` will name the one target it serves, replacing the full
-  pool × target grid. Rationale: warm capacity cannot be shared across targets,
-  so fan-out never amortized — it silently multiplied `min_ready` and
-  over-subscribed scarce hardware. Org scope already covers the common
-  "many repos" case with a single target. This also deletes `_target_naming`
-  and the 1→2-target rename hazard. Cost: onboarding a new org becomes a config
-  edit rather than zero-touch.
+- **Per-pool `min_ready` is per target by construction now.** If you ever want
+  one pool's warm capacity spread across several targets, that is not a config
+  change — it is impossible without GitHub letting one runner registration serve
+  more than one org/repo.
+- **Onboarding is a config edit + restart.** If that becomes a burden (many orgs,
+  frequent churn), the fix is to make the *pool set* reloadable rather than to
+  reintroduce fan-out.

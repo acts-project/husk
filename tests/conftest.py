@@ -13,7 +13,6 @@ import urllib.request
 import pytest
 
 from husk.config import (
-    AccessConfig,
     BackendConfig,
     Config,
     ControllerConfig,
@@ -22,7 +21,6 @@ from husk.config import (
     TimeoutsConfig,
 )
 from husk.controller import Controller
-from husk.discovery import Allowlist
 from husk.fake_backend import FakeBackend, FakeGitHub
 from husk.poller import SnapshotRegistry
 from husk.slot import Runner, Slot
@@ -53,7 +51,7 @@ def make_config(
 ) -> Config:
     return Config(
         github=GithubConfig(app_id=123456, private_key="-----FAKE PRIVATE KEY-----"),
-        access=AccessConfig(allowed=Allowlist(orgs=("acts-project",))),
+        target=TEST_TARGET,
         runner=RunnerConfig(
             version="2.334.0", labels=["self-hosted"], runner_group="husk"
         ),

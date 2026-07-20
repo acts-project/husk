@@ -105,11 +105,10 @@ def test_loader_rejects_scrape_cidr_without_prebaked(tmp_path, monkeypatch):
 [github]
 app_id = 123456
 
-[access]
-allowed_orgs = ["acts-project"]
 
 [[pool]]
 name = "p1"
+target = { org = "acts-project", group = "husk" }
 [pool.runner]
 version = "2.334.0"
 labels = ["self-hosted"]

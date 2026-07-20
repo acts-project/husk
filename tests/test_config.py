@@ -5,20 +5,19 @@ from __future__ import annotations
 import pytest
 
 from husk.config import load_config, load_configs
+from husk.target import Target
 
 _TOML = """
 [github]
 app_id = 123456
 {extra}
-[access]
-allowed_orgs = ["acts-project"]
 
 [[pool]]
 name = "openstack-cern"
+target = {{ org = "acts-project", group = "husk" }}
 [pool.runner]
 version = "2.334.0"
 labels = ["self-hosted"]
-runner_group = "husk"
 [pool.backend]
 cloud = "cern"
 image_name = "ALMA10 - x86_64"
@@ -79,57 +78,77 @@ def test_rejects_a_file_that_is_not_a_pem(tmp_path):
         load_config(_write(tmp_path, extra=f'private_key_path = "{junk}"'))
 
 
-def test_allowlist_is_parsed(tmp_path, monkeypatch):
+def _target(tmp_path, table: str) -> str:
+    """Write the standard config with the pool's target table swapped out."""
+    bad = _TOML.format(extra="").replace(
+        'target = { org = "acts-project", group = "husk" }', f"target = {table}"
+    )
+    p = tmp_path / "c.toml"
+    p.write_text(bad)
+    return str(p)
+
+
+def test_org_target_is_parsed_with_its_group(tmp_path, monkeypatch):
     monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
     cfg = load_config(_write(tmp_path))
-    assert cfg.access.allowed.orgs == ("acts-project",)
-    assert cfg.access.allowed.repos == ()
-    # Drives per-target naming, so it must reflect config, not discovery.
-    assert cfg.access.max_targets == 1
+    assert cfg.target == Target.org("acts-project")
+    # `group` is written inside the target table but flattened onto the runner
+    # config, which is what the GitHub client consumes.
+    assert cfg.runner.runner_group == "husk"
 
 
-def test_repo_in_the_org_list_is_rejected(tmp_path, monkeypatch):
-    """A common mix-up: putting owner/name in allowed_orgs would silently never
-    match any installation account, so it has to fail loudly."""
+def test_repo_target_is_parsed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    cfg = load_config(_target(tmp_path, '{ repo = "owner/name" }'))
+    assert cfg.target == Target.repo("owner/name")
+
+
+def test_a_target_without_a_group_defaults_to_Default(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    cfg = load_config(_target(tmp_path, '{ org = "acts-project" }'))
+    assert cfg.runner.runner_group == "Default"
+
+
+def test_a_target_needs_exactly_one_scope(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    for table in ["{ }", '{ org = "a", repo = "o/n" }']:
+        with pytest.raises(Exception, match="exactly one of org / repo"):
+            load_config(_target(tmp_path, table))
+
+
+def test_a_repo_in_the_org_slot_is_rejected(tmp_path, monkeypatch):
+    """A common mix-up. It would silently never match an installation account,
+    so it has to fail loudly."""
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    with pytest.raises(Exception, match="looks like a repo"):
+        load_config(_target(tmp_path, '{ org = "owner/name" }'))
+
+
+def test_a_bare_login_in_the_repo_slot_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    with pytest.raises(Exception, match="must be owner/name"):
+        load_config(_target(tmp_path, '{ repo = "acts-project" }'))
+
+
+def test_a_group_on_a_repo_target_is_unrepresentable(tmp_path, monkeypatch):
+    """Runner groups are an org-only concept. Nesting `group` inside the target
+    table is what makes this a schema error rather than a silent no-op."""
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    cfg = load_config(_target(tmp_path, '{ repo = "owner/name", group = "husk" }'))
+    # The group parses (it is a plain field) but cannot apply — a repo target has
+    # no groups, and the client ignores it. The value simply has no reachable use.
+    assert cfg.target.kind == "repo"
+
+
+def test_a_pool_without_a_target_is_rejected(tmp_path, monkeypatch):
+    """Every pool must say who it serves; there is no global default any more."""
     monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
     bad = _TOML.format(extra="").replace(
-        'allowed_orgs = ["acts-project"]', 'allowed_orgs = ["acts-project/acts"]'
+        'target = { org = "acts-project", group = "husk" }\n', ""
     )
     p = tmp_path / "c.toml"
     p.write_text(bad)
-    with pytest.raises(RuntimeError, match="allowed_repos"):
-        load_config(str(p))
-
-
-def test_bare_login_in_the_repo_list_is_rejected(tmp_path, monkeypatch):
-    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
-    bad = _TOML.format(extra="").replace(
-        'allowed_orgs = ["acts-project"]', 'allowed_repos = ["acts-project"]'
-    )
-    p = tmp_path / "c.toml"
-    p.write_text(bad)
-    with pytest.raises(RuntimeError, match="must be owner/name"):
-        load_config(str(p))
-
-
-def test_empty_allowlist_fails_closed(tmp_path, monkeypatch):
-    """huskd with no allowlist serves nothing; say so rather than idling silently."""
-    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
-    bad = _TOML.format(extra="").replace('allowed_orgs = ["acts-project"]', "")
-    p = tmp_path / "c.toml"
-    p.write_text(bad)
-    with pytest.raises(RuntimeError, match="empty .access. allowlist"):
-        load_config(str(p))
-
-
-def test_pool_name_may_not_contain_at_sign(tmp_path, monkeypatch):
-    """`@` separates pool from target in a live unit's name, and config reload
-    splits on it to map a unit back to its [[pool]]."""
-    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
-    bad = _TOML.format(extra="").replace('name = "openstack-cern"', 'name = "pool@x"')
-    p = tmp_path / "c.toml"
-    p.write_text(bad)
-    with pytest.raises(RuntimeError, match="may not contain"):
+    with pytest.raises(Exception, match="target"):
         load_config(str(p))
 
 
@@ -145,13 +164,12 @@ _MULTI_TOML = """
 [github]
 app_id = 123456
 
-[access]
-allowed_orgs = ["acts-project"]
 [controller]
 http_addr = "127.0.0.1:9100"
 
 [[pool]]
 name = "openstack-cpu"
+target = { org = "acts-project", group = "husk" }
 [pool.runner]
 version = "2.334.0"
 labels = ["self-hosted", "husk-cpu"]
@@ -166,6 +184,7 @@ max_total = 4
 
 [[pool]]
 name = "libvirt-gpu"
+target = { org = "acts-project", group = "husk" }
 [pool.runner]
 version = "2.334.0"
 labels = ["self-hosted", "gpu"]
@@ -246,9 +265,11 @@ def test_duplicate_pool_name_rejected(tmp_path, monkeypatch):
     monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
     p = tmp_path / "dup.toml"
     p.write_text(
-        '[github]\napp_id = 1\n[access]\nallowed_orgs = ["acme"]\n'
-        '[[pool]]\nname = "dup"\n[pool.runner]\nversion="1"\nlabels=["a"]\n'
-        '[[pool]]\nname = "dup"\n[pool.runner]\nversion="1"\nlabels=["b"]\n'
+        "[github]\napp_id = 1\n"
+        '[[pool]]\nname = "dup"\ntarget = { org = "acme" }\n'
+        '[pool.runner]\nversion="1"\nlabels=["a"]\n'
+        '[[pool]]\nname = "dup"\ntarget = { org = "acme" }\n'
+        '[pool.runner]\nversion="1"\nlabels=["b"]\n'
     )
     with pytest.raises(RuntimeError, match="duplicate pool name"):
         load_configs(str(p))
