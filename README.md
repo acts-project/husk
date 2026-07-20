@@ -9,7 +9,9 @@ the per-cycle dynamic bits (JIT config, egress firewall ruleset, start).
 
 - Backends: OpenStack (CERN) and libvirt/QEMU (GPU passthrough).
 - Deeper design docs: [`image-pipeline.md`](image-pipeline.md) (image ↔ cloud-init
-  boundary), [`plan.md`](plan.md) (roadmap).
+  boundary), [`targets-and-capacity.md`](targets-and-capacity.md) (where runners
+  go, and how units sharing a backend avoid fighting), [`plan.md`](plan.md)
+  (roadmap).
 
 ## Running huskd in Docker
 
