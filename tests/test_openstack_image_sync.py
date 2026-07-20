@@ -61,7 +61,7 @@ class FakeServer:
         self.flavor = {"id": "flavor-1"}
         self.created_at = None
         self.fault = None
-        self.metadata = {"managed-by": "husk"}
+        self.metadata = {"managed-by": "husk", "husk-pool": "os"}
 
     def to_dict(self):
         return {}
@@ -96,6 +96,9 @@ def _backend(ref: str = REF, servers=None) -> OpenStackBackend:
     )
     b.conn = FakeConn(servers or [])
     b._warnings = {}
+    b._untagged = set()
+    b._pool = b.cfg.name
+    b._prefix = b.cfg.vm_prefix
     b._sync = FakeSync(CURR)
     b._backend_ref = ref
     b._synced_ref = ""

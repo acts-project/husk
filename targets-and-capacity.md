@@ -107,30 +107,32 @@ This is where the backends diverge.
 and `list_slots()` returns only domains matching this backend's pool
 (`libvirt_backend.py`). Two units on one host see only their own domains.
 
-**OpenStack — NOT scoped.** `list_slots()` filters solely on
-`metadata["managed-by"] == "husk"`. There is no pool or prefix scoping, so every
-unit sharing an OpenStack project sees **every other unit's servers as its own**.
+**OpenStack — scoped, via `husk-pool` metadata.** Servers are stamped with a
+`husk-pool` tag at create, and `_owns()` filters on it. Servers created *before*
+that tag existed are claimed by **name prefix** instead — `vm_prefix` is unique
+per pool (enforced by `load_configs`), so exactly one pool adopts each legacy
+server, and the tag is backfilled on its next `mark_active`. The fallback is
+transitional, and deliberately not a strict filter: an untagged server that
+became invisible would be reconciled and deleted by nobody, and bill forever.
 
-> ### ⚠️ Known gap: multiple OpenStack units in one project
+> ### Historical: the collision this fixed
 >
-> With >1 unit on one OpenStack cloud, each unit counts the others' servers
-> toward its own sizing, and `match_runner` finds no runner for them (their names
-> carry a different prefix). They classify as unhealthy or as surplus, and get
-> recycled or decommissioned by a controller that does not own them. The units
-> tear each other down.
+> Until `husk-pool` landed, `list_slots()` filtered solely on
+> `managed-by == husk`. Every unit sharing an OpenStack project saw every other
+> unit's servers as its own: it counted them toward its own sizing, and
+> `match_runner` found no runner for them (their names carry a different
+> prefix), so they classified as unhealthy or surplus and were rebuilt or
+> destroyed by a controller that did not own them. Two units tore each other
+> down.
 >
-> This predates the App migration — two OpenStack `[[pool]]`s would collide the
-> same way — but it was latent, because only one OpenStack pool has ever been
-> configured. **Phase 3 makes it trivially reachable: adding a second org to
-> `allowed_orgs` creates a second OpenStack unit.**
+> Verified directly at the time: a unit with a distinct pool name, distinct
+> `vm_prefix` *and* a distinct target still classified a sibling's slot
+> `unhealthy` and issued a rebuild. Distinguishing units by name is not enough —
+> ownership has to be enforced where the listing happens.
 >
-> The fix mirrors libvirt: stamp a `pool` (or unit) tag into server metadata at
-> create and filter `list_slots()` on it. It needs a migration story for servers
-> created before the tag existed — an untagged server must not become invisible
-> and leak forever.
->
-> **Until that lands, keep the OpenStack allowlist to a single target.** libvirt
-> is unaffected.
+> It predated the App migration (two OpenStack `[[pool]]`s collided the same
+> way) but was latent, since only one OpenStack pool had ever been configured.
+> Regression coverage: `tests/test_openstack_pool_scoping.py`.
 
 ### 3. Physical capacity
 
@@ -190,8 +192,11 @@ opposite directions of information:
 
 ## Open
 
-- **`serve_targets`** — a per-pool subset of targets. Designed, not built; every
-  pool currently serves every target. Worth building when a pool shouldn't be
-  offered to every org (an expensive GPU pool, say).
-- **OpenStack slot scoping** — see the gap above. The blocker on running more
-  than one target against a single OpenStack project.
+- **Explicit pool→target binding** (decided 2026-07-20, not yet built). Each
+  `[[pool]]` will name the one target it serves, replacing the full
+  pool × target grid. Rationale: warm capacity cannot be shared across targets,
+  so fan-out never amortized — it silently multiplied `min_ready` and
+  over-subscribed scarce hardware. Org scope already covers the common
+  "many repos" case with a single target. This also deletes `_target_naming`
+  and the 1→2-target rename hazard. Cost: onboarding a new org becomes a config
+  edit rather than zero-touch.
