@@ -48,7 +48,7 @@ _CONFIG = """
 app_id = 123456
 
 [access]
-targets = ["org:acts-project"]
+allowed_orgs = ["acts-project"]
 [controller]
 http_addr = "{http_addr}"
 
@@ -88,6 +88,7 @@ def test_build_forwards_shared_image_sync(tmp_path, monkeypatch):
     import husk.openstack_backend as ob
     from husk.cli import _build
     from husk.config import load_configs
+    from husk.target import Target
 
     captured = []
 
@@ -109,7 +110,7 @@ def test_build_forwards_shared_image_sync(tmp_path, monkeypatch):
 
     sentinel = object()
     for cfg in cfgs:
-        _build(cfg, image_sync=sentinel)
+        _build(cfg, image_sync=sentinel, target=Target.org("acts-project"))
     assert captured == [sentinel, sentinel]  # one shared instance, both backends
 
 

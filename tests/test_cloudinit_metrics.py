@@ -106,7 +106,7 @@ def test_loader_rejects_scrape_cidr_without_prebaked(tmp_path, monkeypatch):
 app_id = 123456
 
 [access]
-targets = ["org:acts-project"]
+allowed_orgs = ["acts-project"]
 
 [[pool]]
 name = "p1"

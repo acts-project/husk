@@ -11,7 +11,7 @@ _TOML = """
 app_id = 123456
 {extra}
 [access]
-targets = ["org:acts-project"]
+allowed_orgs = ["acts-project"]
 
 [[pool]]
 name = "openstack-cern"
@@ -79,20 +79,57 @@ def test_rejects_a_file_that_is_not_a_pem(tmp_path):
         load_config(_write(tmp_path, extra=f'private_key_path = "{junk}"'))
 
 
-def test_targets_are_parsed_into_Target(tmp_path, monkeypatch):
+def test_allowlist_is_parsed(tmp_path, monkeypatch):
     monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
     cfg = load_config(_write(tmp_path))
-    assert [t.key for t in cfg.access.targets] == ["org:acts-project"]
+    assert cfg.access.allowed.orgs == ("acts-project",)
+    assert cfg.access.allowed.repos == ()
+    # Drives per-target naming, so it must reflect config, not discovery.
+    assert cfg.access.max_targets == 1
 
 
-def test_malformed_target_is_rejected(tmp_path, monkeypatch):
+def test_repo_in_the_org_list_is_rejected(tmp_path, monkeypatch):
+    """A common mix-up: putting owner/name in allowed_orgs would silently never
+    match any installation account, so it has to fail loudly."""
     monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
     bad = _TOML.format(extra="").replace(
-        'targets = ["org:acts-project"]', 'targets = ["acts-project"]'
+        'allowed_orgs = ["acts-project"]', 'allowed_orgs = ["acts-project/acts"]'
     )
     p = tmp_path / "c.toml"
     p.write_text(bad)
-    with pytest.raises(RuntimeError, match="access..targets"):
+    with pytest.raises(RuntimeError, match="allowed_repos"):
+        load_config(str(p))
+
+
+def test_bare_login_in_the_repo_list_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    bad = _TOML.format(extra="").replace(
+        'allowed_orgs = ["acts-project"]', 'allowed_repos = ["acts-project"]'
+    )
+    p = tmp_path / "c.toml"
+    p.write_text(bad)
+    with pytest.raises(RuntimeError, match="must be owner/name"):
+        load_config(str(p))
+
+
+def test_empty_allowlist_fails_closed(tmp_path, monkeypatch):
+    """huskd with no allowlist serves nothing; say so rather than idling silently."""
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    bad = _TOML.format(extra="").replace('allowed_orgs = ["acts-project"]', "")
+    p = tmp_path / "c.toml"
+    p.write_text(bad)
+    with pytest.raises(RuntimeError, match="empty .access. allowlist"):
+        load_config(str(p))
+
+
+def test_pool_name_may_not_contain_at_sign(tmp_path, monkeypatch):
+    """`@` separates pool from target in a live unit's name, and config reload
+    splits on it to map a unit back to its [[pool]]."""
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    bad = _TOML.format(extra="").replace('name = "openstack-cern"', 'name = "pool@x"')
+    p = tmp_path / "c.toml"
+    p.write_text(bad)
+    with pytest.raises(RuntimeError, match="may not contain"):
         load_config(str(p))
 
 
@@ -109,7 +146,7 @@ _MULTI_TOML = """
 app_id = 123456
 
 [access]
-targets = ["org:acts-project"]
+allowed_orgs = ["acts-project"]
 [controller]
 http_addr = "127.0.0.1:9100"
 
@@ -200,7 +237,7 @@ def test_stray_backend_image_cache_dir_is_ignored(tmp_path, monkeypatch):
 def test_no_pool_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
     p = tmp_path / "empty.toml"
-    p.write_text('[github]\napp_id = 1\n[access]\ntargets = ["org:acme"]\n')
+    p.write_text('[github]\napp_id = 1\n[access]\nallowed_orgs = ["acme"]\n')
     with pytest.raises(RuntimeError, match="no \\[\\[pool\\]\\] defined"):
         load_configs(str(p))
 
@@ -209,7 +246,7 @@ def test_duplicate_pool_name_rejected(tmp_path, monkeypatch):
     monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
     p = tmp_path / "dup.toml"
     p.write_text(
-        '[github]\napp_id = 1\n[access]\ntargets = ["org:acme"]\n'
+        '[github]\napp_id = 1\n[access]\nallowed_orgs = ["acme"]\n'
         '[[pool]]\nname = "dup"\n[pool.runner]\nversion="1"\nlabels=["a"]\n'
         '[[pool]]\nname = "dup"\n[pool.runner]\nversion="1"\nlabels=["b"]\n'
     )

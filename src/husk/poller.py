@@ -67,6 +67,11 @@ class SnapshotRegistry:
             return None
         return max(0.0, (time.time() if now is None else now) - entry[1])
 
+    def forget(self, target: Target) -> None:
+        """Drop a target's snapshot when it stops being served, so a re-added
+        target starts from "never polled" rather than a stale listing."""
+        self._by_key.pop(target.key, None)
+
 
 class RunnerPoller:
     """Polls every target's runner listing into the registry on one cadence."""
@@ -86,10 +91,24 @@ class RunnerPoller:
     def targets(self) -> list[Target]:
         return list(self._listers)
 
+    def add_target(self, target: Target, lister: RunnerLister) -> None:
+        """Start polling a newly discovered target (no-op if already polled — N
+        pools share one target's listing)."""
+        if target not in self._listers:
+            self._listers[target] = lister
+            log.info("runner poller now tracking %s", target)
+
+    def remove_target(self, target: Target) -> None:
+        """Stop polling a target that is no longer served."""
+        if self._listers.pop(target, None) is not None:
+            log.info("runner poller dropped %s", target)
+
     async def poll_once(self) -> None:
         """One pass over every target. Never raises: a target that fails is logged
         and skipped, leaving its previous snapshot (and its age) in place."""
-        for target, lister in self._listers.items():
+        # Snapshot the mapping: discovery can add/remove targets while this pass
+        # awaits, and mutating a dict mid-iteration would raise.
+        for target, lister in list(self._listers.items()):
             try:
                 runners = await lister()
             except Exception:

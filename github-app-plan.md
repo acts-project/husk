@@ -168,7 +168,42 @@ Shipped as described below, plus:
 - **Churn:** ~10 lines of throwaway (the temp `targets` key), a deliberate cost to
   isolate *auth* bugs from *discovery* bugs. Optional to merge with Phase 3.
 
-### Phase 3 — Dynamic discovery + allowlist
+### Phase 3 — Dynamic discovery + allowlist ✅ SHIPPED
+
+Shipped as described below, plus:
+- `husk/discovery.py` holds `Allowlist` (validating + case-insensitive matching
+  that preserves the operator's spelling, since `vm_prefix` derives from it) and
+  `TargetDiscovery`. The repo listing is **skipped entirely** for an org-only
+  allowlist — one fewer API call per installation per sweep.
+- **Failure policy, mirroring the runner poller's.** A sweep reports whether it
+  was `complete`; a failed sweep changes nothing at all, and a *partial* one
+  (some installation's repo listing failed) may only **add** targets. Absence
+  from an incomplete result is never evidence of removal — otherwise a GitHub
+  500 would tear down live runners.
+- **Removal drains, it doesn't destroy.** A de-allowlisted/uninstalled target
+  stops reconciling immediately, then each sweep deregisters and destroys its
+  *idle* slots; busy slots are left running and retried, so an in-flight job is
+  never killed. A target that reappears mid-drain is **revived** (same
+  Controller, slots intact) rather than rebuilt. A backend that can't list holds
+  the drain open rather than being read as "nothing to clean up".
+- Per-target naming keys off the **allowlist size**, not the discovered set: the
+  discovered set moves as people install/uninstall, and a `vm_prefix` that
+  changed under a running slot would orphan it.
+- Pagination added to `/app/installations` and `/installation/repositories` —
+  huskd is installable by any account, so page-1 truncation would silently not
+  serve the 31st install.
+- Fixed a Phase 2 regression: config reload matched pools by `backend.name`,
+  which the `gpu@target` fold broke. Reload now maps a live unit back to its
+  `[[pool]]` on the base name, and `@` is reserved in configured pool names.
+- `huskctl reap`/`recycle` discover their targets too (no config target list to
+  read any more).
+- Verified by 349 unit tests plus an end-to-end smoke of the real `_serve`
+  composition driving an actual lifecycle mid-flight: org install → unit appears;
+  repo install added → second unit spawns with **no restart**; a
+  non-allowlisted org install → ignored; a granted-but-not-allowlisted repo →
+  never minted against; repo install removed → unit stops, runner deregistered,
+  slot destroyed, surviving target untouched.
+
 - Discovery poller: `GET /app/installations` → for each install read
   `account.login`; if in `allowed_orgs` emit an **org target**; regardless,
   `GET /installation/repositories` ∩ `allowed_repos` → emit **repo targets**.
@@ -201,11 +236,19 @@ Shipped as described below, plus:
   personal-account install of `paulgessinger/husk-test` to exercise the repo-level
   fallback.
 
-## Open items to revisit before/while building
+## Open items
 
-- `serve_targets` per-pool mapping — default (all pools serve all targets) vs
-  explicit; confirm the fan-out policy.
-- Whether to auto-decline (`DELETE /app/installations/{id}`) non-allowlisted
-  installs or just ignore them (starting position: ignore).
-- Merge Phase 2 + Phase 3 to avoid the temp `targets` scaffold, at the cost of a
-  bigger single step.
+- ~~Whether to auto-decline (`DELETE /app/installations/{id}`) non-allowlisted
+  installs or just ignore them.~~ **Settled: ignore.** Declining is destructive
+  and irreversible from huskd's side; someone experimenting with a public App
+  should not have their install silently deleted.
+- ~~Merge Phase 2 + Phase 3 to avoid the temp `targets` scaffold.~~ Kept
+  separate; the scaffold cost ~10 lines and isolated auth bugs from discovery
+  bugs.
+- `serve_targets` per-pool mapping — **still open, still defaulted**: every pool
+  serves every discovered target. Worth revisiting once there's a pool that
+  shouldn't be offered to every org (e.g. an expensive GPU pool).
+- Repo scope was reconsidered and **kept** (2026-07-20): dropping it would remove
+  ~200 mostly-mechanical lines and the partial-sweep rule, but it is already
+  written and validated, and it is the only way to serve a personal account —
+  personal accounts have no org-level runners.

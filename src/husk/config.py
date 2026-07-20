@@ -8,11 +8,14 @@ loading boundary only (see `load_config`), never to the hot-path value objects.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
-from husk.target import Target
+from husk.discovery import Allowlist
+
+log = logging.getLogger("husk.config")
 
 
 def _slug(name: str) -> str:
@@ -50,13 +53,23 @@ class GithubConfig:
 
 @dataclass(frozen=True)
 class AccessConfig:
-    """Which targets huskd serves.
+    """huskd's allowlist — THE restriction on who this daemon serves.
 
-    Phase 2 scaffold: an explicit list, standing in for discovery. Phase 3
-    replaces it with the two-list allowlist (`allowed_orgs`/`allowed_repos`)
-    intersected against what each installation actually granted."""
+    The App is installable by any account, so the gate is here rather than on
+    GitHub's side. Discovery intersects the live installations with these two
+    lists; the entry's type picks the runner scope (org entry → org-level runners,
+    repo entry → runners for exactly that repo). See `husk.discovery`."""
 
-    targets: tuple[Target, ...]
+    allowed: Allowlist
+
+    @property
+    def max_targets(self) -> int:
+        """Upper bound on the discovered target set, known at startup.
+
+        Per-target naming keys off this rather than the live target count: the
+        discovered set changes as people install/uninstall, and a `vm_prefix` that
+        moved underneath a running slot would orphan it."""
+        return len(self.allowed)
 
 
 @dataclass(frozen=True)
@@ -209,8 +222,9 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         private_key_path: str | None = None  # file / k8s Secret mount
 
     class _Access(BaseModel):
-        # TEMP (Phase 2): explicit targets standing in for discovery.
-        targets: list[str] = []
+        # huskd's allowlist. Discovery intersects live installations with these.
+        allowed_orgs: list[str] = []
+        allowed_repos: list[str] = []
 
     class _Runner(BaseModel):
         version: str
@@ -318,14 +332,29 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         )
 
     try:
-        targets = tuple(Target.parse(t) for t in s.access.targets)
-    except ValueError as e:
-        raise RuntimeError(f"[access].targets: {e}") from e
-    if not targets:
-        raise RuntimeError(
-            "no [access].targets configured: huskd needs at least one target, e.g. "
-            'targets = ["org:acts-project"] or ["repo:owner/name"]'
+        allowed = Allowlist(
+            orgs=tuple(s.access.allowed_orgs), repos=tuple(s.access.allowed_repos)
         )
+    except ValueError as e:
+        raise RuntimeError(f"[access]: {e}") from e
+    if not allowed:
+        raise RuntimeError(
+            "empty [access] allowlist: huskd serves nothing until an org or repo is "
+            'allowed, e.g. allowed_orgs = ["acts-project"] or '
+            'allowed_repos = ["owner/name"]'
+        )
+    # An allowed repo under an allowed org is redundant: the org's runners already
+    # serve every repo in it, so the repo entry only adds a second, narrower pool
+    # competing for the same jobs.
+    for r in allowed.repos:
+        owner = r.split("/", 1)[0]
+        if allowed.org_for(owner) is not None:
+            log.warning(
+                "[access]: allowed_repos entry %r is redundant — %r is already an "
+                "allowed org, whose org-level runners serve that repo",
+                r,
+                owner,
+            )
 
     if not s.pool:
         hint = ""
@@ -349,7 +378,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
     # Shared across every pool — one App identity + target set, one lock/http
     # per daemon.
     github = GithubConfig(app_id=s.github.app_id, private_key=private_key)
-    access = AccessConfig(targets=targets)
+    access = AccessConfig(allowed=allowed)
     controller = ControllerConfig(
         lock_path=s.controller.lock_path,
         http_addr=s.controller.http_addr,
@@ -363,6 +392,14 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
     names = [c.backend.name for c in configs]
     if len(set(names)) != len(names):
         raise RuntimeError(f"duplicate pool name across [[pool]] entries: {names}")
+    # `@` separates pool from target in a live unit's name (`gpu@acts-project`),
+    # which is how config reload maps a unit back to its [[pool]]. Keep it reserved.
+    for n in names:
+        if "@" in n:
+            raise RuntimeError(
+                f"pool name {n!r} may not contain '@': huskd reserves it to name "
+                "per-target units (pool@target)"
+            )
     prefixes = [c.backend.vm_prefix for c in configs]
     if len(set(prefixes)) != len(prefixes):
         raise RuntimeError(

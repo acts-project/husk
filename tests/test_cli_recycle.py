@@ -20,7 +20,16 @@ def _recycle(backend, github, **kwargs):
 
 
 class _NullTokens:
-    """Recycle only needs a client per target; no real credential is involved."""
+    """Recycle only needs a client per target; no real credential is involved.
+
+    `installations` is here because recycle now *discovers* its targets rather
+    than reading them from config — the allowlist alone can't tell it which orgs
+    the App is actually installed on."""
+
+    async def installations(self, *, refresh: bool = False) -> list[dict]:
+        return [
+            {"id": 11, "account": {"login": "acts-project", "type": "Organization"}}
+        ]
 
     async def aclose(self) -> None: ...
 
@@ -36,7 +45,7 @@ _TWO_POOLS = """
 app_id = 123456
 
 [access]
-targets = ["org:acts-project"]
+allowed_orgs = ["acts-project"]
 [[pool]]
 name = "openstack-cpu"
 [pool.runner]

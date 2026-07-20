@@ -129,13 +129,13 @@ def _backend_for(cfg: Config, image_sync=None):
     return OpenStackBackend(cfg.backend, image_sync=image_sync)
 
 
-def _build(cfg: Config, image_sync=None, *, tokens=None, target=None):
+def _build(cfg: Config, image_sync=None, *, tokens=None, target):
     """One (backend, github client) pair for a pool, scoped to one target."""
     from husk.github import GitHubClient
 
     backend = _backend_for(cfg, image_sync=image_sync)
     github = GitHubClient(
-        target=target or cfg.access.targets[0],
+        target=target,
         tokens=tokens or _tokens(cfg),
         labels=cfg.runner.labels,
         runner_group=cfg.runner.runner_group,
@@ -150,10 +150,16 @@ def _target_naming(cfg: Config, target, n_targets: int) -> dict:
     prefix-based) and the runner APIs are target-wide, so two targets sharing a
     backend MUST mint distinct names.
 
-    With a single target both are deliberately left alone: changing `vm_prefix`
-    would orphan every running VM (existing slots stop matching the prefix and
-    become invisible to reconcile), which is a live migration rather than a config
-    detail. So the fold only kicks in where it is actually required."""
+    `n_targets` is the size of the **allowlist**, not of the discovered set. The
+    discovered set moves as people install and uninstall, and a `vm_prefix` that
+    changed underneath a running slot would orphan it (it stops matching the
+    prefix and becomes invisible to reconcile). Keying off config makes the name a
+    slot is born with the name it keeps.
+
+    With a single allowed target both are deliberately left alone, so a
+    single-target deployment keeps the plain `husk-gpu` names its live VMs already
+    carry. Widening the allowlist from one entry to two therefore renames the
+    pools: that is a restart-and-drain migration, not a hot edit."""
     from husk.config import _slug
 
     if n_targets < 2:
@@ -411,6 +417,7 @@ def run(
         # loud error rather than taking the whole daemon down — the other pools run.
         # One process-wide image coordinator: the registry pull is single-flighted
         # per content digest and the controller cache is shared across all pools.
+        from husk.discovery import TargetDiscovery
         from husk.image_sync import ImageSync
         from husk.poller import RunnerPoller, SnapshotRegistry
 
@@ -419,11 +426,22 @@ def run(
         # target's runner listing here and every pool's reconcile task reads it.
         registry = SnapshotRegistry()
         tokens = _tokens(cfgs[0])  # shared App credential (targets are process-wide)
-        targets = cfgs[0].access.targets
-        controllers = []
-        # The reconcile unit is (target, pool) — one Controller each. Today the
-        # target set is static config; Phase 3 makes it dynamic and adds spawn/reap.
-        for target in targets:
+        allowed = cfgs[0].access.allowed
+        # The reconcile unit is (target, pool) — one Controller each — and the
+        # target set is discovered (installations ∩ allowlist), not configured.
+        # `_make_pools` is what the facade calls when a target appears.
+        poller = RunnerPoller(
+            registry,
+            {},
+            # Cadence follows the most eager pool, so no pool ever reads a snapshot
+            # older than its own tick interval.
+            interval=min(c.timeouts.poll_interval_sec for c in cfgs),
+        )
+
+        allowed_size = len(allowed)
+
+        def make_pools(target) -> list[Controller]:
+            out: list[Controller] = []
             for cfg in cfgs:
                 label = f"{target}/{cfg.backend.name}"
                 try:
@@ -442,34 +460,28 @@ def run(
                     cfg,
                     controller=dataclasses.replace(cfg.controller, http_addr=""),
                     backend=dataclasses.replace(
-                        cfg.backend, **_target_naming(cfg, target, len(targets))
+                        cfg.backend,
+                        **_target_naming(cfg, target, allowed_size),
                     ),
                 )
-                controllers.append(
+                out.append(
                     Controller(backend, github, sub, target=target, registry=registry)
                 )
-        if not controllers:
-            typer.echo("no pools could be started", err=True)
-            raise typer.Exit(code=1)
+            return out
+
+        discovery = TargetDiscovery(tokens, allowed)
         facade = MultiPoolController(
-            controllers,
+            [],
             reload_configs=_configs_reloader(config, secrets_dir),
+            discover=discovery.discover,
+            build=make_pools,
+            # One listing per distinct target, not per pool: the runner API is
+            # target-wide, so pools sharing a target share the poll.
+            attach=lambda c: poller.add_target(c.target, c.github.list_runners),
+            detach=lambda t: (poller.remove_target(t), registry.forget(t)),
         )
-        # One listing per distinct target, not per pool: the runner API is
-        # target-wide, so pools sharing a target share the poll. Cadence follows
-        # the most eager pool so no pool ever reads a snapshot older than its own
-        # tick interval.
-        listers = {}
-        for ctrl in controllers:
-            listers.setdefault(ctrl.target, ctrl.github.list_runners)
-        poller = RunnerPoller(
-            registry,
-            listers,
-            interval=min(c.cfg.timeouts.poll_interval_sec for c in controllers),
-        )
-        githubs = [c.github for c in controllers]
         if once:
-            asyncio.run(_once(facade, poller, githubs, tokens))
+            asyncio.run(_once(facade, poller, discovery, tokens))
         else:
             if not shared.http_addr:
                 typer.echo("controller.http_addr must be set", err=True)
@@ -486,7 +498,7 @@ def run(
                 _serve(
                     facade,
                     poller,
-                    githubs,
+                    discovery,
                     tokens,
                     shared.http_addr,
                     ssh_targets=ssh_targets,
@@ -497,23 +509,37 @@ def run(
         lock.release()
 
 
-async def _once(facade: MultiPoolController, poller, githubs: list, tokens) -> None:
-    """Single reconcile pass: warm the registry, tick every pool, print, close."""
+async def _shutdown(facade: MultiPoolController, discovery, tokens) -> None:
+    """Close every client the daemon opened. The GitHub clients are per
+    `(target, pool)` and the target set is dynamic, so they're collected from the
+    facade at shutdown rather than captured at startup."""
+    for c in facade.controllers:
+        try:
+            await c.github.aclose()
+        except Exception:
+            log.debug("closing github client for %s failed", c.target, exc_info=True)
+    await discovery.aclose()
+    await tokens.aclose()
+
+
+async def _once(facade: MultiPoolController, poller, discovery, tokens) -> None:
+    """Single reconcile pass: discover targets, warm the registry, tick, print."""
     try:
+        # Discovery has to run first here: with no daemon loop there is nothing to
+        # create the (target, pool) units this pass is supposed to tick.
+        await facade.discover_once()
         await poller.poll_once()
         await facade.tick_all()
         for snap in facade.snapshots():
             _print_status(snap)
     finally:
-        for gh in githubs:
-            await gh.aclose()
-        await tokens.aclose()
+        await _shutdown(facade, discovery, tokens)
 
 
 async def _serve(
     facade: MultiPoolController,
     poller,
-    githubs: list,
+    discovery,
     tokens,
     http_addr: str,
     *,
@@ -536,8 +562,11 @@ async def _serve(
         loop.add_signal_handler(sig, stop.set)
 
     scraper = GuestScraper(ssh_targets) if ssh_targets else None
-    # Warm the registry before the first ticks, so no pool has to fail-safe its
-    # opening tick purely because nothing has been polled yet.
+    # Discover the target set, then warm its registry entries, both before the
+    # first ticks: otherwise the opening tick of every pool would fail-safe purely
+    # because nothing had been polled yet. Units created here are registered but
+    # not yet spawned (no `stop` event); `facade.run` starts them below.
+    await facade.discover_once()
     await poller.poll_once()
     tasks = [
         asyncio.create_task(poller.run(stop), name="husk-poller"),
@@ -561,9 +590,7 @@ async def _serve(
     finally:
         stop.set()
         await asyncio.gather(*tasks, return_exceptions=True)
-        for gh in githubs:
-            await gh.aclose()
-        await tokens.aclose()
+        await _shutdown(facade, discovery, tokens)
         if scraper is not None:
             scraper.close()  # drop the multiplexed SSH control sockets
 
@@ -665,7 +692,14 @@ def reap(
     tokens = _tokens(cfgs[0])
 
     async def go():
+        from husk.discovery import discover_targets
+
         out: list[tuple[str, list[str]]] = []
+        targets = await discover_targets(tokens, cfgs[0].access.allowed)
+        if not targets:
+            typer.echo(
+                "no targets: the App is not installed on any allowed org/repo", err=True
+            )
         clients = [
             GitHubClient(
                 target=t,
@@ -673,7 +707,7 @@ def reap(
                 labels=cfgs[0].runner.labels,
                 runner_group=cfgs[0].runner.runner_group,
             )
-            for t in cfgs[0].access.targets
+            for t in targets
         ]
         try:
             for gh in clients:
@@ -799,9 +833,17 @@ def recycle(
     pools = cfgs if (all_slots and pool is None) else [_select_pool(cfgs, pool)]
     multi = len(pools) > 1
 
+    from husk.discovery import discover_targets
     from husk.github import GitHubClient
 
     tokens = _tokens(cfgs[0])
+    # Discovered once and reused across pools: recycle is target-agnostic (it acts
+    # on slots), and the targets only matter for best-effort busy detection.
+    try:
+        targets = asyncio.run(discover_targets(tokens, cfgs[0].access.allowed))
+    except Exception as e:
+        typer.echo(f"target discovery failed: {e}", err=True)
+        raise typer.Exit(code=1)
     total_acted, any_unknown, any_err = 0, False, False
     for cfg in pools:
         backend = _backend_for(cfg)
@@ -814,7 +856,7 @@ def recycle(
                 labels=cfg.runner.labels,
                 runner_group=cfg.runner.runner_group,
             )
-            for tg in cfg.access.targets
+            for tg in targets
         ]
         if multi:
             typer.echo(f"── {cfg.backend.name} ──")

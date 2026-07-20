@@ -9,7 +9,7 @@ import logging
 import threading
 import time
 
-from conftest import FakeClock, make_config, make_slot, pump, tick_all
+from conftest import TEST_TARGET, FakeClock, make_config, make_slot, pump, tick_all
 from husk.controller import Controller
 from husk.fake_backend import FakeBackend, FakeGitHub
 from husk.multipool import MultiPoolController
@@ -25,7 +25,7 @@ def _pool(name, prefix, *, github=None, slots=None, runners=None, **cfg_kw):
         backend=dataclasses.replace(cfg.backend, name=name, vm_prefix=prefix),
         controller=dataclasses.replace(cfg.controller, http_addr=""),
     )
-    ctrl = Controller(backend, gh, cfg, clock=FakeClock())
+    ctrl = Controller(backend, gh, cfg, clock=FakeClock(), target=TEST_TARGET)
     return ctrl, backend, gh
 
 

@@ -6,11 +6,15 @@
 app_id = 123456                        # from the App's settings page
 private_key_path = "/etc/husk/husk-app.pem"   # or env HUSK_GITHUB__PRIVATE_KEY (PEM contents)
 
-[access]                               # TEMP (Phase 2): explicit targets.
-# Phase 3 replaces this with the two-list allowlist:
-#   allowed_orgs  = ["acts-project"]   # whole org  -> org-level runners
-#   allowed_repos = ["owner/name"]     # this repo  -> repo-level runners
-targets = ["org:acts-project"]
+[access]                               # huskd's allowlist -- THE restriction.
+# The App is installable by anyone, so this is what decides who huskd serves.
+# Discovery intersects live installations with these two lists; an install that
+# matches neither is ignored (never auto-declined). The entry TYPE picks scope:
+#   allowed_orgs  -- whole org -> org-level runners, one warm pool for every repo
+#   allowed_repos -- owner/name -> runners for exactly that repo, nothing else
+# A repo is served only if the installation granted it AND it is listed here.
+allowed_orgs  = ["acts-project"]
+allowed_repos = []
 
 [controller]
 lock_path = "/tmp/huskd.lock"

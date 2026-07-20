@@ -22,6 +22,7 @@ from husk.config import (
     TimeoutsConfig,
 )
 from husk.controller import Controller
+from husk.discovery import Allowlist
 from husk.fake_backend import FakeBackend, FakeGitHub
 from husk.poller import SnapshotRegistry
 from husk.slot import Runner, Slot
@@ -52,7 +53,7 @@ def make_config(
 ) -> Config:
     return Config(
         github=GithubConfig(app_id=123456, private_key="-----FAKE PRIVATE KEY-----"),
-        access=AccessConfig(targets=(TEST_TARGET,)),
+        access=AccessConfig(allowed=Allowlist(orgs=("acts-project",))),
         runner=RunnerConfig(
             version="2.334.0", labels=["self-hosted"], runner_group="husk"
         ),
@@ -122,7 +123,14 @@ def clock() -> FakeClock:
 def make_controller(
     backend: FakeBackend, github: FakeGitHub, config: Config, clock
 ) -> Controller:
-    return Controller(backend, github, config, clock=clock, registry=SnapshotRegistry())
+    return Controller(
+        backend,
+        github,
+        config,
+        clock=clock,
+        target=TEST_TARGET,
+        registry=SnapshotRegistry(),
+    )
 
 
 async def pump(ctrl: Controller) -> None:

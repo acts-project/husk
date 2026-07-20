@@ -93,7 +93,7 @@ class Controller:
         *,
         clock=time.monotonic,
         reload_config: Callable[[], Config | None] | None = None,
-        target: Target | None = None,
+        target: Target,
         demand: DemandRegistry | None = None,
         registry: SnapshotRegistry | None = None,
         runner_snapshot_max_age: float = RUNNER_SNAPSHOT_MAX_AGE_S,
@@ -103,11 +103,12 @@ class Controller:
         self.cfg = config
         self._clock = clock
         # Reconcile is keyed (target, pool) — one Controller per pair. The target
-        # is injected by the caller from `[access].targets`; Phase 3 makes that set
-        # dynamic (discovery ∩ allowlist) without this loop changing. The demand
+        # is injected by the caller, which gets it from discovery (installations ∩
+        # allowlist); a Controller is created when its target appears and torn down
+        # when it goes away, so this loop never sees the set change. The demand
         # registry is the seam reconcile reads `desired` from — a webhook becomes a
         # second producer in Phase 4 without this loop changing either.
-        self.target = target or config.access.targets[0]
+        self.target = target
         self.pool = config.backend.name
         self.demand = demand or DemandRegistry()
         # Runner listings come from the centralized poller via this registry, never

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 
-from conftest import FakeClock, make_config, tick
+from conftest import TEST_TARGET, FakeClock, make_config, tick
 from husk.controller import Controller
 from husk.fake_backend import FakeBackend, FakeGitHub
 
@@ -19,7 +19,9 @@ def _config_with_prefix(prefix: str):
 
 def test_default_prefix_is_husk():
     backend, github = FakeBackend(), FakeGitHub()
-    ctrl = Controller(backend, github, make_config(min_ready=1), clock=FakeClock())
+    ctrl = Controller(
+        backend, github, make_config(min_ready=1), clock=FakeClock(), target=TEST_TARGET
+    )
     tick(ctrl)
     created = [c[1] for c in backend.calls if c[0] == "create"]
     assert created and all(n.startswith("husk-") for n in created)
@@ -28,7 +30,11 @@ def test_default_prefix_is_husk():
 def test_pool_prefix_partitions_names():
     backend, github = FakeBackend(), FakeGitHub()
     ctrl = Controller(
-        backend, github, _config_with_prefix("husk-gpu"), clock=FakeClock()
+        backend,
+        github,
+        _config_with_prefix("husk-gpu"),
+        clock=FakeClock(),
+        target=TEST_TARGET,
     )
     tick(ctrl)
     created = [c[1] for c in backend.calls if c[0] == "create"]

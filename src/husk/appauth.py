@@ -41,6 +41,12 @@ _TOKEN_MARGIN_S = 300
 # reinstall mints a NEW installation id, so this can't be cached forever.
 _INSTALLATIONS_TTL_S = 300
 
+# GitHub's list endpoints page at 30 by default. huskd is installable by *any*
+# account, so silently truncating at page 1 would mean quietly not serving the
+# 31st installation. Ask for the max and follow pages.
+_PER_PAGE = 100
+_MAX_PAGES = 50  # 5000 installs; a guard against a pathological pagination loop
+
 
 class AppAuthError(GitHubError):
     """The App could not authenticate, or has no installation for a target."""
@@ -129,14 +135,23 @@ class InstallationTokenProvider:
             and now - self._installs[1] < _INSTALLATIONS_TTL_S
         ):
             return self._installs[0]
+        installs: list[dict] = []
         try:
-            r = await request(
-                self._client, "GET", f"{GH_API}/app/installations", token=self.app_jwt()
-            )
-            r.raise_for_status()
+            for page in range(1, _MAX_PAGES + 1):
+                r = await request(
+                    self._client,
+                    "GET",
+                    f"{GH_API}/app/installations",
+                    token=self.app_jwt(),
+                    params={"per_page": _PER_PAGE, "page": page},
+                )
+                r.raise_for_status()
+                batch = r.json()
+                installs += batch
+                if len(batch) < _PER_PAGE:
+                    break
         except httpx.HTTPError as e:
             raise AppAuthError(f"list installations failed: {e}") from e
-        installs = r.json()
         self._installs = (installs, now)
         log.debug(
             "app has %d installation(s): %s",
@@ -175,31 +190,45 @@ class InstallationTokenProvider:
         mint endpoint when a token expires."""
         async with self._lock:
             iid = await self.installation_id(target)
-            cached = self._tokens.get(iid)
-            if cached is not None and self._clock() < cached[1] - _TOKEN_MARGIN_S:
-                return cached[0]
-            try:
-                r = await request(
-                    self._client,
-                    "POST",
-                    f"{GH_API}/app/installations/{iid}/access_tokens",
-                    token=self.app_jwt(),
-                )
-            except httpx.HTTPError as e:
-                raise AppAuthError(f"token exchange for {target} failed: {e}") from e
-            if r.status_code != 201:
-                raise AppAuthError(
-                    f"token exchange for {target}: HTTP {r.status_code}: {r.text[:200]}"
-                )
-            body = r.json()
-            token, expiry = body["token"], _expiry_epoch(body.get("expires_at"))
-            self._tokens[iid] = (token, expiry)
-            log.info(
-                "minted installation token for %s (expires %s)",
-                target,
-                body.get("expires_at"),
+            return await self._token_for_id(iid, str(target))
+
+    async def token_for_installation(self, installation_id: int) -> str:
+        """A valid token for an installation id, without going through a `Target`.
+
+        Discovery works the other way round from reconcile — it has installs in
+        hand and is deriving targets from them, so it can't ask by target yet."""
+        async with self._lock:
+            return await self._token_for_id(
+                installation_id, f"installation {installation_id}"
             )
-            return token
+
+    async def _token_for_id(self, iid: int, what: str) -> str:
+        """Mint/reuse the token for one installation. Caller holds `self._lock`."""
+        cached = self._tokens.get(iid)
+        if cached is not None and self._clock() < cached[1] - _TOKEN_MARGIN_S:
+            return cached[0]
+        try:
+            r = await request(
+                self._client,
+                "POST",
+                f"{GH_API}/app/installations/{iid}/access_tokens",
+                token=self.app_jwt(),
+            )
+        except httpx.HTTPError as e:
+            raise AppAuthError(f"token exchange for {what} failed: {e}") from e
+        if r.status_code != 201:
+            raise AppAuthError(
+                f"token exchange for {what}: HTTP {r.status_code}: {r.text[:200]}"
+            )
+        body = r.json()
+        token, expiry = body["token"], _expiry_epoch(body.get("expires_at"))
+        self._tokens[iid] = (token, expiry)
+        log.info(
+            "minted installation token for %s (expires %s)",
+            what,
+            body.get("expires_at"),
+        )
+        return token
 
     def invalidate(self, target: Target) -> None:
         """Drop the cached token for `target` — call on a 401 so the next request
