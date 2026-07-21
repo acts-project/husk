@@ -20,3 +20,20 @@ config.openstack.*.toml
 
 # Local multi-pool daemon config (OpenStack + libvirt CPU + libvirt GPU at once).
 config.multi.toml
+
+# ── credentials ─────────────────────────────────────────────────────────────
+# Everything huskd needs to authenticate, kept in the working tree but never
+# committed. `just k8s-secrets` reads from here and loads them into the cluster.
+#   secrets/private-key.pem   GitHub App private key (App settings -> Private keys)
+#   secrets/clouds.yaml       openstacksdk profile with the CERN app credential
+secrets/
+
+# Belt and braces: no PEM anywhere in the tree, whatever it's called. A GitHub App
+# key grants installation tokens for every org/repo the App is on, so a stray
+# `git add -A` must never be able to pick one up.
+*.pem
+*.key
+
+# The k8s overlays' real configs (k8s/overlays/*/config.toml) are already covered
+# by the bare `config.toml` rule above. The committed templates are the
+# config.example.toml next to each — see k8s/README.md.
