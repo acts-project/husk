@@ -61,9 +61,9 @@ patches:
       # (~1000740000+) and would REJECT a hardcoded 999 as out of range. So the
       # base stays UID-less for CERN, and vanilla k8s gets the pin here.
       #
-      # fsGroup makes the emptyDir volumes (image cache, lock dir) group-writable
-      # by that GID — without it the golden pull and the flock both fail on a
-      # root-owned mount.
+      # fsGroup makes the emptyDir volumes (image cache, lock dir, metrics state)
+      # group-writable by that GID — without it the golden pull, the flock and the
+      # metrics flush all fail on a root-owned mount.
       - op: add
         path: /spec/template/spec/securityContext
         value:

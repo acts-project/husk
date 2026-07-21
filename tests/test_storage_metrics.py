@@ -1,0 +1,233 @@
+"""qcow2 storage accounting: the controller cache scan, the libvirt per-host
+scan, cross-pool dedupe, and the daemon-wide Prometheus block."""
+
+from __future__ import annotations
+
+import os
+
+from conftest import render_metrics
+from husk.image_sync import ImageSync
+from husk.storage import CACHE, GOLDEN, OVERLAY, DiskUsage, collect
+
+
+def _sample(body: str, metric: str) -> float:
+    """The single value of `metric` in an exposition, via the real parser."""
+    from prometheus_client.parser import text_string_to_metric_families
+
+    values = [
+        s.value
+        for family in text_string_to_metric_families(body)
+        for s in family.samples
+        if s.name == metric
+    ]
+    assert len(values) == 1, f"{metric}: expected one sample, got {values}"
+    return values[0]
+
+
+def _qcow2(path: str, size: int) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(b"\0" * size)
+
+
+# ------------------------------------------------------------ controller cache
+def test_cache_usage_counts_and_sums_qcow2(tmp_path):
+    cache = str(tmp_path / "cache")
+    _qcow2(os.path.join(cache, "sha256-aaa", "base.qcow2"), 100)
+    _qcow2(os.path.join(cache, "sha256-bbb", "base.qcow2"), 250)
+
+    usage = ImageSync(cache).cache_usage()
+
+    # Only the qcow2-content half is asserted here; the filesystem figures depend
+    # on whatever disk tmp_path lives on and have their own tests below.
+    assert (usage.kind, usage.host, usage.images, usage.total_bytes) == (
+        CACHE,
+        "",
+        2,
+        350,
+    )
+
+
+def test_cache_usage_ignores_in_flight_pulls(tmp_path):
+    """A `.pull-*` temp dir is a partial download, not cache content — counting
+    it would make the gauge sawtooth during every pull."""
+    cache = str(tmp_path / "cache")
+    _qcow2(os.path.join(cache, "sha256-aaa", "base.qcow2"), 100)
+    _qcow2(os.path.join(cache, ".pull-xyz", "base.qcow2"), 900)
+
+    assert ImageSync(cache).cache_usage().total_bytes == 100
+
+
+def test_cache_usage_on_missing_dir_is_zero_not_an_error(tmp_path):
+    usage = ImageSync(str(tmp_path / "never-pulled")).cache_usage()
+
+    assert (usage.images, usage.total_bytes) == (0, 0)
+
+
+def test_cache_usage_is_memoized(tmp_path):
+    """/metrics reads this, so a scrape storm must not re-scan the disk."""
+    cache = str(tmp_path / "cache")
+    _qcow2(os.path.join(cache, "sha256-aaa", "base.qcow2"), 100)
+    sync = ImageSync(cache)
+    assert sync.cache_usage().total_bytes == 100
+
+    _qcow2(os.path.join(cache, "sha256-bbb", "base.qcow2"), 250)
+
+    assert sync.cache_usage().total_bytes == 100  # still the memoized figure
+
+
+# --------------------------------------------------------------------- collect
+class _Backend:
+    def __init__(self, rows, boom=False):
+        self._rows = rows
+        self._boom = boom
+
+    def disk_usage(self):
+        if self._boom:
+            raise RuntimeError("host unreachable")
+        return self._rows
+
+
+class _Sync:
+    def __init__(self, usage=None, boom=False):
+        self._usage = usage
+        self._boom = boom
+
+    def cache_usage(self):
+        if self._boom:
+            raise RuntimeError("cache gone")
+        return self._usage
+
+
+def test_collect_dedupes_a_host_shared_by_two_pools():
+    """Two libvirt pools on one hypervisor measure the SAME pool dir. Counting
+    both would double the bytes for a disk that only filled once."""
+    shared = [
+        DiskUsage(kind=GOLDEN, host="hv1", images=2, total_bytes=200),
+        DiskUsage(kind=OVERLAY, host="hv1", images=4, total_bytes=40),
+    ]
+    rows = collect(
+        _Sync(DiskUsage(CACHE, "", 1, 10)), [_Backend(shared), _Backend(shared)]
+    )
+
+    assert rows == [DiskUsage(CACHE, "", 1, 10)] + shared
+
+
+def test_collect_keeps_distinct_hosts():
+    a = [DiskUsage(kind=GOLDEN, host="hv1", images=1, total_bytes=100)]
+    b = [DiskUsage(kind=GOLDEN, host="hv2", images=3, total_bytes=300)]
+
+    rows = collect(None, [_Backend(a), _Backend(b)])
+
+    assert [(r.host, r.total_bytes) for r in rows] == [("hv1", 100), ("hv2", 300)]
+
+
+def test_collect_survives_a_failing_backend_and_cache():
+    """This feeds /metrics: one broken source must not fail the whole scrape."""
+    ok = [DiskUsage(kind=GOLDEN, host="hv2", images=1, total_bytes=7)]
+
+    rows = collect(_Sync(boom=True), [_Backend(None, boom=True), _Backend(ok)])
+
+    assert rows == ok
+
+
+# ------------------------------------------------------------------- rendering
+def test_render_storage_exposition():
+    body = render_metrics(
+        storage=[
+            DiskUsage(kind=CACHE, host="", images=2, total_bytes=350),
+            DiskUsage(kind=GOLDEN, host="hv1", images=1, total_bytes=100),
+        ]
+    )
+
+    # Label names come out alphabetically ordered (host before kind) — the format
+    # does not treat label order as meaningful.
+    assert 'husk_images{host="",kind="cache"} 2.0' in body
+    assert 'husk_image_bytes{host="",kind="cache"} 350.0' in body
+    assert 'husk_images{host="hv1",kind="golden"} 1.0' in body
+    assert 'husk_image_bytes{host="hv1",kind="golden"} 100.0' in body
+    # No backend label on the storage series: these are daemon-wide, not per-pool
+    # (two pools can share a hypervisor's storage dir).
+    for line in body.splitlines():
+        if line.startswith(("husk_images", "husk_image_bytes")):
+            assert "backend=" not in line
+
+
+# ------------------------------------------------------- filesystem headroom
+def test_cache_usage_reports_filesystem_headroom(tmp_path):
+    """Content size says what husk is holding; this says whether the next golden
+    pull will fit. On k8s the cache is its own PVC, whose capacity huskd cannot
+    otherwise see."""
+    cache = str(tmp_path / "cache")
+    _qcow2(os.path.join(cache, "sha256-aaa", "base.qcow2"), 100)
+
+    usage = ImageSync(cache).cache_usage()
+
+    assert usage.fs_size_bytes and usage.fs_size_bytes > 0
+    assert usage.fs_avail_bytes and 0 < usage.fs_avail_bytes <= usage.fs_size_bytes
+
+
+def test_filesystem_headroom_works_before_the_cache_dir_exists(tmp_path):
+    """Cold start: the PVC is mounted but nothing has been pulled, so the cache
+    directory isn't there yet. The volume still has a capacity worth reporting —
+    `_fs_space` walks up to the nearest existing ancestor to find it."""
+    usage = ImageSync(str(tmp_path / "never" / "pulled")).cache_usage()
+
+    assert (usage.images, usage.total_bytes) == (0, 0)
+    assert usage.fs_size_bytes and usage.fs_size_bytes > 0
+
+
+def test_headroom_uses_available_not_free(tmp_path):
+    """f_bavail, not f_bfree: the difference is the root-reserved blocks, which
+    huskd (unprivileged) can never actually use. Counting them would make the
+    volume look emptier than it is exactly when that matters."""
+    import os as _os
+
+    st = _os.statvfs(str(tmp_path))
+    usage = ImageSync(str(tmp_path)).cache_usage()
+
+    assert usage.fs_avail_bytes == st.f_frsize * st.f_bavail
+    if st.f_bfree != st.f_bavail:  # reserved blocks exist on this filesystem
+        assert usage.fs_avail_bytes < st.f_frsize * st.f_bfree
+
+
+def test_headroom_series_are_rendered():
+    body = render_metrics(
+        storage=[
+            DiskUsage(
+                kind=CACHE,
+                host="",
+                images=2,
+                total_bytes=350,
+                fs_size_bytes=53687091200,
+                fs_avail_bytes=42949672960,
+            )
+        ]
+    )
+
+    # Parsed, not substring-matched: prometheus_client renders large floats in
+    # exponent form and the exponent's zero-padding is platform-dependent
+    # (5.36870912e+010 on macOS, e+10 on Linux), so a literal would pass locally
+    # and fail in CI.
+    assert _sample(body, "husk_filesystem_size_bytes") == 53687091200
+    assert _sample(body, "husk_filesystem_avail_bytes") == 42949672960
+
+
+def test_unmeasured_headroom_is_omitted_not_zero():
+    """A backend that doesn't measure its hosts' filesystems reports None. Emitting
+    0 would read as "completely full" to any sane alert."""
+    body = render_metrics(
+        storage=[DiskUsage(kind=GOLDEN, host="hv1", images=1, total_bytes=100)]
+    )
+
+    assert "# TYPE husk_filesystem_size_bytes gauge" in body
+    assert not [
+        ln for ln in body.splitlines() if ln.startswith("husk_filesystem_size_bytes{")
+    ]
+
+
+def test_render_storage_with_nothing_measured_still_emits_headers():
+    body = render_metrics(storage=[])
+
+    assert "# TYPE husk_images gauge" in body
+    assert "# TYPE husk_image_bytes gauge" in body

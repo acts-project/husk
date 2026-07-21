@@ -53,6 +53,13 @@ shrink_ticks = 3                       # sustained-surplus ticks before ramp-dow
 # through huskd. Defaults to http_addr; set it only if huskd is reached on a
 # different address than it binds (behind a NAT, k8s Service, or ingress).
 # advertise_addr = "huskd.cern.ch:9100"
+# Where huskd persists its accumulated counters/histograms (failure counts, recycle
+# duration distributions) so they survive a restart. Unset ⇒ they reset to zero on
+# every boot, which — since any config change means a restart — quietly caps how
+# far back `increase(...[30d])` or a p95 recycle time can actually see. A few KB;
+# a small PVC (or any writable path) is enough. Nothing about slot state is stored
+# here: slots are still re-adopted from backend metadata on the first tick.
+# metrics_state_path = "/var/lib/husk/metrics.json"
 
 # ───────────────────────────── pool 1: OpenStack CPU ─────────────────────────
 # `name` is the pool identity: it becomes the backend name AND the default

@@ -3,7 +3,9 @@ coroutine the CLI awaits to run it on the main event loop.
 
   GET /         — live dashboard (Jinja + SSE, no polling)
   GET /status   — JSON list of ControllerState, one per pool (huskctl, dashboards)
-  GET /metrics  — Prometheus text exposition (per-pool gauges, backend="..." label)
+  GET /metrics  — Prometheus text exposition, rendered from a CollectorRegistry
+                  (see husk.metrics for what is in it and why it is split into a
+                  snapshot-derived half and an event-time half)
   GET /sd/targets — Prometheus http_sd: live per-slot node_exporter scrape targets
   GET /slot/<pool>/<slot>/metrics — a libvirt guest's node_exporter, bridged over
                   huskd's SSH channel to the hypervisor (the guest is on a private
@@ -32,11 +34,14 @@ from typing import Callable
 
 from hypercorn.asyncio import serve
 from hypercorn.config import Config as HypercornConfig
+from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, generate_latest
 from quart import Quart, Response, render_template
 
 from husk.guest_scrape import GuestScraper, GuestScrapeError
 
+from husk.metrics import Metrics, SnapshotCollector
 from husk.snapshot import ControllerState
+from husk.storage import DiskUsage
 
 log = logging.getLogger("husk.web")
 
@@ -56,90 +61,27 @@ def parse_addr(addr: str) -> tuple[str, int]:
     return ("0.0.0.0", int(addr))
 
 
-def render_prometheus(s: ControllerState) -> str:
-    b = s.backend
-    out = [
-        "# HELP husk_slots Slots by classified state",
-        "# TYPE husk_slots gauge",
-    ]
-    out += [
-        f'husk_slots{{backend="{b}",state="{state}"}} {n}'
-        for state, n in s.counts.items()
-    ]
-    out += [
-        "# HELP husk_slots_desired Desired total slots",
-        "# TYPE husk_slots_desired gauge",
-        f'husk_slots_desired{{backend="{b}"}} {s.desired_total}',
-        "# HELP husk_slots_min_ready Configured min_ready",
-        "# TYPE husk_slots_min_ready gauge",
-        f'husk_slots_min_ready{{backend="{b}"}} {s.min_ready}',
-        "# HELP husk_slots_max_total Configured max_total",
-        "# TYPE husk_slots_max_total gauge",
-        f'husk_slots_max_total{{backend="{b}"}} {s.max_total}',
-        "# HELP husk_last_reconcile_timestamp_seconds Unix time of the last reconcile",
-        "# TYPE husk_last_reconcile_timestamp_seconds gauge",
-        f'husk_last_reconcile_timestamp_seconds{{backend="{b}"}} {s.last_reconcile_epoch}',
-        "# HELP husk_reconcile_generation Monotonic reconcile counter",
-        "# TYPE husk_reconcile_generation counter",
-        f'husk_reconcile_generation{{backend="{b}"}} {s.generation}',
-    ]
-    # Per-slot timing (low cardinality — slots are long-lived). Emit only when
-    # a value exists so a never-recycled slot doesn't report a bogus 0.
-    out += [
-        "# HELP husk_slot_last_cloudinit_seconds Last ACTIVE->runner-online duration",
-        "# TYPE husk_slot_last_cloudinit_seconds gauge",
-    ]
-    out += [
-        f'husk_slot_last_cloudinit_seconds{{backend="{b}",slot="{v.name}"}} {v.cloudinit_seconds}'
-        for v in s.slots
-        if v.cloudinit_seconds is not None
-    ]
-    out += [
-        "# HELP husk_slot_last_recycle_seconds Last issue->runner-online duration",
-        "# TYPE husk_slot_last_recycle_seconds gauge",
-    ]
-    out += [
-        f'husk_slot_last_recycle_seconds{{backend="{b}",slot="{v.name}"}} {v.recycle_seconds}'
-        for v in s.slots
-        if v.recycle_seconds is not None
-    ]
-    out += [
-        "# HELP husk_slot_live_fraction Fraction of tracked time the slot was available to serve (busy or idle)",
-        "# TYPE husk_slot_live_fraction gauge",
-    ]
-    out += [
-        f'husk_slot_live_fraction{{backend="{b}",slot="{v.name}"}} {v.live_fraction}'
-        for v in s.slots
-        if v.live_fraction is not None
-    ]
-    out += [
-        "# HELP husk_slot_boot_seconds systemd-analyze boot phase durations (husk-bootreport)",
-        "# TYPE husk_slot_boot_seconds gauge",
-    ]
-    out += [
-        f'husk_slot_boot_seconds{{backend="{b}",slot="{v.name}",phase="{phase}"}} {val}'
-        for v in s.slots
-        for phase, val in (
-            ("kernel", v.boot_kernel_seconds),
-            ("initrd", v.boot_initrd_seconds),
-            ("userspace", v.boot_userspace_seconds),
-            ("total", v.boot_total_seconds),
-        )
-        if val is not None
-    ]
-    # Join table: attributes node_* (keyed by the http_sd target's backend/slot
-    # labels) back to pool/host/runner/cycle. Value is always 1; the labels carry
-    # the information. Join on (backend, slot).
-    out += [
-        "# HELP husk_slot_info Slot identity for joining in-guest metrics (always 1)",
-        "# TYPE husk_slot_info gauge",
-    ]
-    out += [
-        f'husk_slot_info{{backend="{b}",slot="{v.name}",ip="{v.ip or ""}",'
-        f'host="{v.host or ""}",runner="{v.runner or ""}",cycle="{v.cycle}"}} 1'
-        for v in s.slots
-    ]
-    return "\n".join(out) + "\n"
+def build_registry(
+    snapshot_provider: Callable[[], list[ControllerState]],
+    *,
+    storage_provider: Callable[[], list[DiskUsage]] | None = None,
+    metrics: Metrics | None = None,
+) -> CollectorRegistry:
+    """The registry `/metrics` renders.
+
+    A fresh `CollectorRegistry` rather than `prometheus_client.REGISTRY`, because
+    the default one is process-global and already carries the Process/Platform/GC
+    collectors from import time. Sharing it would mean every `make_app` in a test
+    process accumulating collectors on the same registry — each one still gets
+    collected, so the exposition would grow a duplicate copy of every husk series
+    per app ever built — and it would fold in platform metrics husk never chose to
+    publish. An explicit registry makes the exposition exactly what husk put in
+    it."""
+    registry = CollectorRegistry()
+    registry.register(SnapshotCollector(snapshot_provider, storage_provider))
+    if metrics is not None:
+        registry.register(metrics)
+    return registry
 
 
 def make_app(
@@ -148,6 +90,8 @@ def make_app(
     shutdown: asyncio.Event | None = None,
     scraper: GuestScraper | None = None,
     advertise_addr: str = "",
+    storage_provider: Callable[[], list[DiskUsage]] | None = None,
+    metrics: Metrics | None = None,
 ) -> Quart:
     """Build the app over a per-pool snapshot provider (the same one every
     endpoint reads). Templates resolve relative to this package.
@@ -166,8 +110,16 @@ def make_app(
     `advertise_addr` is where central Prometheus reaches THIS huskd — the address
     `/sd/targets` hands out for the proxied libvirt targets. Defaults to the
     controller's `http_addr`, which is wrong only if huskd is behind a NAT/ingress,
-    hence the override."""
+    hence the override.
+
+    `metrics` is the daemon's event-time instrument set (`husk.metrics.Metrics`),
+    the same object the controllers and the poller record into. Omitted, `/metrics`
+    still serves everything derivable from the snapshot — which is what `huskctl`
+    and most tests want."""
     app = Quart(__name__)
+    registry = build_registry(
+        snapshot_provider, storage_provider=storage_provider, metrics=metrics
+    )
 
     def _snaps() -> list[ControllerState]:
         return snapshot_provider() or []
@@ -184,11 +136,11 @@ def make_app(
         return Response(_payload(), content_type="application/json")
 
     @app.get("/metrics")
-    async def metrics():
-        # Per-pool series are distinguished by the backend="..." label already on
-        # every metric, so concatenation across pools is a valid exposition.
-        body = "".join(render_prometheus(s) for s in _snaps())
-        return Response(body, content_type="text/plain; version=0.0.4; charset=utf-8")
+    async def metrics_endpoint():
+        # The collectors read the snapshot/storage providers themselves, so this
+        # is the whole handler: everything about which series exist, how they are
+        # labelled and how they are escaped lives in husk.metrics.
+        return Response(generate_latest(registry), content_type=CONTENT_TYPE_LATEST)
 
     @app.get("/sd/targets")
     async def sd_targets():
@@ -258,6 +210,8 @@ def make_app(
             body = await scraper.fetch(backend, view.host, view.ip)
         except GuestScrapeError as e:
             log.warning("guest scrape failed for %s/%s: %s", backend, slot, e)
+            if metrics is not None:
+                metrics.guest_scrape_failures.inc(backend)
             return Response(f"{e}\n", status=502)
         return Response(body, content_type="text/plain; version=0.0.4; charset=utf-8")
 

@@ -26,18 +26,20 @@ images:
     newTag: latest  # `just k8s-live-deploy` overwrites this with the sha- tag
 
 patches:
-  # Swap the base's emptyDir image cache for the PVC.
+  # Swap the base's emptyDir volumes for PVCs: the golden-image cache, and huskd's
+  # own metrics state.
   #
-  # This is a JSON6902 patch replacing the whole volume entry, NOT a strategic
-  # merge. A merge on `volumes` merges by name and would leave emptyDir AND
+  # These are JSON6902 patches replacing whole volume entries, NOT strategic
+  # merges. A merge on `volumes` merges by name and would leave emptyDir AND
   # persistentVolumeClaim both set on the volume, which the API server rejects
   # ($retainKeys is not honoured for an inline patch here). Replacing the entry
   # outright is unambiguous.
   #
-  # The index must match `image-cache`'s position in base/deployment.yaml
-  # (config, openstack, image-cache, run). `value` restates the name, so a
-  # wrong index shows up immediately in `just k8s-render cern` as a volume
-  # named image-cache in the wrong slot rather than as silent breakage.
+  # The indices must match base/deployment.yaml's volume order
+  # (config, openstack, image-cache, run, metrics-state). Each `value` restates
+  # the name, so a wrong index shows up immediately in `just k8s-render cern` as a
+  # volume named image-cache sitting in the wrong slot, rather than as silent
+  # breakage.
   - target:
       kind: Deployment
       name: huskd
@@ -48,3 +50,11 @@ patches:
           name: image-cache
           persistentVolumeClaim:
             claimName: huskd-image-cache
+      # Without this, huskd's counters reset on every pod restart — and since
+      # there is no config hot-reload, every config change IS a restart.
+      - op: replace
+        path: /spec/template/spec/volumes/4
+        value:
+          name: metrics-state
+          persistentVolumeClaim:
+            claimName: huskd-metrics-state

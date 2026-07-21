@@ -21,6 +21,7 @@ shrink_ticks = 3
 # image_cache_dir = "/var/cache/husk/images"   # optional; default ~/.cache/husk/images. Shared by every pool
 # Self-GC'd: a golden no pool still needs is dropped 24h after its last use, so the
 # cache holds the images in service plus roughly a day of rollout churn.
+# metrics_state_path = "/var/lib/husk/metrics.json"  # optional; keeps counters/histograms across restarts
 
 [[pool]]
 name = "libvirt-gpu"          # → backend name + default vm_prefix "husk-libvirt-gpu"

@@ -50,6 +50,11 @@ class SlotView:
     live_fraction: float | None = (
         None  # (busy+idle) / total tracked ("available to serve")
     )
+    # Cumulative seconds in each classified state, since the controller first saw
+    # this slot. `live_fraction` above is one ratio over these, precomputed for the
+    # dashboard; the raw seconds are what /metrics exposes, so a query can pick its
+    # own window instead of being stuck with "since huskd started".
+    state_seconds: dict[str, float] = field(default_factory=dict)
     boot_seconds: float | None = None  # spawn: issue→ACTIVE (controller clock)
     # systemd-analyze guest boot phases from the last husk-bootreport (seconds) —
     # a sub-breakdown of the cloud-init window, on the *guest's* clock.
@@ -173,6 +178,11 @@ class ControllerState:
                         else None
                     ),
                     live_fraction=round(lf, 3) if lf is not None else None,
+                    state_seconds=(
+                        {k: round(v, 1) for k, v in t.state_seconds.items()}
+                        if t is not None
+                        else {}
+                    ),
                     boot_seconds=_round1(
                         t.last_boot_seconds if t is not None else None
                     ),

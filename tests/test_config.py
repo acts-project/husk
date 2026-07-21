@@ -239,6 +239,44 @@ def test_image_cache_dir_lives_on_controller(tmp_path, monkeypatch):
     assert cfgs[0].controller == cfgs[1].controller  # shared across pools
 
 
+def _with_controller(tmp_path, monkeypatch, lines: str):
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    p = tmp_path / "multi.toml"
+    p.write_text(
+        _MULTI_TOML.replace(
+            '[controller]\nhttp_addr = "127.0.0.1:9100"\n',
+            f'[controller]\nhttp_addr = "127.0.0.1:9100"\n{lines}',
+        )
+    )
+    return str(p)
+
+
+def test_metrics_state_path_lives_on_controller(tmp_path, monkeypatch):
+    # Where huskd persists its accumulated counters/histograms. Daemon-wide, like
+    # the lock and the HTTP surface — one file for every pool.
+    p = _with_controller(
+        tmp_path, monkeypatch, 'metrics_state_path = "/var/lib/husk/metrics.json"\n'
+    )
+    cfgs = load_configs(p)
+    assert cfgs[0].controller.metrics_state_path == "/var/lib/husk/metrics.json"
+    assert cfgs[0].controller == cfgs[1].controller  # shared across pools
+
+
+def test_metrics_persistence_is_off_by_default(tmp_path, monkeypatch):
+    """Opt-in: without a writable path configured, huskd must not invent one and
+    start writing to the working directory."""
+    cfgs = load_configs(_with_controller(tmp_path, monkeypatch, ""))
+    assert cfgs[0].controller.metrics_state_path == ""
+
+
+def test_a_typo_in_metrics_state_path_fails_the_load(tmp_path, monkeypatch):
+    """Unknown keys are errors, not defaults — a silently-ignored key looks like it
+    took effect, and the operator only finds out when the counters reset anyway."""
+    p = _with_controller(tmp_path, monkeypatch, 'metrics_state_pth = "/typo"\n')
+    with pytest.raises(Exception, match="metrics_state_pth"):
+        load_configs(p)
+
+
 def test_stray_backend_image_cache_dir_is_rejected(tmp_path, monkeypatch):
     # image_cache_dir moved out of [pool.backend] onto [controller]. A leftover one
     # must fail the load, not be silently dropped: an ignored key looks like it took

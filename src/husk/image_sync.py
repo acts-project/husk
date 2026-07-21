@@ -35,6 +35,8 @@ import threading
 import time
 from dataclasses import dataclass
 
+from husk.storage import CACHE, DiskUsage
+
 log = logging.getLogger("husk.image")
 
 # How often to log registry-pull progress (MiB pulled so far) during a slow pull.
@@ -70,6 +72,11 @@ _GC_INTERVAL_S = 900
 # else a human parked in the cache dir is left alone.
 _DIGEST_DIR = re.compile(r"^sha\d+-[0-9a-f]{32,}$")
 
+# How long a cache-usage measurement is reused. The scan is a local scandir over
+# a handful of digest dirs (microseconds), but it is reached from the /metrics
+# handler, so a memo keeps a scrape storm off the disk entirely.
+_USAGE_TTL_S = 30.0
+
 
 def _default_cache_dir() -> str:
     return os.environ.get("HUSK_IMAGE_CACHE", _DEFAULT_CACHE)
@@ -78,6 +85,34 @@ def _default_cache_dir() -> str:
 def _dir_for(digest: str) -> str:
     """The cache subdir holding a digest's qcow2 (":" isn't a portable filename)."""
     return digest.replace(":", "-")
+
+
+def _fs_space(path: str) -> tuple[int | None, int | None]:
+    """(capacity, free) in bytes for the filesystem holding `path`, or (None, None).
+
+    Walks up to the nearest existing ancestor, because on a cold start the cache
+    directory has not been created yet while the volume under it very much exists —
+    and an ancestor on the same mount reports the same filesystem, which is the
+    thing we actually want to know about.
+
+    `f_bavail`, not `f_bfree`: the latter counts blocks reserved for root, which
+    huskd (running unprivileged) can never use. Reporting them as free would make
+    the volume look emptier than it is right when that matters most.
+
+    Best-effort — this feeds /metrics, so anything unmeasurable is None and the
+    series is simply omitted."""
+    while True:
+        try:
+            st = os.statvfs(path)
+            return st.f_frsize * st.f_blocks, st.f_frsize * st.f_bavail
+        except FileNotFoundError:
+            parent = os.path.dirname(path.rstrip(os.sep))
+            if not parent or parent == path:
+                return None, None
+            path = parent
+        except OSError:
+            log.debug("could not statvfs %s", path, exc_info=True)
+            return None, None
 
 
 class ImageSyncError(RuntimeError):
@@ -142,6 +177,8 @@ class ImageSync:
         self._pins: dict[str, set[str]] = {}
         self._active_tmp: set[str] = set()
         self._last_gc = 0.0
+        # Memoized cache_usage(): (measured_at, usage). Guarded by _locks_guard.
+        self._usage: tuple[float, "DiskUsage"] | None = None
 
     def _client_(self):
         # Two pool worker threads can race the first resolve; build the shared
@@ -357,6 +394,59 @@ class ImageSync:
             f"artifact {ref!r} has no {_QCOW2_MEDIA_TYPE} layer (layers: "
             f"{[layer.get('mediaType') for layer in layers]})"
         )
+
+    def cache_usage(self) -> DiskUsage:
+        """How many qcow2 images the controller cache holds, their total size, and
+        how full the filesystem underneath them is.
+
+        `gc` bounds this cache, so the image counts should sit near "the goldens
+        in service" and spike for a day around a rollout. A count that keeps
+        climbing means pins are not being released (or a pool stopped pinning) —
+        which is exactly the kind of drift worth a graph.
+
+        The filesystem figures answer the different question GC does not: how much
+        room is left. Those come apart, because the cache is not the only thing on
+        the volume and GC only reclaims what husk itself put there. On k8s this
+        directory is its own PVC, so this is the number that says whether the next
+        golden pull will fail.
+
+        Memoized for `_USAGE_TTL_S` because `/metrics` reads it. In-flight pulls
+        (`.pull-*` temp dirs) are excluded: they are not cache content yet, and
+        counting them would make the gauge sawtooth during a pull. A cache dir
+        that doesn't exist yet is 0/0, not an error."""
+        now = time.time()
+        with self._locks_guard:
+            if self._usage is not None and now - self._usage[0] < _USAGE_TTL_S:
+                return self._usage[1]
+        images = total = 0
+        try:
+            for entry in os.scandir(self.cache_dir):
+                if not entry.is_dir() or entry.name.startswith("."):
+                    continue
+                for name in os.listdir(entry.path):
+                    if not name.endswith(".qcow2"):
+                        continue
+                    try:
+                        total += os.path.getsize(os.path.join(entry.path, name))
+                    except OSError:
+                        continue  # vanished mid-scan (a concurrent re-pull swap)
+                    images += 1
+        except FileNotFoundError:
+            pass  # nothing pulled yet
+        except OSError:
+            log.debug("could not scan image cache %s", self.cache_dir, exc_info=True)
+        size, avail = _fs_space(self.cache_dir)
+        usage = DiskUsage(
+            kind=CACHE,
+            host="",
+            images=images,
+            total_bytes=total,
+            fs_size_bytes=size,
+            fs_avail_bytes=avail,
+        )
+        with self._locks_guard:
+            self._usage = (now, usage)
+        return usage
 
     @staticmethod
     def _qcow2_in(directory: str) -> str | None:

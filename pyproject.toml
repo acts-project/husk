@@ -19,6 +19,10 @@ dependencies = [
     # Retry/backoff for the in-process async-op registry (husk.ops) that runs the
     # slow image staging off the reconcile thread — replaces hand-rolled backoff.
     "tenacity>=8.2",
+    # Prometheus exposition: escaping, metric-family typing and `generate_latest`.
+    # husk registers *collectors* rather than library Gauge/Counter objects — see
+    # husk.metrics for why (labelsets that must expire, and state we persist).
+    "prometheus-client>=0.20",
     # huskd's single HTTP surface (dashboard + /status /metrics /healthz /events).
     # Quart shares one event loop with the runner poller and the reconcile tasks.
     # hypercorn is the ASGI server Quart's run_task drives.

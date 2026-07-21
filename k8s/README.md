@@ -138,6 +138,12 @@ steady-state footprint is *the goldens in service* plus a day of rollout churn �
 not every golden ever pulled. Abandoned `.pull-*` downloads (huskd killed
 mid-transfer) are swept too, after 6h.
 
+Note the scope: husk holds qcow2s in *three* places and now garbage-collects all
+three — the controller pull cache mounted here (`ImageSync.gc`), per-host goldens
+(`libvirt_backend._gc_goldens`) and Glance images
+(`openstack_backend._gc_glance`). They are independent sweeps with independent
+keep-sets, so a digest can persist in one and not another.
+
 Measured from the published artifacts (ghcr, 2026-07):
 
 | artifact | v3 | v4 |
@@ -151,6 +157,61 @@ a full cache fails the pull for a *new* golden, breaking exactly the rollout you
 were attempting. Check with `just k8s-live-cache`. Deleting digest directories
 under `/app/.cache/husk/images/` by hand is still safe while running (a deleted
 digest is re-pulled on next resolve), but shouldn't be necessary.
+
+Don't rely on remembering to check, though: huskd publishes this PVC's headroom on
+`/metrics`, so alert on it.
+
+```promql
+husk_filesystem_avail_bytes{kind="cache"}
+  / husk_filesystem_size_bytes{kind="cache"} < 0.15
+```
+
+That fires on *headroom* rather than a byte count, so it survives resizing the PVC.
+GC does not make it redundant: it bounds what *husk* puts on the volume and says
+nothing about anything else sharing it, and it cannot help if pins stop being
+released. Headroom is the measurement that stays true either way.
+
+**Verify it once on the cluster before trusting it.** huskd gets these from
+`statvfs`, and on CephFS statvfs reports the subvolume quota only if ceph-csi set
+one and `client_quota_df` is on. `just k8s-live-cache` prints `df -h` for exactly
+this: if Size reads ~50G the alert works; if it reads the whole Ceph cluster's
+capacity, `avail/size` never drops and the alert silently never fires — use
+`kubelet_volume_stats_available_bytes` instead, which is authoritative for PVCs.
+See "Headroom" in `observability.md`.
+
+### Metrics state (the second PVC)
+
+`huskd-metrics-state` (1Gi, mounted at `/var/lib/husk`) holds huskd's accumulated
+counters and histograms — action-failure counts, recycle-duration distributions,
+reconcile aborts. Without it they reset to zero on every pod restart, and since
+huskd has **no config hot-reload**, every config change is a restart. So
+`increase(husk_action_failures_total[30d])` would quietly only see back as far as
+the last deploy, and a "p95 recycle time this month" would really be "since the
+last ConfigMap edit".
+
+Two things make this cheap to reason about:
+
+- **It cannot grow with usage.** No event-time instrument carries a per-slot label
+  (there is a test asserting this), so the series count is bounded by config —
+  pools × actions × reasons × buckets — not by how many slots have passed through.
+  Measured: 3.4 KB for two pools after 500 recycles, and 11.7 KB for six pools with
+  every labelset populated — roughly the ceiling. 1Gi is just a comfortable
+  minimum request, not a sizing estimate.
+- **Losing it is not an incident.** huskd logs the failure and starts from zero,
+  which Prometheus reads as an ordinary counter reset. The same is true of a
+  corrupt file or a bucket-boundary change: the policy is "reset loudly", never a
+  migration.
+
+It is a **separate claim from the image cache** on purpose despite being tiny. The
+two have unrelated lifetimes and sizes four orders of magnitude apart, the cache is
+swept on its own schedule by `ImageSync.gc`, and it is the directory operators are
+pointed at when reclaiming space — so a state file parked inside it invites an
+`rm -rf` that takes the metrics with it.
+
+`Recreate` means the old pod detaches the volume before the new one attaches, so
+`ReadWriteOnce` is correct and there is no multi-writer window. huskd flushes every
+60s and once more on shutdown, so a clean rollout loses nothing and an ungraceful
+kill loses at most a minute.
 
 ## Not covered yet
 

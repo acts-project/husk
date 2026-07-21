@@ -28,6 +28,9 @@ shrink_ticks = 3
 # one). "off" | "dry-run" | "on" — scoped to this pool's vm_prefix, and never
 # deletes a registration a live slot might still be booting into.
 reap_runners = "dry-run"
+# On the `metrics-state` emptyDir here, so it resets with the pod — locally that is
+# what you want. The cern overlay backs the same path with a PVC.
+metrics_state_path = "/var/lib/husk/metrics.json"
 
 # ISOLATION — THE OPENSTACK PROJECT IS THE BOUNDARY.
 #

@@ -25,3 +25,35 @@ spec:
       #   kubectl exec deploy/huskd -n husk -- rm -rf /app/.cache/husk/images/sha256-<old>
       # (safe while running: a deleted digest is simply re-pulled on next resolve).
       storage: 50Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: huskd-metrics-state
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: cephfs-ssd-no-backup
+  resources:
+    requests:
+      # huskd's accumulated counters/histograms (controller.metrics_state_path).
+      #
+      # A SEPARATE claim from the image cache on purpose, despite being tiny.
+      # Their lifetimes are unrelated and their sizes differ by four orders of
+      # magnitude: the cache is swept on its own schedule by ImageSync.gc and is
+      # the directory operators are pointed at when reclaiming space, so parking
+      # a state file inside it invites an `rm -rf` that takes the metrics with it.
+      # Sharing would also couple this file's durability to a 50Gi volume sized
+      # for multi-GB churn.
+      #
+      # 1Gi is far more than the content needs, deliberately. This file cannot
+      # grow with usage at all: no event-time instrument carries a
+      # per-slot label (asserted by a test in tests/test_metrics.py), so the
+      # series count is bounded by config — pools x actions x reasons x buckets —
+      # not by how many slots have passed through. Measured: 3.4 KB for two pools
+      # after 500 recycles; 11.7 KB for six pools with EVERY labelset populated,
+      # which is about the ceiling.
+      #
+      # Losing this volume is not an incident: huskd logs it and starts every
+      # counter from zero, which Prometheus reads as an ordinary counter reset.
+      storage: 1Gi

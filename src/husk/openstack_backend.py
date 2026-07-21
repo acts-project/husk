@@ -26,6 +26,7 @@ from husk.config import BackendConfig
 from husk.image_sync import ImageSync
 from husk.ops import DONE, OpStore, OpView
 from husk.slot import Capacity, Slot
+from husk.storage import DiskUsage
 
 log = logging.getLogger("husk.openstack")
 
@@ -214,6 +215,13 @@ class OpenStackBackend:
 
     def slot_warnings(self) -> dict[str, tuple[float, str]]:
         return dict(self._warnings)
+
+    def disk_usage(self) -> list[DiskUsage]:
+        """Nothing: Nova/Glance own the storage, so there is no husk-managed
+        filesystem to measure here. The goldens this backend uploads live in
+        Glance (see `_gc_glance`), whose sizes come from the image listing rather
+        than a disk scan — a separate metric, not yet exposed."""
+        return []
 
     # ----------------------------------------------------------- image sync
     def sync_images(self, cfg: BackendConfig | None = None) -> None:

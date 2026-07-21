@@ -104,6 +104,13 @@ spec:
             # the lock must be per-pod, and the kernel drops it on crash.
             - name: run
               mountPath: /run/husk
+            # controller.metrics_state_path. huskd's accumulated counters and
+            # histograms (failure rates, recycle-duration distributions) — a few KB
+            # of JSON. emptyDir here means they reset on every pod restart, which is
+            # fine locally; the cern overlay swaps in a PVC so a config change (which
+            # always means a restart) doesn't silently truncate a 30d query window.
+            - name: metrics-state
+              mountPath: /var/lib/husk
           livenessProbe:
             httpGet:
               path: /healthz
@@ -146,4 +153,9 @@ spec:
         - name: image-cache
           emptyDir: {}
         - name: run
+          emptyDir: {}
+        # NB overlays patch volumes BY INDEX (JSON6902 — see overlays/cern). Append
+        # new entries at the end; inserting one above shifts every later index and
+        # silently repoints an existing patch at the wrong volume.
+        - name: metrics-state
           emptyDir: {}

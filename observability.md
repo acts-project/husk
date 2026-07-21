@@ -29,10 +29,10 @@ left open.
 > still unknown for OpenStack (see open questions: it depends on where central
 > Prometheus lives, and it's fail-closed until set).
 >
-> The pre-existing controller `/metrics` endpoint (`src/husk/web/app.py`,
-> `render_prometheus`) continues to expose the state-derived per-pool / per-slot
-> gauges (`husk_slots*`, `husk_slot_last_cloudinit_seconds`,
-> `husk_slot_last_recycle_seconds`, `husk_slot_live_fraction`).
+> The controller `/metrics` endpoint now renders from a `prometheus_client`
+> `CollectorRegistry` (`src/husk/metrics.py`) instead of hand-built strings. See
+> **huskd's own metrics** below for the snapshot/event-time split, what changed
+> names, and how counters are persisted across restarts.
 
 -----
 
@@ -319,9 +319,11 @@ image or set up once per host.**
 3. **The `husk_slot_info` join table** on `/metrics`:
    ```
    husk_slot_info{backend="cern-cpu", slot="...", ip="...",
-                  runner_name="...", job_id="...", cycle="...",
-                  image_digest="..."} 1
+                  host="...", runner="..."} 1
    ```
+   Note `cycle` is **not** a label here (it is `husk_slot_cycle`): it increments
+   on every recycle, so as a label it minted a fresh series per recycle — exactly
+   the churn this join table exists to avoid.
    This is what makes `node_*` (keyed by IP) legible as pool/job. huskd already
    owns every one of these labels.
 4. **Discovery — a single `http_sd` endpoint** (a Quart route, `GET /sd/targets`)
@@ -382,12 +384,272 @@ what remains here is unrelated to metrics collection:
 |---|---|---|---|
 | Boot-timing metrics | ✅ parse + expose | — | serial-log fix (libvirt only) |
 | `husk_slot_info` join | ✅ | — | — |
+| qcow2 storage usage | ✅ cache scan + per-host `stat` | — | — |
 | Discovery (`http_sd`, single feed) | ✅ | — | — |
 | `:9100` ingress rule | ✅ (cloud-init, `scrape_cidr`) | — | — |
 | node_exporter (no TLS/auth) | — | ✅ baked (primary per-VM source, both backends) | — |
 | Guest bridge (libvirt) | ✅ `/slot/<pool>/<slot>/metrics` over its existing SSH channel | — | **nothing** |
 | Scrape transport | — | — | central → huskd → ssh → guest (libvirt); direct pull (OpenStack) |
 | Optional per-domain metrics | — | — | optional `prometheus-libvirt-exporter` |
+
+-----
+
+## huskd's own metrics
+
+Everything above is about the *fleet*. This section is about **layer 1** — huskd's
+own `/metrics`, which is scraped as one static target and describes the control
+plane itself.
+
+It is built from a `prometheus_client` `CollectorRegistry` (`src/husk/metrics.py`)
+split into two halves that behave very differently.
+
+### Snapshot-derived — `SnapshotCollector`
+
+`husk_slots*`, `husk_slot_last_*_seconds`, `husk_slot_boot_seconds`,
+`husk_slot_cycle`, `husk_slot_info`, `husk_image*`. These describe the **present**,
+and huskd already holds a complete immutable description of the present: the
+per-pool `ControllerState` the reconcile loop swaps in each tick. They are rendered
+straight from it at scrape time and are never stored.
+
+These are registered as a **collector**, not as library `Gauge` objects, and that
+distinction is load-bearing. A `Gauge`'s labelsets never expire, so
+`Gauge.labels(slot="husk-a-7").set(...)` keeps reporting a slot forever after it is
+destroyed — you would have to hand-roll clear-and-repopulate every tick. A
+collector reads the current snapshot, so a destroyed slot simply produces no
+sample and Prometheus's own staleness handling finishes the job.
+
+### Event-time — `Metrics`
+
+`husk_reconcile_ticks_total`, `husk_reconcile_aborts_total`,
+`husk_reconcile_duration_seconds`, `husk_action_failures_total`,
+`husk_slots_created_total`, `husk_slots_destroyed_total`,
+`husk_slot_recycles_total`, `husk_recycle_duration_seconds`,
+`husk_cloudinit_duration_seconds`, `husk_boot_phase_seconds`,
+`husk_github_polls_total`, `husk_github_poll_failures_total`,
+`husk_guest_scrape_failures_total`.
+
+These describe **what happened between scrapes**, which no snapshot can express: a
+rebuild that failed and was retried leaves no trace in the current state, and a
+failed GitHub poll deliberately leaves the last good snapshot published. They are
+recorded as they occur (in `Controller` and `RunnerPoller`) and accumulate across
+ticks.
+
+The two most operationally valuable, and the reason this half exists:
+
+- **`husk_reconcile_aborts_total{backend,reason}`** — huskd is up, scraping fine,
+  and has silently stopped acting on reality. `reason` separates a backend listing
+  failure from a stale/absent GitHub runner snapshot, which have different fixes.
+  ```promql
+  increase(husk_reconcile_aborts_total[15m]) > 0
+  ```
+- **`husk_action_failures_total{backend,action}`** — rebuild/create/destroy/… that
+  failed. Previously these were only pinned to a slot as a dashboard string, so
+  "rebuild failure rate climbed after the image bump" was unanswerable.
+
+`action` is the **verb only**. The controller's internal descriptions embed the
+slot id for the log line (`"destroy vm-abc123"`); `_action()` strips it, because a
+slot id in a label mints a new series per slot per action and leaves it behind.
+
+**Cardinality rule, enforced by a test:** no event-time instrument carries a
+per-slot label. Every label value comes from config (pool names, target keys) or a
+fixed vocabulary (action, reason, phase). Per-slot detail lives only in the
+snapshot half, where it expires on its own.
+
+### Histograms vs. the "last value" gauges
+
+`husk_slot_last_recycle_seconds` is a gauge holding one slot's most recent
+bring-up. It answers "why is *this* slot slow" — which is what the dashboard wants
+— but it cannot answer "what is the p95 over the last day, and did it move when we
+bumped the image": `quantile()` over a gauge is the quantile *across slots at one
+instant*, not across events over time.
+
+So both exist. The gauges stayed; `husk_recycle_duration_seconds`,
+`husk_cloudinit_duration_seconds` and `husk_boot_phase_seconds` were added as
+histograms, observed at the moment a bring-up completes.
+
+```promql
+histogram_quantile(0.95, sum by (le, backend) (
+  rate(husk_recycle_duration_seconds_bucket[6h])))
+```
+
+Bucket bounds are in `husk.metrics` (`BRINGUP_BUCKETS`, `BOOT_BUCKETS`,
+`TICK_BUCKETS`). The library defaults top out at 10s, which is useless here — a
+slot bring-up is a minute or more.
+
+### `husk_slot_state_seconds_total` replaces `husk_slot_live_fraction`
+
+`live_fraction` was a ratio computed inside husk over "all time since huskd
+started". That fixes the window at query time and resets silently on restart, so
+"live fraction over the last hour" was unanswerable. The raw seconds are exposed
+instead — the accumulator (`SlotTiming.state_seconds`) already existed — and the
+ratio is derived in PromQL, over whatever window you like:
+
+```promql
+sum by (backend, slot) (rate(husk_slot_state_seconds_total{state=~"busy|idle"}[1h]))
+/ sum by (backend, slot) (rate(husk_slot_state_seconds_total[1h]))
+```
+
+It lives in the *snapshot* half despite being a counter, because it is per-slot and
+its accumulator is owned by the slot — so it must expire when the slot does.
+
+`live_fraction` is still in `/status` for the dashboard, which has no PromQL to
+divide with.
+
+### Persistence across restarts
+
+huskd restarts on every config change (there is no hot reload), and a restart zeros
+every counter. Prometheus copes — `rate()` treats a drop as a reset — but the
+long-horizon questions quietly stop working: `increase(husk_action_failures_total[30d])`
+after a deploy only sees failures since the deploy.
+
+Set `controller.metrics_state_path` and the event-time half is written to a small
+JSON file (a few KB; a modest PVC is plenty) every 60s and once more on shutdown,
+then folded back in at startup. Unset ⇒ disabled, everything starts from zero.
+
+Only `Metrics` is persisted — never the snapshot half, which is re-derived from
+live state on every scrape. **No slot state is stored here**; slots are still
+re-adopted from backend metadata on the first tick, as before.
+
+Writes are atomic (temp file in the same directory, then `os.replace`), and every
+failure mode is non-fatal: a corrupt file, a schema-version mismatch, or changed
+bucket bounds all mean "start that metric from zero, loudly". There is deliberately
+**no migration path** — half-restored data is worse than a clean reset, because a
+counter that silently loses part of its history is indistinguishable from one that
+is simply low. A save failure (full or read-only PVC) is logged and ignored; a
+bookkeeping file must never take down a runner fleet.
+
+### Renames
+
+Per husk's no-back-compat rule, these changed outright rather than being aliased:
+
+| Before | After | Why |
+|---|---|---|
+| `husk_reconcile_generation` | `husk_reconcile_generation_total` | it declared `TYPE counter` while omitting the suffix |
+| `husk_slot_info{...,cycle="N"}` | `husk_slot_cycle{backend,slot}` | a label that churned a new series every recycle |
+| `husk_slot_live_fraction` | `husk_slot_state_seconds_total{...,state}` | a baked-in ratio can't be re-windowed |
+
+Label **names** are also now emitted alphabetically (prometheus_client normalizes
+them). Label order is not semantically meaningful, but it will change the text of
+any hand-written diff or golden-file test.
+
+-----
+
+## qcow2 storage usage
+
+`/metrics` carries one **daemon-wide** block (no `backend` label — see below)
+counting the qcow2 images husk has put on disk:
+
+```
+husk_images{host="",kind="cache"}            2.0
+husk_image_bytes{host="",kind="cache"}       7516192768.0
+husk_images{host="gpu-1",kind="golden"}      1.0
+husk_image_bytes{host="gpu-1",kind="golden"} 3221225472.0
+husk_images{host="gpu-1",kind="overlay"}     4.0
+husk_image_bytes{host="gpu-1",kind="overlay"} 88604672.0
+```
+
+Three populations, two machines (`storage.py`):
+
+- **`cache`** — the controller-local OCI pull cache (`~/.cache/husk/images`).
+  `ImageSync.gc` evicts a digest no pool pins 24h after its last use, so this
+  should sit at the goldens in service and spike for about a day around a
+  rollout. A count that climbs and never comes back down means pins aren't being
+  released — the drift this gauge exists to show.
+- **`golden`** — the backing files staged into each hypervisor's storage pool.
+  `_gc_goldens` prunes unreferenced ones, so this should stay flat across a
+  rollout, briefly doubling while the new golden lands.
+- **`overlay`** — per-slot COW disks. Grows with runner churn; this is the
+  series that actually predicts a full hypervisor disk.
+
+**No `backend` label, deliberately.** The cache is shared by every pool, and two
+libvirt pools can target one hypervisor's storage pool dir — a per-pool label
+would make `sum(husk_image_bytes)` double-count a disk that only filled once.
+`storage.collect` dedupes by `(host, kind)` for the same reason. Labels stop at
+`kind`/`host`: per-image series would churn on every image bump for no
+analytical gain.
+
+Neither side does I/O during a scrape. Hosts are `stat`'d once per reconcile
+tick (one command, riding the existing `sync_images` pass) and `/metrics` reads
+the cached result, so a wedged hypervisor can't stall a scrape; the controller
+cache scan is local and memoized for 30s. A host that can't be reached keeps its
+last-known numbers rather than reporting zero — a transient SSH failure must not
+look like a disk that emptied itself.
+
+OpenStack pools report no host rows: Nova/Glance own that storage. The Glance
+image listing already returns per-image sizes (`_gc_glance`), so a `kind="glance"`
+row is a small follow-up, not yet exposed.
+
+### Headroom — what actually predicts the outage
+
+`husk_image_bytes` says how much husk is *holding*. It does not say how much room
+is left, and those come apart: on Kubernetes the pull cache is its own PVC whose
+capacity huskd cannot otherwise see, and a hypervisor's storage pool shares a disk
+with everything else on that box, so husk's footprint can be flat while the volume
+fills anyway.
+
+So `/metrics` also carries the filesystem behind each location, named after
+node_exporter's equivalents so the alerting idiom carries straight over:
+
+```
+husk_filesystem_size_bytes{host="",kind="cache"}   53687091200.0
+husk_filesystem_avail_bytes{host="",kind="cache"}  42949672960.0
+```
+
+The alert you actually want on the cache PVC — it fires on *headroom*, so it stays
+correct if the PVC is resized. `ImageSync.gc` does not make it redundant: GC bounds
+what *husk* puts on the volume, and says nothing about anything else sharing it or
+about pins that stop being released.
+
+```promql
+husk_filesystem_avail_bytes{kind="cache"}
+  / husk_filesystem_size_bytes{kind="cache"} < 0.15
+```
+
+Running out is not cosmetic: a full cache fails the pull for a **new** golden,
+breaking exactly the rollout you were attempting.
+
+With GC in place the expected shape is a *sawtooth*, not a ramp — a bump adds a
+golden, and the superseded one is reclaimed 24h later. So a `predict_linear` is
+still worth having, but window it well past that 24h so the teeth average out;
+what it catches is the case GC cannot, a digest that stays pinned forever:
+
+```promql
+predict_linear(husk_filesystem_avail_bytes{kind="cache"}[7d], 14*86400) < 0
+```
+
+Caveats, in order of how likely they are to bite:
+
+- **What `statvfs` reports depends on the storage class — VERIFY THIS ONCE.** The
+  mechanism is the same one `df` and node_exporter use, and a filesystem-mode PVC
+  is an ordinary mount, so it always returns *something*. Whether that something is
+  the PVC's size is the question:
+  - block-backed claims (RBD, EBS, Cinder) sit on a device sized to the claim, so
+    they report the claim. Correct.
+  - **CephFS — what `cephfs-ssd-no-backup` is** — reports the subvolume's
+    `ceph.quota.max_bytes` *if* ceph-csi set one and `client_quota_df` is enabled
+    (both are defaults). If either isn't true, statvfs reports the whole Ceph
+    cluster's capacity, `avail/size` sits near 1.0 forever, and **the alert above
+    silently never fires**.
+  - `emptyDir` and k3s local-path report the *node's* disk, not any limit. So the
+    local overlay's numbers describe your colima VM, not a quota.
+
+  One command settles it on the real cluster: `just k8s-live-cache` now prints
+  `df -h` alongside `du`. If Size reads ~50G the alert is good; if it reads tens of
+  TB, fall back to `kubelet_volume_stats_available_bytes` (authoritative for PVCs,
+  published by the kubelet) or alert on absolute `husk_image_bytes` growth instead.
+- **`avail`, not `free`.** These come from `statvfs(f_bavail)`, which excludes
+  root-reserved blocks huskd can never use. It is the space huskd actually has.
+- **Do not `sum()` them.** They describe a *filesystem*, so if two `kind`s ever
+  share one disk they report identical numbers; aggregate with `max()`/`avg()`.
+  Today only `kind="cache"` reports them — the backends do not measure their
+  hosts' filesystems yet, and a location with no measurement omits the series
+  rather than emitting a `0` that would read as "completely full".
+
+Given the first caveat, `kubelet_volume_stats_*` is the more authoritative source
+for the PVC specifically. The husk-side series exist because they don't depend on
+cluster metrics being scraped, and because they extend to the libvirt hosts, which
+are not in the cluster at all — but if the two disagree about the cache volume,
+believe the kubelet.
 
 -----
 

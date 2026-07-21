@@ -612,9 +612,25 @@ k8s-reap confirm="":
     kubectl exec -n {{k8s_namespace}} deployment/huskd -- huskctl reap --config /etc/husk/config.toml
 
 # huskd evicts unpinned goldens itself — see the sizing note in k8s/overlays/cern/pvc.yaml.
-# Show how much of the golden-image cache PVC is in use.
+#
+# `df` is NOT redundant with du. GC bounds what husk puts on the volume; it says
+# nothing about what else is on it, and df is the only view of that. It also tells
+# you whether huskd's husk_filesystem_* metrics mean anything here: those come from
+# statvfs, and on CephFS statvfs reports the subvolume QUOTA only if ceph-csi set
+# one and client_quota_df is on. If Size shows ~50G the headroom alert works; if it
+# shows the whole Ceph cluster's capacity it does not — fall back to
+# kubelet_volume_stats_* (authoritative for PVCs).
+# Show golden-image cache usage (du) and the PVC's real capacity/headroom (df).
 k8s-live-cache:
     oc exec -n {{k8s_namespace}} deployment/huskd -- du -sh /app/.cache/husk/images/
+    oc exec -n {{k8s_namespace}} deployment/huskd -- df -h /app/.cache/husk/images/
+
+# Confirms the metrics PVC is actually being written — the thing that is easy to
+# get wrong (a read-only mount) fails SILENTLY by design: huskd logs a warning and
+# carries on rather than dying over a bookkeeping file. So check the mtime moves.
+# Show huskd's persisted metrics state (size + when it was last flushed).
+k8s-live-metrics-state:
+    oc exec -n {{k8s_namespace}} deployment/huskd -- ls -l --time-style=full-iso /var/lib/husk/metrics.json
 
 # ── openstack ───────────────────────────────────────────────────────────────
 
