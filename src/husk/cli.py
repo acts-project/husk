@@ -403,9 +403,14 @@ def run(
         # per content digest and the controller cache is shared across all pools.
         from husk.discovery import TargetDiscovery
         from husk.image_sync import ImageSync
+        from husk.metrics import Metrics
         from husk.poller import RunnerPoller, SnapshotRegistry
 
         image_sync = ImageSync(shared.image_cache_dir or None)
+        # One instrument set for the daemon: every pool's Controller and the
+        # poller record into it, and `/metrics` renders it. Restored from disk
+        # below (in _serve) so counters survive a restart.
+        metrics = Metrics()
         # One registry for the whole daemon: the centralized poller writes each
         # target's runner listing here and every pool's reconcile task reads it.
         registry = SnapshotRegistry()
@@ -416,6 +421,7 @@ def run(
             # Cadence follows the most eager pool, so no pool ever reads a snapshot
             # older than its own tick interval.
             interval=min(c.timeouts.poll_interval_sec for c in cfgs),
+            metrics=metrics,
         )
         # One Controller per [[pool]] — each names the one target it serves. A pool
         # that can't be built (bad backend config, unreachable cloud) is skipped
@@ -435,7 +441,14 @@ def run(
                 cfg, controller=dataclasses.replace(cfg.controller, http_addr="")
             )
             controllers.append(
-                Controller(backend, github, sub, target=cfg.target, registry=registry)
+                Controller(
+                    backend,
+                    github,
+                    sub,
+                    target=cfg.target,
+                    registry=registry,
+                    metrics=metrics,
+                )
             )
         if not controllers:
             typer.echo("no pools could be started", err=True)
@@ -474,6 +487,8 @@ def run(
                     ssh_targets=ssh_targets,
                     advertise_addr=shared.advertise_addr or shared.http_addr,
                     image_sync=image_sync,
+                    metrics=metrics,
+                    metrics_state_path=shared.metrics_state_path,
                 )
             )
     finally:
@@ -517,6 +532,8 @@ async def _serve(
     ssh_targets: dict[tuple[str, str], str] | None = None,
     advertise_addr: str = "",
     image_sync=None,
+    metrics=None,
+    metrics_state_path: str = "",
 ) -> None:
     """Run the whole daemon on this one event loop: the centralized runner poller,
     every pool's reconcile task, and Quart serving each endpoint. SIGINT/SIGTERM
@@ -534,6 +551,16 @@ async def _serve(
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
 
+    # Restore accumulated counters BEFORE anything can record into them — the
+    # store folds saved totals in additively, so a poll or tick that landed first
+    # would survive, but only by luck of ordering. Loading here makes it explicit.
+    store = None
+    if metrics is not None and metrics_state_path:
+        from husk.metrics_store import MetricsStore
+
+        store = MetricsStore(metrics_state_path, metrics)
+        store.load()
+
     scraper = GuestScraper(ssh_targets) if ssh_targets else None
     # Discover the target set, then warm its registry entries, both before the
     # first ticks: otherwise the opening tick of every pool would fail-safe purely
@@ -545,6 +572,10 @@ async def _serve(
         asyncio.create_task(poller.run(stop), name="husk-poller"),
         asyncio.create_task(facade.run(stop), name="husk-reconcile"),
     ]
+    if store is not None:
+        tasks.append(
+            asyncio.create_task(_save_metrics(store, stop), name="husk-metrics")
+        )
     try:
         host, port = parse_addr(http_addr)
         display_host = "127.0.0.1" if host == "0.0.0.0" else host
@@ -562,6 +593,7 @@ async def _serve(
                 storage_provider=lambda: collect_storage(
                     image_sync, [c.backend for c in facade.controllers]
                 ),
+                metrics=metrics,
             ),
             host,
             port,
@@ -573,6 +605,25 @@ async def _serve(
         await _shutdown(facade, discovery, tokens)
         if scraper is not None:
             scraper.close()  # drop the multiplexed SSH control sockets
+
+
+async def _save_metrics(store, stop: asyncio.Event) -> None:
+    """Flush accumulated metrics to disk periodically, and once more on shutdown.
+
+    The periodic flush is what bounds the loss from an *ungraceful* exit (OOM kill,
+    node eviction) to one interval; the final flush is what makes an ordinary
+    restart lossless. `store.save()` never raises — a full or read-only PVC must
+    not take the daemon down over a bookkeeping file — so this loop cannot die."""
+    from husk.aio import sleep_or_stop
+    from husk.metrics_store import SAVE_INTERVAL_S
+
+    try:
+        while not stop.is_set():
+            await sleep_or_stop(stop, SAVE_INTERVAL_S)
+            store.save()
+    except asyncio.CancelledError:
+        pass
+    store.save()
 
 
 # ------------------------------------------------------------------- huskctl

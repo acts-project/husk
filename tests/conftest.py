@@ -29,6 +29,25 @@ from husk.target import Target
 TEST_TARGET = Target.org("acts-project")
 
 
+def render_metrics(snapshots=(), *, storage=None, metrics=None) -> str:
+    """The `/metrics` body for the given state, without standing up a server.
+
+    Assertions throughout the suite are written against this text rather than
+    against collector objects on purpose: the exposition *is* the contract, and
+    the escaping/naming/bucket details worth testing only exist once it has been
+    serialized."""
+    from prometheus_client import generate_latest
+
+    from husk.web import build_registry
+
+    registry = build_registry(
+        lambda: list(snapshots),
+        storage_provider=(lambda: list(storage)) if storage is not None else None,
+        metrics=metrics,
+    )
+    return generate_latest(registry).decode()
+
+
 class FakeClock:
     def __init__(self, t: float = 1000.0) -> None:
         self.t = t

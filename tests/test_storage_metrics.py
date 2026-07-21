@@ -5,9 +5,9 @@ from __future__ import annotations
 
 import os
 
+from conftest import render_metrics
 from husk.image_sync import ImageSync
 from husk.storage import CACHE, GOLDEN, OVERLAY, DiskUsage, collect
-from husk.web import render_storage_prometheus
 
 
 def _qcow2(path: str, size: int) -> None:
@@ -112,24 +112,28 @@ def test_collect_survives_a_failing_backend_and_cache():
 
 # ------------------------------------------------------------------- rendering
 def test_render_storage_exposition():
-    body = render_storage_prometheus(
-        [
+    body = render_metrics(
+        storage=[
             DiskUsage(kind=CACHE, host="", images=2, total_bytes=350),
             DiskUsage(kind=GOLDEN, host="hv1", images=1, total_bytes=100),
         ]
     )
 
-    assert 'husk_images{kind="cache",host=""} 2' in body
-    assert 'husk_image_bytes{kind="cache",host=""} 350' in body
-    assert 'husk_images{kind="golden",host="hv1"} 1' in body
-    assert 'husk_image_bytes{kind="golden",host="hv1"} 100' in body
-    # No backend label: these are daemon-wide, not per-pool.
-    assert "backend=" not in body
-    assert body.count("# TYPE") == 2
+    # Label names come out alphabetically ordered (host before kind) — the format
+    # does not treat label order as meaningful.
+    assert 'husk_images{host="",kind="cache"} 2.0' in body
+    assert 'husk_image_bytes{host="",kind="cache"} 350.0' in body
+    assert 'husk_images{host="hv1",kind="golden"} 1.0' in body
+    assert 'husk_image_bytes{host="hv1",kind="golden"} 100.0' in body
+    # No backend label on the storage series: these are daemon-wide, not per-pool
+    # (two pools can share a hypervisor's storage dir).
+    for line in body.splitlines():
+        if line.startswith(("husk_images", "husk_image_bytes")):
+            assert "backend=" not in line
 
 
 def test_render_storage_with_nothing_measured_still_emits_headers():
-    body = render_storage_prometheus([])
+    body = render_metrics(storage=[])
 
     assert "# TYPE husk_images gauge" in body
     assert "# TYPE husk_image_bytes gauge" in body

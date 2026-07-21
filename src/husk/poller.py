@@ -28,6 +28,7 @@ import time
 from typing import Awaitable, Callable
 
 from husk.aio import sleep_or_stop
+from husk.metrics import Metrics
 from husk.slot import Runner
 from husk.target import Target
 
@@ -82,10 +83,16 @@ class RunnerPoller:
         listers: dict[Target, RunnerLister],
         *,
         interval: float,
+        metrics: Metrics | None = None,
     ) -> None:
         self._registry = registry
         self._listers = dict(listers)
         self._interval = interval
+        # A failed poll is invisible in any snapshot — the last good listing stays
+        # published, which is the whole point of the failure policy above. Counting
+        # it here is the only way to see a GitHub problem before it ages a snapshot
+        # out and starts aborting ticks.
+        self._metrics = metrics or Metrics()
 
     @property
     def targets(self) -> list[Target]:
@@ -109,6 +116,7 @@ class RunnerPoller:
         # Snapshot the mapping: discovery can add/remove targets while this pass
         # awaits, and mutating a dict mid-iteration would raise.
         for target, lister in list(self._listers.items()):
+            self._metrics.github_polls.inc(target.key)
             try:
                 runners = await lister()
             except Exception:
@@ -117,6 +125,7 @@ class RunnerPoller:
                     target,
                     exc_info=True,
                 )
+                self._metrics.github_poll_failures.inc(target.key)
                 continue
             self._registry.publish_runners(target, runners)
             log.debug("polled %s -> %d runner(s)", target, len(runners))

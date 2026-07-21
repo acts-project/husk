@@ -228,6 +228,12 @@ class ControllerConfig:
     # registrations that are in use. Watch dry-run for a while before enabling.
     # Always scoped to the pool's own vm_prefix, in every mode.
     reap_runners: str = "off"
+    # Where huskd persists its accumulated counters/histograms across restarts
+    # ("" → disabled, everything starts from zero on every boot). A small JSON
+    # file, meant for a modest PVC; see husk.metrics_store for the format and the
+    # failure policy. Only event-time metrics are stored — never slot state, which
+    # is always re-adopted from backend metadata.
+    metrics_state_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -505,6 +511,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         # Literal, not a bool: a typo like "yes" must fail at load rather than
         # quietly reading as falsy and leaving orphans to pile up unnoticed.
         reap_runners: Literal["off", "dry-run", "on"] = "off"
+        metrics_state_path: str = ""
 
         @field_validator("http_addr")
         @classmethod
@@ -595,6 +602,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         advertise_addr=s.controller.advertise_addr,
         image_cache_dir=s.controller.image_cache_dir,
         reap_runners=s.controller.reap_runners,
+        metrics_state_path=s.controller.metrics_state_path,
     )
 
     configs = [_pool_config(p, github, controller) for p in s.pool]

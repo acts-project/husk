@@ -12,11 +12,17 @@ from dataclasses import replace
 
 import pytest
 
-from conftest import make_config, make_runner, make_slot, serve_in_thread
+from conftest import (
+    make_config,
+    make_runner,
+    make_slot,
+    render_metrics,
+    serve_in_thread,
+)
 from husk.slot import SlotState
 from husk.snapshot import ControllerState
 from husk.storage import DiskUsage
-from husk.web import make_app, parse_addr, render_prometheus
+from husk.web import make_app, parse_addr
 
 
 def _snap(backend="pool-a", *, busy=False):
@@ -51,9 +57,9 @@ def test_parse_addr(addr, expected):
 
 
 def test_render_prometheus():
-    text = render_prometheus(_snap(backend="openstack-cern", busy=True))
-    assert 'husk_slots{backend="openstack-cern",state="busy"} 1' in text
-    assert 'husk_slots_max_total{backend="openstack-cern"} 4' in text
+    text = render_metrics([_snap(backend="openstack-cern", busy=True)])
+    assert 'husk_slots{backend="openstack-cern",state="busy"} 1.0' in text
+    assert 'husk_slots_max_total{backend="openstack-cern"} 4.0' in text
     assert "husk_last_reconcile_timestamp_seconds" in text
 
 
@@ -78,12 +84,14 @@ def test_render_prometheus_boot_seconds():
         classified=classified,
         timing={"vm-1": t},
     )
-    text = render_prometheus(state)
+    # NB label names come out alphabetically ordered — the exposition format does
+    # not treat label order as meaningful, and prometheus_client normalizes it.
+    text = render_metrics([state])
     assert (
-        'husk_slot_boot_seconds{backend="pool-a",slot="husk-a-1",phase="total"} 15.6'
+        'husk_slot_boot_seconds{backend="pool-a",phase="total",slot="husk-a-1"} 15.6'
         in text
     )
-    assert 'phase="kernel"} 2.1' in text
+    assert 'phase="kernel",slot="husk-a-1"} 2.1' in text
     # initrd was None -> the series is omitted, not emitted as 0.
     assert 'phase="initrd"' not in text
 
@@ -137,11 +145,15 @@ def test_render_prometheus_slot_info():
             SlotState.IDLE,
         )
     )
-    text = render_prometheus(snap)
+    text = render_metrics([snap])
     assert (
-        'husk_slot_info{backend="pool-a",slot="husk-a-1",ip="10.1.2.3",'
-        'host="",runner="run-x",cycle="2"} 1' in text
+        'husk_slot_info{backend="pool-a",host="",ip="10.1.2.3",'
+        'runner="run-x",slot="husk-a-1"} 1.0' in text
     )
+    # `cycle` is a value, not an identity: as a label it minted a fresh series on
+    # every recycle, which is unbounded churn for a join table.
+    assert "cycle=" not in text
+    assert 'husk_slot_cycle{backend="pool-a",slot="husk-a-1"} 2.0' in text
 
 
 def _sd_get(app):
@@ -301,15 +313,20 @@ def test_metrics_emits_storage_once_across_pools():
 
     assert code == 200
     assert body.count(b"# TYPE husk_image_bytes gauge") == 1
-    assert body.count(b'husk_image_bytes{kind="cache",host=""} 350') == 1
+    assert body.count(b'husk_image_bytes{host="",kind="cache"} 350.0') == 1
     assert b'husk_slots_desired{backend="pool-b"}' in body  # pool metrics intact
 
 
-def test_metrics_without_a_storage_provider_omits_the_block():
+def test_metrics_without_a_storage_provider_emits_no_storage_samples():
+    """The family is still declared (HELP/TYPE with no samples is valid, and keeps
+    the metric's existence discoverable) — but nothing is measured, so no series."""
     code, body = _client_get(make_app(lambda: [_snap()]), "/metrics")
 
     assert code == 200
-    assert b"husk_image_bytes" not in body
+    assert b"# TYPE husk_image_bytes gauge" in body
+    assert not [
+        ln for ln in body.decode().splitlines() if ln.startswith("husk_image_bytes{")
+    ]
 
 
 def test_healthz_ok_when_fresh():

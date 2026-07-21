@@ -5,10 +5,9 @@ runs the centralized runner poller and every pool's reconcile task (see
 
 from husk.web.app import (
     STALE_AFTER_SEC,
+    build_registry,
     make_app,
     parse_addr,
-    render_prometheus,
-    render_storage_prometheus,
     serve_app,
 )
 
@@ -16,7 +15,6 @@ __all__ = [
     "make_app",
     "serve_app",
     "parse_addr",
-    "render_prometheus",
-    "render_storage_prometheus",
+    "build_registry",
     "STALE_AFTER_SEC",
 ]

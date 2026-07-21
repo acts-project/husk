@@ -25,6 +25,7 @@ from husk.bootreport import parse_bootreport
 from husk.cloudinit import render_cloud_init
 from husk.config import Config
 from husk.demand import DemandRegistry
+from husk.metrics import Metrics
 from husk.poller import SnapshotRegistry
 from husk.slot import (
     Runner,
@@ -73,6 +74,16 @@ def _fmt(v: float | None) -> str:
     return f"{v:.0f}" if v is not None else "?"
 
 
+def _action(what: str) -> str:
+    """The metric label for a `_safe()` action description.
+
+    Descriptions carry the slot id for the log line (`"destroy vm-abc123"`), which
+    must never reach a label — that would mint a new series per slot per action and
+    leave it behind forever. Only the leading verb is kept, which comes from a
+    fixed vocabulary in this file."""
+    return what.split(" ", 1)[0]
+
+
 class Controller:
     def __init__(
         self,
@@ -85,6 +96,7 @@ class Controller:
         demand: DemandRegistry | None = None,
         registry: SnapshotRegistry | None = None,
         runner_snapshot_max_age: float = RUNNER_SNAPSHOT_MAX_AGE_S,
+        metrics: Metrics | None = None,
     ) -> None:
         self.backend = backend
         self.github = github
@@ -105,6 +117,11 @@ class Controller:
         # batched behind a poll.
         self.registry = registry or SnapshotRegistry()
         self._runner_max_age = runner_snapshot_max_age
+        # Event-time instruments, shared across every pool in the daemon (huskd
+        # builds one and hands it to each Controller). Defaulting to a private
+        # instance keeps every instrumented path exercised in tests and on the
+        # `huskctl` side, where the numbers are simply discarded.
+        self.metrics = metrics or Metrics()
         # `self.cfg` is fixed for the life of the process: huskd does not reload the
         # config file. Changing anything means a restart, which is cheap and safe —
         # every slot is re-adopted from backend metadata (husk-pool/husk-cycle/
@@ -164,10 +181,19 @@ class Controller:
                 "image sync failed; continuing with current host image",
                 exc_info=True,
             )
+            self.metrics.action_failures.inc(self.pool, "sync_images")
 
     # ----------------------------------------------------------------- tick
     async def tick(self) -> ControllerState | None:
-        now = self._clock()
+        """One reconcile pass. Wraps `_tick` only to time it and to count the
+        completions, so the fail-safe early returns inside stay easy to read."""
+        started = self._clock()
+        try:
+            return await self._tick(started)
+        finally:
+            self.metrics.reconcile_duration.observe(self._clock() - started, self.pool)
+
+    async def _tick(self, now: float) -> ControllerState | None:
 
         # 0. IMAGE SYNC — ensure each host holds the configured golden image
         #    before any create/rebuild this tick (a no-op once synced; on a ref
@@ -182,6 +208,7 @@ class Controller:
             slots = await asyncio.to_thread(self.backend.list_slots)
         except ListSlotsError:
             log.error("list_slots failed; aborting tick (no mutations)", exc_info=True)
+            self.metrics.reconcile_aborts.inc(self.pool, "list_slots")
             return self.snapshot
 
         # Runner data comes from the centralized poller. Missing (never polled) or
@@ -195,6 +222,7 @@ class Controller:
                 "no runner snapshot for %s yet; aborting tick (no mutations)",
                 self.target,
             )
+            self.metrics.reconcile_aborts.inc(self.pool, "no_runner_snapshot")
             return self.snapshot
         if age is not None and age > self._runner_max_age:
             log.error(
@@ -204,6 +232,7 @@ class Controller:
                 age,
                 self._runner_max_age,
             )
+            self.metrics.reconcile_aborts.inc(self.pool, "stale_runner_snapshot")
             return self.snapshot
 
         log.debug(
@@ -340,6 +369,7 @@ class Controller:
             self._surplus_ticks = 0
 
         # 6. PUBLISH SNAPSHOT
+        self.metrics.reconcile_ticks.inc(self.pool)
         self._generation += 1
         self.snapshot = ControllerState.from_classified(
             generation=self._generation,
@@ -474,7 +504,9 @@ class Controller:
         except Exception as e:
             log.exception("rebuild of slot %s failed", slot.id)
             self.slot_errors[slot.id] = (now, f"rebuild failed: {e}")
+            self.metrics.action_failures.inc(self.pool, "rebuild")
             return
+        self.metrics.slot_recycles.inc(self.pool)
         self.cycle_counter[slot.id] = cycle
         self.last_provision_action[slot.id] = now
         self.pending_start.add(slot.id)
@@ -543,7 +575,9 @@ class Controller:
             )
         except Exception:
             log.exception("create of slot %s failed", vm)
+            self.metrics.action_failures.inc(self.pool, "create")
             return  # one attempt; no retry storm, no orphaned ghost tracked
+        self.metrics.slots_created.inc(self.pool)
         self.cycle_counter[slot.id] = 0
         self.last_provision_action[slot.id] = now
         self._known.add(slot.id)
@@ -594,10 +628,15 @@ class Controller:
             await self._safe(self.github.delete_runner(r.id), f"reap runner {r.name}")
 
     async def _destroy(self, slot: Slot, reason: str) -> None:
+        # `reason` is a fixed vocabulary here (error / decommission / …), so it is
+        # safe as a label and is the thing you actually want to break down by:
+        # slots retired for surplus and slots destroyed because they broke are
+        # very different signals.
         await self._safe(
             asyncio.to_thread(self.backend.destroy_slot, slot, reason=reason),
             f"destroy {slot.id}",
         )
+        self.metrics.slots_destroyed.inc(self.pool, reason)
         self._forget(slot.id)
 
     # ------------------------------------------------------------ bookkeeping
@@ -645,6 +684,18 @@ class Controller:
                     t = self.timing.get(s.id)
                     if t is not None:
                         t.on_runner_online(now)
+                        # The distribution behind the per-slot "last value"
+                        # gauges. Recorded here, at the moment the bring-up
+                        # completes, because a scrape-time renderer cannot know
+                        # how many bring-ups happened since the last scrape.
+                        if t.last_cloudinit_seconds is not None:
+                            self.metrics.cloudinit_duration.observe(
+                                t.last_cloudinit_seconds, self.pool
+                            )
+                        if t.last_recycle_seconds is not None:
+                            self.metrics.recycle_duration.observe(
+                                t.last_recycle_seconds, self.pool
+                            )
                         log.debug(
                             "slot %s runner online: cloud-init=%ss recycle=%ss",
                             s.id,
@@ -722,6 +773,14 @@ class Controller:
                     units=list(report.systemd_units),
                     stages=list(report.cloudinit_stages),
                 )
+            for phase, val in (
+                ("kernel", report.kernel_seconds),
+                ("initrd", report.initrd_seconds),
+                ("userspace", report.userspace_seconds),
+                ("total", report.total_seconds),
+            ):
+                if val is not None:
+                    self.metrics.boot_duration.observe(val, self.pool, phase)
             log.info(
                 "slot %s boot report: kernel=%s initrd=%s userspace=%s total=%s",
                 s.id,
@@ -826,5 +885,6 @@ class Controller:
                 self.slot_errors.pop(slot_id, None)  # cleared on success
         except Exception as e:
             log.exception("%s failed", what)
+            self.metrics.action_failures.inc(self.pool, _action(what))
             if slot_id is not None:
                 self.slot_errors[slot_id] = (self._clock(), f"{what} failed: {e}")

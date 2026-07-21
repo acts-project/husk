@@ -29,10 +29,10 @@ left open.
 > still unknown for OpenStack (see open questions: it depends on where central
 > Prometheus lives, and it's fail-closed until set).
 >
-> The pre-existing controller `/metrics` endpoint (`src/husk/web/app.py`,
-> `render_prometheus`) continues to expose the state-derived per-pool / per-slot
-> gauges (`husk_slots*`, `husk_slot_last_cloudinit_seconds`,
-> `husk_slot_last_recycle_seconds`, `husk_slot_live_fraction`).
+> The controller `/metrics` endpoint now renders from a `prometheus_client`
+> `CollectorRegistry` (`src/husk/metrics.py`) instead of hand-built strings. See
+> **huskd's own metrics** below for the snapshot/event-time split, what changed
+> names, and how counters are persisted across restarts.
 
 -----
 
@@ -319,9 +319,11 @@ image or set up once per host.**
 3. **The `husk_slot_info` join table** on `/metrics`:
    ```
    husk_slot_info{backend="cern-cpu", slot="...", ip="...",
-                  runner_name="...", job_id="...", cycle="...",
-                  image_digest="..."} 1
+                  host="...", runner="..."} 1
    ```
+   Note `cycle` is **not** a label here (it is `husk_slot_cycle`): it increments
+   on every recycle, so as a label it minted a fresh series per recycle — exactly
+   the churn this join table exists to avoid.
    This is what makes `node_*` (keyed by IP) legible as pool/job. huskd already
    owns every one of these labels.
 4. **Discovery — a single `http_sd` endpoint** (a Quart route, `GET /sd/targets`)
@@ -392,18 +394,158 @@ what remains here is unrelated to metrics collection:
 
 -----
 
+## huskd's own metrics
+
+Everything above is about the *fleet*. This section is about **layer 1** — huskd's
+own `/metrics`, which is scraped as one static target and describes the control
+plane itself.
+
+It is built from a `prometheus_client` `CollectorRegistry` (`src/husk/metrics.py`)
+split into two halves that behave very differently.
+
+### Snapshot-derived — `SnapshotCollector`
+
+`husk_slots*`, `husk_slot_last_*_seconds`, `husk_slot_boot_seconds`,
+`husk_slot_cycle`, `husk_slot_info`, `husk_image*`. These describe the **present**,
+and huskd already holds a complete immutable description of the present: the
+per-pool `ControllerState` the reconcile loop swaps in each tick. They are rendered
+straight from it at scrape time and are never stored.
+
+These are registered as a **collector**, not as library `Gauge` objects, and that
+distinction is load-bearing. A `Gauge`'s labelsets never expire, so
+`Gauge.labels(slot="husk-a-7").set(...)` keeps reporting a slot forever after it is
+destroyed — you would have to hand-roll clear-and-repopulate every tick. A
+collector reads the current snapshot, so a destroyed slot simply produces no
+sample and Prometheus's own staleness handling finishes the job.
+
+### Event-time — `Metrics`
+
+`husk_reconcile_ticks_total`, `husk_reconcile_aborts_total`,
+`husk_reconcile_duration_seconds`, `husk_action_failures_total`,
+`husk_slots_created_total`, `husk_slots_destroyed_total`,
+`husk_slot_recycles_total`, `husk_recycle_duration_seconds`,
+`husk_cloudinit_duration_seconds`, `husk_boot_phase_seconds`,
+`husk_github_polls_total`, `husk_github_poll_failures_total`,
+`husk_guest_scrape_failures_total`.
+
+These describe **what happened between scrapes**, which no snapshot can express: a
+rebuild that failed and was retried leaves no trace in the current state, and a
+failed GitHub poll deliberately leaves the last good snapshot published. They are
+recorded as they occur (in `Controller` and `RunnerPoller`) and accumulate across
+ticks.
+
+The two most operationally valuable, and the reason this half exists:
+
+- **`husk_reconcile_aborts_total{backend,reason}`** — huskd is up, scraping fine,
+  and has silently stopped acting on reality. `reason` separates a backend listing
+  failure from a stale/absent GitHub runner snapshot, which have different fixes.
+  ```promql
+  increase(husk_reconcile_aborts_total[15m]) > 0
+  ```
+- **`husk_action_failures_total{backend,action}`** — rebuild/create/destroy/… that
+  failed. Previously these were only pinned to a slot as a dashboard string, so
+  "rebuild failure rate climbed after the image bump" was unanswerable.
+
+`action` is the **verb only**. The controller's internal descriptions embed the
+slot id for the log line (`"destroy vm-abc123"`); `_action()` strips it, because a
+slot id in a label mints a new series per slot per action and leaves it behind.
+
+**Cardinality rule, enforced by a test:** no event-time instrument carries a
+per-slot label. Every label value comes from config (pool names, target keys) or a
+fixed vocabulary (action, reason, phase). Per-slot detail lives only in the
+snapshot half, where it expires on its own.
+
+### Histograms vs. the "last value" gauges
+
+`husk_slot_last_recycle_seconds` is a gauge holding one slot's most recent
+bring-up. It answers "why is *this* slot slow" — which is what the dashboard wants
+— but it cannot answer "what is the p95 over the last day, and did it move when we
+bumped the image": `quantile()` over a gauge is the quantile *across slots at one
+instant*, not across events over time.
+
+So both exist. The gauges stayed; `husk_recycle_duration_seconds`,
+`husk_cloudinit_duration_seconds` and `husk_boot_phase_seconds` were added as
+histograms, observed at the moment a bring-up completes.
+
+```promql
+histogram_quantile(0.95, sum by (le, backend) (
+  rate(husk_recycle_duration_seconds_bucket[6h])))
+```
+
+Bucket bounds are in `husk.metrics` (`BRINGUP_BUCKETS`, `BOOT_BUCKETS`,
+`TICK_BUCKETS`). The library defaults top out at 10s, which is useless here — a
+slot bring-up is a minute or more.
+
+### `husk_slot_state_seconds_total` replaces `husk_slot_live_fraction`
+
+`live_fraction` was a ratio computed inside husk over "all time since huskd
+started". That fixes the window at query time and resets silently on restart, so
+"live fraction over the last hour" was unanswerable. The raw seconds are exposed
+instead — the accumulator (`SlotTiming.state_seconds`) already existed — and the
+ratio is derived in PromQL, over whatever window you like:
+
+```promql
+sum by (backend, slot) (rate(husk_slot_state_seconds_total{state=~"busy|idle"}[1h]))
+/ sum by (backend, slot) (rate(husk_slot_state_seconds_total[1h]))
+```
+
+It lives in the *snapshot* half despite being a counter, because it is per-slot and
+its accumulator is owned by the slot — so it must expire when the slot does.
+
+`live_fraction` is still in `/status` for the dashboard, which has no PromQL to
+divide with.
+
+### Persistence across restarts
+
+huskd restarts on every config change (there is no hot reload), and a restart zeros
+every counter. Prometheus copes — `rate()` treats a drop as a reset — but the
+long-horizon questions quietly stop working: `increase(husk_action_failures_total[30d])`
+after a deploy only sees failures since the deploy.
+
+Set `controller.metrics_state_path` and the event-time half is written to a small
+JSON file (a few KB; a modest PVC is plenty) every 60s and once more on shutdown,
+then folded back in at startup. Unset ⇒ disabled, everything starts from zero.
+
+Only `Metrics` is persisted — never the snapshot half, which is re-derived from
+live state on every scrape. **No slot state is stored here**; slots are still
+re-adopted from backend metadata on the first tick, as before.
+
+Writes are atomic (temp file in the same directory, then `os.replace`), and every
+failure mode is non-fatal: a corrupt file, a schema-version mismatch, or changed
+bucket bounds all mean "start that metric from zero, loudly". There is deliberately
+**no migration path** — half-restored data is worse than a clean reset, because a
+counter that silently loses part of its history is indistinguishable from one that
+is simply low. A save failure (full or read-only PVC) is logged and ignored; a
+bookkeeping file must never take down a runner fleet.
+
+### Renames
+
+Per husk's no-back-compat rule, these changed outright rather than being aliased:
+
+| Before | After | Why |
+|---|---|---|
+| `husk_reconcile_generation` | `husk_reconcile_generation_total` | it declared `TYPE counter` while omitting the suffix |
+| `husk_slot_info{...,cycle="N"}` | `husk_slot_cycle{backend,slot}` | a label that churned a new series every recycle |
+| `husk_slot_live_fraction` | `husk_slot_state_seconds_total{...,state}` | a baked-in ratio can't be re-windowed |
+
+Label **names** are also now emitted alphabetically (prometheus_client normalizes
+them). Label order is not semantically meaningful, but it will change the text of
+any hand-written diff or golden-file test.
+
+-----
+
 ## qcow2 storage usage
 
 `/metrics` carries one **daemon-wide** block (no `backend` label — see below)
 counting the qcow2 images husk has put on disk:
 
 ```
-husk_images{kind="cache",host=""}          2
-husk_image_bytes{kind="cache",host=""}     7516192768
-husk_images{kind="golden",host="gpu-1"}    1
-husk_image_bytes{kind="golden",host="gpu-1"} 3221225472
-husk_images{kind="overlay",host="gpu-1"}   4
-husk_image_bytes{kind="overlay",host="gpu-1"} 88604672
+husk_images{host="",kind="cache"}            2.0
+husk_image_bytes{host="",kind="cache"}       7516192768.0
+husk_images{host="gpu-1",kind="golden"}      1.0
+husk_image_bytes{host="gpu-1",kind="golden"} 3221225472.0
+husk_images{host="gpu-1",kind="overlay"}     4.0
+husk_image_bytes{host="gpu-1",kind="overlay"} 88604672.0
 ```
 
 Three populations, two machines (`storage.py`):
