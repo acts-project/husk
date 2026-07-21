@@ -25,8 +25,25 @@ lock_path = "/run/husk/huskd.lock"
 image_cache_dir = "/app/.cache/husk/images"
 shrink_ticks = 3
 
+# ISOLATION — THE OPENSTACK PROJECT IS THE BOUNDARY.
+#
+# Pool name, target and labels are deliberately IDENTICAL to the live overlay, so
+# this is a faithful rehearsal rather than a different thing that merely resembles
+# one. What keeps the two apart is the credential: `cloud` (below) picks a
+# clouds.yaml entry, hence the OpenStack project — and huskd only ever sees
+# servers in the project it authenticated into.
+#
+# Why that is load-bearing: slot ownership is the `husk-pool` metadata tag —
+# openstack_backend._owns() claims a server iff managed-by=husk AND
+# husk-pool == this pool's name. With the name shared, the project is the ONLY
+# thing separating two huskds. Point both at one project and they will each adopt
+# the same slots and enforce their own min_ready/max_total on them. The controller
+# lock is a per-pod flock; it does not span machines and will not save you.
+#
+# Hence the one rule: never run two huskds against the same project at once —
+# including this local pod and a live deployment during a migration.
 [[pool]]
-name = "openstack-cern-oci"
+name = "openstack-cern-oci"            # same as live, on purpose — see above
 target = { org = "acts-project", group = "husk" }
 
 [pool.runner]
@@ -37,7 +54,20 @@ scrape_cidr = "0.0.0.0/0"
 
 [pool.backend]
 type = "openstack"
-cloud = "cern"                         # profile in the mounted clouds.yaml
+# THE isolation control — this profile name selects the OpenStack project, and
+# nothing else separates this pool from the live one. Point it at a personal /
+# test project; leave the production project to the cern overlay.
+#
+# Two ways to arrange that, both supported:
+#   a) one clouds.yaml with several entries, and each overlay names a different
+#      one here (e.g. cern-personal vs cern-prod);
+#   b) the same profile name in both overlays, backed by a different credential
+#      per environment — `just k8s-secrets local` prefers secrets/clouds.local.yaml
+#      over secrets/clouds.yaml, so the configs stay byte-identical.
+# (a) is easier to eyeball; (b) keeps the two configs identical, which makes the
+# rehearsal stricter. k8s-secrets warns if the profile named here is missing from
+# the clouds file it loads.
+cloud = "cern"
 flavor_name = "m2.small"
 network_name = "CERN_NETWORK"
 keypair = "acts-gha"

@@ -24,6 +24,43 @@ spec:
         prometheus.io/port: "9100"
         prometheus.io/path: /metrics
     spec:
+      # Fail a bad ConfigMap BEFORE the daemon starts. `huskctl validate` parses
+      # the config and touches nothing external — no cloud, no libvirt, no GitHub —
+      # so this is fast and side-effect free, and the pod never reaches the point
+      # of taking the controller lock with a config that can't work. A parse error
+      # then shows up as Init:Error with the message in this container's logs,
+      # instead of the main container crash-looping.
+      #
+      # `just k8s-validate` runs the identical check on your laptop.
+      initContainers:
+        - name: validate-config
+          image: ghcr.io/acts-project/husk:latest
+          imagePullPolicy: IfNotPresent
+          command: ["huskctl", "validate", "--config", "/etc/husk/config.toml"]
+          env:
+            # The loader insists on a key being present even though validate never
+            # uses it, so the same secret is wired here.
+            - name: HUSK_GITHUB__PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: huskd-github
+                  key: private-key.pem
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/husk
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
       containers:
         - name: huskd
           # Published by .github/workflows/build-app-image.yml. Overlays retag this;
