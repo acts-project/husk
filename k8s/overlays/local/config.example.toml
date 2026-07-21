@@ -1,0 +1,90 @@
+# TEMPLATE — copy to config.toml next to this file and fill in your values:
+#     just k8s-init
+# config.toml is gitignored; this template is what's committed. The overlay's
+# configMapGenerator reads config.toml, so rendering fails until you do this.
+#
+# huskd config for the local colima/k3s test drive.
+#
+# This is a REAL run: real GitHub App, real CERN OpenStack, one real slot. The
+# only things dialled down are the pool size (1) and the fact that nothing is
+# exposed beyond `kubectl port-forward`. Your colima VM must be able to reach the
+# CERN OpenStack API (VPN / on-site), same as running huskd on the laptop directly.
+
+[github]
+app_id = 123456                        # from the App's settings page
+# No private_key_path, and NEVER the key itself: the PEM arrives as
+# HUSK_GITHUB__PRIVATE_KEY from the huskd-github Secret, which `just k8s-secrets`
+# builds from secrets/private-key.pem. config.py prefers the env var over the path.
+
+[controller]
+# 0.0.0.0, NOT the 127.0.0.1 default — the kubelet dials the pod IP for the
+# probes, and a loopback-only bind makes every probe fail with connection refused.
+http_addr = "0.0.0.0:9100"
+# On the `run` emptyDir. Must be pod-local; see the volume comment in the base.
+lock_path = "/run/husk/huskd.lock"
+image_cache_dir = "/app/.cache/husk/images"
+shrink_ticks = 3
+# Dead runner registrations pile up (a slot whose runner never connects strands
+# one). "off" | "dry-run" | "on" — scoped to this pool's vm_prefix, and never
+# deletes a registration a live slot might still be booting into.
+reap_runners = "dry-run"
+
+# ISOLATION — THE OPENSTACK PROJECT IS THE BOUNDARY.
+#
+# Pool name, target and labels are deliberately IDENTICAL to the live overlay, so
+# this is a faithful rehearsal rather than a different thing that merely resembles
+# one. What keeps the two apart is the credential: `cloud` (below) picks a
+# clouds.yaml entry, hence the OpenStack project — and huskd only ever sees
+# servers in the project it authenticated into.
+#
+# Why that is load-bearing: slot ownership is the `husk-pool` metadata tag —
+# openstack_backend._owns() claims a server iff managed-by=husk AND
+# husk-pool == this pool's name. With the name shared, the project is the ONLY
+# thing separating two huskds. Point both at one project and they will each adopt
+# the same slots and enforce their own min_ready/max_total on them. The controller
+# lock is a per-pod flock; it does not span machines and will not save you.
+#
+# Hence the one rule: never run two huskds against the same project at once —
+# including this local pod and a live deployment during a migration.
+[[pool]]
+name = "openstack-cern-oci"            # same as live, on purpose — see above
+target = { org = "acts-project", group = "husk" }
+
+[pool.runner]
+version = "2.334.0"                    # MUST match the golden's husk.runner.version
+labels = ["self-hosted", "linux", "x64", "husk-os-oci"]
+prebaked = true
+scrape_cidr = "0.0.0.0/0"
+
+[pool.backend]
+type = "openstack"
+# THE isolation control — this profile name selects the OpenStack project, and
+# nothing else separates this pool from the live one. Point it at a personal /
+# test project; leave the production project to the cern overlay.
+#
+# Two ways to arrange that, both supported:
+#   a) one clouds.yaml with several entries, and each overlay names a different
+#      one here (e.g. cern-personal vs cern-prod);
+#   b) the same profile name in both overlays, backed by a different credential
+#      per environment — `just k8s-secrets local` prefers secrets/clouds.local.yaml
+#      over secrets/clouds.yaml, so the configs stay byte-identical.
+# (a) is easier to eyeball; (b) keeps the two configs identical, which makes the
+# rehearsal stricter. k8s-secrets warns if the profile named here is missing from
+# the clouds file it loads.
+cloud = "cern"
+flavor_name = "m2.small"
+network_name = "CERN_NETWORK"
+keypair = "acts-gha"
+rebuild_microversion = "2.79"
+image_ref = "ghcr.io/acts-project/husk-base:v4"
+# One slot, so a local test drive can't eat the project quota. The image cache is
+# an emptyDir here, so each pod restart re-pulls the golden (~GBs) — fine for a
+# handful of runs, and the reason the live overlay uses a PVC.
+min_ready = 1
+max_total = 1
+
+[pool.timeouts]
+poll_interval_sec = 5
+idle_timeout_sec = 1800
+startup_grace_sec = 240
+max_job_duration_sec = 21600

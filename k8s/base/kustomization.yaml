@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+labels:
+  - includeSelectors: true
+    pairs:
+      app.kubernetes.io/name: huskd
+
+resources:
+  - deployment.yaml
+  - service.yaml
+
+# NOTE: the base deliberately ships no ConfigMap. Each overlay generates
+# huskd-config from its own config.toml, which is the single biggest difference
+# between local and live (pool sizes, http_addr, image refs). The generator's
+# content hash is appended to the name, so editing config.toml rolls the pod —
+# a plain ConfigMap would leave a stale pod running the old config.

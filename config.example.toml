@@ -38,6 +38,13 @@ private_key_path = "/etc/husk/husk-app.pem"   # or env HUSK_GITHUB__PRIVATE_KEY 
 lock_path = "/tmp/huskd.lock"
 http_addr = "127.0.0.1:9100"           # dashboard + /status /metrics /healthz /events; "0.0.0.0:9100" to expose
 shrink_ticks = 3                       # sustained-surplus ticks before ramp-down
+# Garbage-collect dead GitHub runner registrations: "off" (default) | "dry-run" | "on".
+# A slot whose runner never connects strands its registration offline forever, and
+# they accumulate until something reaps them. Always scoped to the pool's vm_prefix,
+# and never touches a registration a live slot might still use (an offline runner at
+# the slot's CURRENT cycle is the mid-boot case, and is kept). Start with "dry-run"
+# and read the logs before switching to "on" — this deletes GitHub state on a timer.
+# reap_runners = "dry-run"
 # image_cache_dir = "/var/cache/husk/images"  # optional; default ~/.cache/husk/images. Shared by every pool
 # Where central Prometheus reaches THIS huskd. /sd/targets hands it out as the
 # address of the libvirt targets, whose guests are private and so are scraped back

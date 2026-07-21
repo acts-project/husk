@@ -1,0 +1,149 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: huskd
+spec:
+  # huskd is a SINGLETON: it takes an exclusive flock on controller.lock_path
+  # (src/husk/lock.py) so two daemons can't fight over the same slot set. Recreate
+  # (not RollingUpdate) so the old pod is gone before the new one starts — a rolling
+  # update would leave the new pod crash-looping on LockHeld only if they shared the
+  # lock volume, but more importantly two huskds would both reconcile the same
+  # backend for the overlap window.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: huskd
+  template:
+    metadata:
+      labels:
+        app: huskd
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+        prometheus.io/path: /metrics
+    spec:
+      # Fail a bad ConfigMap BEFORE the daemon starts. `huskctl validate` parses
+      # the config and touches nothing external — no cloud, no libvirt, no GitHub —
+      # so this is fast and side-effect free, and the pod never reaches the point
+      # of taking the controller lock with a config that can't work. A parse error
+      # then shows up as Init:Error with the message in this container's logs,
+      # instead of the main container crash-looping.
+      #
+      # `just k8s-validate` runs the identical check on your laptop.
+      initContainers:
+        - name: validate-config
+          image: ghcr.io/acts-project/husk:latest
+          imagePullPolicy: IfNotPresent
+          command: ["huskctl", "validate", "--config", "/etc/husk/config.toml"]
+          env:
+            # The loader insists on a key being present even though validate never
+            # uses it, so the same secret is wired here.
+            - name: HUSK_GITHUB__PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: huskd-github
+                  key: private-key.pem
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/husk
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      containers:
+        - name: huskd
+          # Published by .github/workflows/build-app-image.yml. Overlays retag this;
+          # the live deploy pins a sha- tag over it via `oc set image`.
+          image: ghcr.io/acts-project/husk:latest
+          imagePullPolicy: IfNotPresent
+          # Dockerfile's CMD already is ["--config", "/etc/husk/config.toml"];
+          # repeated here so the mount path and the flag can't drift apart.
+          args: ["--config", "/etc/husk/config.toml"]
+          ports:
+            - containerPort: 9100
+              name: http
+          env:
+            # PEM contents, not a path. config.py resolves this BEFORE
+            # [github].private_key_path, so the TOML carries no key material.
+            - name: HUSK_GITHUB__PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: huskd-github
+                  key: private-key.pem
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/husk
+              readOnly: true
+            # openstacksdk looks for clouds.yaml under $HOME/.config/openstack;
+            # the image pins HOME=/app.
+            - name: openstack
+              mountPath: /app/.config/openstack
+              readOnly: true
+            # controller.image_cache_dir. Golden qcow2s land here before being
+            # fanned out to Glance / libvirt hosts — multi-GB, so give it real
+            # storage in any long-lived cluster (see overlays/cern).
+            - name: image-cache
+              mountPath: /app/.cache/husk/images
+            # controller.lock_path lives here. Deliberately NOT shared storage:
+            # the lock must be per-pod, and the kernel drops it on crash.
+            - name: run
+              mountPath: /run/husk
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            # /healthz is 503 until every pool has reconciled recently. A first
+            # reconcile has to pull the golden and talk to the backend, so the
+            # startup budget is generous: 12 * 15s = 3 min before liveness counts.
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 15
+            failureThreshold: 12
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: config
+          configMap:
+            name: huskd-config
+        - name: openstack
+          secret:
+            secretName: huskd-openstack
+        - name: image-cache
+          emptyDir: {}
+        - name: run
+          emptyDir: {}

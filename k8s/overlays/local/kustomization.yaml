@@ -1,0 +1,60 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: husk
+
+resources:
+  - ../../base
+  - namespace.yaml
+
+configMapGenerator:
+  - name: huskd-config
+    files:
+      - config.toml
+
+images:
+  # Built straight into colima's docker daemon; k3s there runs on cri-dockerd, so
+  # the image is visible without a registry push. `newTag` is a marker, not a
+  # thing to pull — hence the Never below.
+  - name: ghcr.io/acts-project/husk
+    newName: husk        # matches `image := "husk:local"` in the justfile
+    newTag: local
+
+patches:
+  - target:
+      kind: Deployment
+      name: huskd
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Never
+      # Same for the validate-config initContainer — otherwise IfNotPresent would
+      # fall back to a registry pull of `husk:local`, which exists nowhere but this
+      # colima VM's docker daemon. Never fails loudly instead of hanging on a 404.
+      - op: replace
+        path: /spec/template/spec/initContainers/0/imagePullPolicy
+        value: Never
+      # Pin the numeric UID/GID of the image's `husk` user (Dockerfile: useradd
+      # --system, which lands on 999).
+      #
+      # Required on vanilla Kubernetes: the Dockerfile says `USER husk`, a NAME,
+      # and the kubelet has to prove the user is non-root BEFORE the container
+      # starts. It can't read /etc/passwd inside the image, so with
+      # runAsNonRoot: true and no numeric UID it refuses outright —
+      #   CreateContainerConfigError: container has runAsNonRoot and image has
+      #   non-numeric user (husk), cannot verify user is non-root
+      #
+      # This lives in the LOCAL overlay, not the base, because OpenShift does the
+      # opposite: its restricted SCC assigns a UID from the project's own range
+      # (~1000740000+) and would REJECT a hardcoded 999 as out of range. So the
+      # base stays UID-less for CERN, and vanilla k8s gets the pin here.
+      #
+      # fsGroup makes the emptyDir volumes (image cache, lock dir) group-writable
+      # by that GID — without it the golden pull and the flock both fail on a
+      # root-owned mount.
+      - op: add
+        path: /spec/template/spec/securityContext
+        value:
+          runAsUser: 999
+          runAsGroup: 999
+          fsGroup: 999

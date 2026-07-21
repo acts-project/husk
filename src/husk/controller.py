@@ -26,7 +26,14 @@ from husk.cloudinit import render_cloud_init
 from husk.config import Config
 from husk.demand import DemandRegistry
 from husk.poller import SnapshotRegistry
-from husk.slot import Runner, Slot, SlotState, classify, match_runner
+from husk.slot import (
+    Runner,
+    Slot,
+    SlotState,
+    classify,
+    match_runner,
+    orphaned_runners,
+)
 from husk.snapshot import ControllerState
 from husk.target import Target
 from husk.timing import SlotTiming
@@ -39,6 +46,10 @@ log = logging.getLogger("husk.controller")
 # no action" safety. Generous by design: at the default 30s poll cadence this is
 # several missed polls, so only a sustained outage trips it.
 RUNNER_SNAPSHOT_MAX_AGE_S = 180.0
+
+# How often the opt-in runner reaper runs. Orphans appear at recycle speed
+# (minutes at best), so reaping every tick would burn API budget listing nothing.
+_REAP_INTERVAL_S = 300.0
 
 # Max serial-console reads per bring-up while chasing a slot's husk-bootreport
 # block (the block flushes shortly after the runner registers). At a ~30s poll
@@ -106,6 +117,9 @@ class Controller:
         self.runner_present: set[str] = set()
         self.pending_start: set[str] = set()
         self.cycle_counter: dict[str, int] = {}
+        # Rate-limits the opt-in runner reaper. -inf so the first eligible tick
+        # reaps immediately rather than waiting out one interval after a restart.
+        self._last_reap: float = float("-inf")
         self.timing: dict[str, SlotTiming] = {}
         # Last failed backend action per slot (rebuild/start/stop/…), surfaced on the
         # dashboard so a stuck slot's cause is visible without the logs. slot_id ->
@@ -250,6 +264,11 @@ class Controller:
         )
         surplus_remaining = over  # how many powered-off excess slots to shed/hold
         did_retire = False
+
+        # 2b. REAP dead runner registrations (opt-in; see controller.reap_runners).
+        #     Placed here, on the same fresh slots+runners snapshot the tick has
+        #     already fail-safed, so it can never act on a stale slot list.
+        await self._reap_runners(slots, runners, now)
 
         # 3. PER-SLOT REMEDIATION (one action max per slot)
         for s, runner, state in classified:
@@ -540,6 +559,39 @@ class Controller:
         if runner is not None:
             await self._safe(self.github.delete_runner(runner.id), "delete_runner")
         await self._destroy(slot, "decommission")
+
+    async def _reap_runners(
+        self, slots: list[Slot], runners: list[Runner], now: float
+    ) -> None:
+        """Delete this pool's dead runner registrations. Opt-in, prefix-scoped.
+
+        Runs at most every `_REAP_INTERVAL_S` rather than every tick: orphans
+        accrue at recycle speed (minutes), so a 5s cadence would spend API budget
+        listing for nothing. Failures are swallowed per runner — cleanup is
+        housekeeping and must never abort a tick or block provisioning.
+        """
+        mode = self.cfg.controller.reap_runners
+        if mode == "off":
+            return
+        if now - self._last_reap < _REAP_INTERVAL_S:
+            return
+        self._last_reap = now
+
+        doomed = orphaned_runners(runners, slots, self.cfg.backend.vm_prefix)
+        if not doomed:
+            return
+        names = [r.name for r in doomed]
+        if mode == "dry-run":
+            log.info(
+                "reap (dry-run): would delete %d offline runner(s) for %s: %s",
+                len(names),
+                self.cfg.backend.vm_prefix,
+                names,
+            )
+            return
+        log.info("reap: deleting %d dead runner registration(s): %s", len(names), names)
+        for r in doomed:
+            await self._safe(self.github.delete_runner(r.id), f"reap runner {r.name}")
 
     async def _destroy(self, slot: Slot, reason: str) -> None:
         await self._safe(
