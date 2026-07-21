@@ -421,6 +421,35 @@ k8s-logs-prev:
 k8s-logs-init:
     kubectl logs -n {{k8s_namespace}} -l app=huskd -c validate-config --tail=50
 
+# kustomize's configMapGenerator mints a NEW hash-suffixed ConfigMap every time
+# config.toml changes, and `apply -k` never removes the old one — nothing in
+# Kubernetes expires them, so they accumulate forever. Harmless in size, but they
+# make `get configmap` ambiguous about which config is actually running.
+#
+# Safe by construction: it keeps every ConfigMap referenced by the Deployment's
+# desired spec AND by any live pod. The second part matters mid-rollout, where an
+# old pod still mounts the previous ConfigMap and would fail to restart without it.
+# Delete huskd ConfigMaps no longer referenced (env-agnostic; prints what it does).
+k8s-configmap-prune:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ns="{{k8s_namespace}}"
+    echo "context: $(kubectl config current-context)"
+    keep="$(kubectl get deploy huskd -n "$ns" -o jsonpath='{.spec.template.spec.volumes[?(@.name=="config")].configMap.name}' 2>/dev/null || true)"
+    keep="$keep $(kubectl get pods -n "$ns" -l app=huskd -o jsonpath='{range .items[*]}{range .spec.volumes[?(@.name=="config")]}{.configMap.name}{" "}{end}{end}' 2>/dev/null || true)"
+    echo "in use: $keep"
+    # Selected by NAME PREFIX, not label: ConfigMaps generated before the overlays
+    # started labelling them carry no labels at all, and a label selector would
+    # skip exactly the stale ones worth removing. The generator always names them
+    # huskd-config-<hash>, so the prefix is the reliable handle.
+    n=0
+    for cm in $(kubectl get configmap -n "$ns" -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null | tr ' ' '\n' | grep '^huskd-config-'); do
+        case " $keep " in *" $cm "*) continue ;; esac
+        kubectl delete configmap "$cm" -n "$ns"
+        n=$((n+1))
+    done
+    echo "pruned $n unreferenced ConfigMap(s)"
+
 # Pod/deployment state, plus recent events (where image-pull and probe failures show up).
 k8s-status:
     kubectl get pods,svc -n {{k8s_namespace}}

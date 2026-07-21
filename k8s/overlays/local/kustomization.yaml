@@ -7,6 +7,18 @@ resources:
   - ../../base
   - namespace.yaml
 
+# Repeated from the base ON PURPOSE. A base's transformers apply only to the
+# base's own resources, so the configMapGenerator below — declared here, beside
+# the base rather than inside it — is not labelled by it. Without this the
+# generated ConfigMaps carry NO labels, which silently breaks every
+# label-selector operation on them (teardown, pruning).
+# includeSelectors: false because the Deployment's spec.selector is immutable and
+# the base already set it; this only adds metadata labels.
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/name: huskd
+
 configMapGenerator:
   - name: huskd-config
     files:

@@ -8,6 +8,14 @@ resources:
   - pvc.yaml
   - route.yaml
 
+# See the note in overlays/local: a base's transformers do not reach a generator
+# declared in the overlay, so without this the ConfigMaps are unlabelled and no
+# label selector can find them.
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/name: huskd
+
 configMapGenerator:
   - name: huskd-config
     files:
