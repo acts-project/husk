@@ -1,0 +1,56 @@
+# TEMPLATE — copy to config.toml next to this file and fill in your values:
+#     just k8s-init
+# config.toml is gitignored; this template is what's committed. The overlay's
+# configMapGenerator reads config.toml, so rendering fails until you do this.
+#
+# huskd config for the local colima/k3s test drive.
+#
+# This is a REAL run: real GitHub App, real CERN OpenStack, one real slot. The
+# only things dialled down are the pool size (1) and the fact that nothing is
+# exposed beyond `kubectl port-forward`. Your colima VM must be able to reach the
+# CERN OpenStack API (VPN / on-site), same as running huskd on the laptop directly.
+
+[github]
+app_id = 123456                        # from the App's settings page
+# No private_key_path, and NEVER the key itself: the PEM arrives as
+# HUSK_GITHUB__PRIVATE_KEY from the huskd-github Secret, which `just k8s-secrets`
+# builds from secrets/private-key.pem. config.py prefers the env var over the path.
+
+[controller]
+# 0.0.0.0, NOT the 127.0.0.1 default — the kubelet dials the pod IP for the
+# probes, and a loopback-only bind makes every probe fail with connection refused.
+http_addr = "0.0.0.0:9100"
+# On the `run` emptyDir. Must be pod-local; see the volume comment in the base.
+lock_path = "/run/husk/huskd.lock"
+image_cache_dir = "/app/.cache/husk/images"
+shrink_ticks = 3
+
+[[pool]]
+name = "openstack-cern-oci"
+target = { org = "acts-project", group = "husk" }
+
+[pool.runner]
+version = "2.334.0"                    # MUST match the golden's husk.runner.version
+labels = ["self-hosted", "linux", "x64", "husk-os-oci"]
+prebaked = true
+scrape_cidr = "0.0.0.0/0"
+
+[pool.backend]
+type = "openstack"
+cloud = "cern"                         # profile in the mounted clouds.yaml
+flavor_name = "m2.small"
+network_name = "CERN_NETWORK"
+keypair = "acts-gha"
+rebuild_microversion = "2.79"
+image_ref = "ghcr.io/acts-project/husk-base:v4"
+# One slot, so a local test drive can't eat the project quota. The image cache is
+# an emptyDir here, so each pod restart re-pulls the golden (~GBs) — fine for a
+# handful of runs, and the reason the live overlay uses a PVC.
+min_ready = 1
+max_total = 1
+
+[pool.timeouts]
+poll_interval_sec = 5
+idle_timeout_sec = 1800
+startup_grace_sec = 240
+max_job_duration_sec = 21600

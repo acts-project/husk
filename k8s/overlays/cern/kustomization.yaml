@@ -1,0 +1,42 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: husk
+
+resources:
+  - ../../base
+  - pvc.yaml
+  - route.yaml
+
+configMapGenerator:
+  - name: huskd-config
+    files:
+      - config.toml
+
+images:
+  - name: ghcr.io/acts-project/husk
+    newTag: latest  # `just k8s-live-deploy` overwrites this with the sha- tag
+
+patches:
+  # Swap the base's emptyDir image cache for the PVC.
+  #
+  # This is a JSON6902 patch replacing the whole volume entry, NOT a strategic
+  # merge. A merge on `volumes` merges by name and would leave emptyDir AND
+  # persistentVolumeClaim both set on the volume, which the API server rejects
+  # ($retainKeys is not honoured for an inline patch here). Replacing the entry
+  # outright is unambiguous.
+  #
+  # The index must match `image-cache`'s position in base/deployment.yaml
+  # (config, openstack, image-cache, run). `value` restates the name, so a
+  # wrong index shows up immediately in `just k8s-render cern` as a volume
+  # named image-cache in the wrong slot rather than as silent breakage.
+  - target:
+      kind: Deployment
+      name: huskd
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/volumes/2
+        value:
+          name: image-cache
+          persistentVolumeClaim:
+            claimName: huskd-image-cache

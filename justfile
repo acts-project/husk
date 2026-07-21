@@ -62,6 +62,208 @@ docker-run config="config.toml": docker-build
 
     docker run "${args[@]}" {{image}}
 
+# ── kubernetes ──────────────────────────────────────────────────────────────
+
+k8s_namespace := "husk"
+k8s_profile   := "husk"                        # colima profile for the local cluster
+# Must match what .github/workflows/build-app-image.yml publishes: it pushes to
+# ghcr.io/${{ github.repository }} (the REPO name, husk — not huskd, and distinct
+# from the husk-base/husk-gpu golden VM images), tagged by `type=sha`, whose
+# default format is sha-<7 chars>. --short=7 pins that width so the tag we look
+# for is the tag CI wrote.
+oc_image      := "ghcr.io/acts-project/husk"
+oc_sha        := "sha-" + `git rev-parse --short=7 HEAD`
+
+# NB `just --list` shows only the LAST comment line of a block as the summary,
+# so each recipe below keeps its one-line description last.
+
+# Uses a profile separate from `default` so your existing docker setup is
+# untouched — colima can't add k8s to a running profile in place. k3s here runs
+# on cri-dockerd, which is why the local overlay can use a locally-built image
+# with imagePullPolicy: Never (no registry push needed).
+# Start a colima profile with kubernetes (k3s) and switch kubectl to it.
+k8s-start:
+    colima start {{k8s_profile}} --kubernetes --cpu 4 --memory 6 --disk 60
+    kubectl config use-context colima-{{k8s_profile}}
+
+# Stop the local cluster (keeps the VM's disk; `colima delete {{k8s_profile}}` to wipe).
+k8s-stop:
+    colima stop {{k8s_profile}}
+
+# Copies each overlay's config.example.toml to config.toml (never overwriting an
+# existing one) and creates the gitignored secrets/ directory. The real config.toml
+# and everything in secrets/ stay local — see k8s/README.md.
+# Set up the local, gitignored config + secrets files. Safe to re-run.
+k8s-init:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p secrets
+    for env in local cern; do
+        src="k8s/overlays/$env/config.example.toml"
+        dst="k8s/overlays/$env/config.toml"
+        if [ -e "$dst" ]; then
+            echo "keep   $dst (already exists)"
+        else
+            cp "$src" "$dst"
+            echo "create $dst"
+        fi
+    done
+    echo
+    echo "Next: edit those, then drop your credentials into secrets/ :"
+    echo "  secrets/private-key.pem   GitHub App private key"
+    echo "  secrets/clouds.yaml       openstacksdk profile (or: just k8s-secrets clouds=~/.config/openstack/clouds.yaml)"
+    echo "Then: just k8s-secrets"
+
+# Reads from the gitignored secrets/ dir by default. Re-run to rotate: the
+# create|apply pipe below updates in place rather than erroring on a re-run.
+# Load the GitHub App key + clouds.yaml into the cluster as Secrets.
+k8s-secrets pem="secrets/private-key.pem" clouds="secrets/clouds.yaml":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    clouds="$(eval echo {{clouds}})"
+    pem="$(eval echo {{pem}})"
+    if [ ! -f "$pem" ]; then
+        echo "App private key not found: $pem" >&2
+        echo "Put it there (\`just k8s-init\` creates secrets/), or pass one:" >&2
+        echo "  just k8s-secrets pem=/path/to/key.pem" >&2
+        exit 1
+    fi
+    # A PEM is useless to huskd if it's actually the public key or a stray file;
+    # cheaper to catch here than as a JWT signing failure in the pod. (config.py
+    # applies the same "PRIVATE KEY" check at load time.)
+    grep -q "PRIVATE KEY" "$pem" || { echo "$pem does not look like a private key" >&2; exit 1; }
+    if [ ! -f "$clouds" ]; then
+        echo "clouds.yaml not found: $clouds" >&2
+        echo "Copy yours in, or pass it: just k8s-secrets clouds=~/.config/openstack/clouds.yaml" >&2
+        exit 1
+    fi
+    kubectl create namespace {{k8s_namespace}} --dry-run=client -o yaml | kubectl apply -f -
+    # --dry-run|apply so re-running rotates the contents instead of erroring.
+    # NB "$pem"/"$clouds", not {{pem}}/{{clouds}} — the shell vars are the ~-expanded
+    # ones. The Secret KEYS (private-key.pem, clouds.yaml) are what the Deployment
+    # references, so they're fixed regardless of the source filename.
+    kubectl create secret generic huskd-github \
+        --from-file=private-key.pem="$pem" \
+        -n {{k8s_namespace}} --dry-run=client -o yaml | kubectl apply -f -
+    kubectl create secret generic huskd-openstack \
+        --from-file=clouds.yaml="$clouds" \
+        -n {{k8s_namespace}} --dry-run=client -o yaml | kubectl apply -f -
+    echo "secrets huskd-github + huskd-openstack are in namespace {{k8s_namespace}}"
+
+# Good first check before any apply: `just k8s-render cern | less`.
+# Render an overlay to stdout without applying (env = local | cern).
+k8s-render env="local":
+    kubectl kustomize k8s/overlays/{{env}}
+
+# Explicitly targets the `husk` profile's docker daemon rather than whatever
+# `docker context show` happens to point at. This matters: each colima profile has
+# its OWN daemon, so building against the `default` profile puts the image in a VM
+# the husk k3s node can't see — and because the local overlay sets
+# imagePullPolicy: Never, that fails at RUN time as ErrImageNeverPull rather than
+# at build time. Built for the host arch (arm64 here); the live amd64 image is
+# built by CI (.github/workflows/build-huskd.yml), never on a laptop.
+# Build the huskd image into the husk profile's docker daemon.
+k8s-build:
+    docker --context colima-{{k8s_profile}} build -t {{image}} .
+
+# The image tag is unchanged between builds, so this forces a rollout restart —
+# otherwise the Deployment spec is identical and k8s keeps the old pod running.
+# Build the huskd image locally and deploy it to the colima cluster.
+k8s-local: k8s-build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Guard against deploying into the wrong cluster (e.g. still pointed at CERN
+    # from an earlier `oc login`). Cheap check, expensive mistake.
+    ctx="$(kubectl config current-context)"
+    if [ "$ctx" != "colima-{{k8s_profile}}" ]; then
+        echo "kubectl context is '$ctx', expected 'colima-{{k8s_profile}}'." >&2
+        echo "Run: kubectl config use-context colima-{{k8s_profile}}" >&2
+        exit 1
+    fi
+    kubectl apply -k k8s/overlays/local
+    kubectl rollout restart deployment/huskd -n {{k8s_namespace}}
+    kubectl rollout status deployment/huskd -n {{k8s_namespace}} --timeout=5m
+
+# Confirms the image is in the daemon k3s actually reads, which is the failure
+# `ErrImageNeverPull` is telling you about.
+# Verify the locally-built image is visible to the husk cluster's docker daemon.
+k8s-verify-image:
+    docker --context colima-{{k8s_profile}} images {{image}}
+
+# Follow huskd's logs in the local cluster.
+k8s-logs:
+    kubectl logs -n {{k8s_namespace}} deployment/huskd -f
+
+# Pod/deployment state, plus recent events (where image-pull and probe failures show up).
+k8s-status:
+    kubectl get pods,svc -n {{k8s_namespace}}
+    kubectl get events -n {{k8s_namespace}} --sort-by=.lastTimestamp | tail -20
+
+# Forward the dashboard to localhost:9100 (/status /metrics /healthz /events).
+k8s-forward:
+    @echo "dashboard  -> http://localhost:9100/"
+    kubectl port-forward -n {{k8s_namespace}} svc/huskd 9100:9100
+
+# Tear down the local deployment. Leaves the Secrets and the namespace in place.
+k8s-local-down:
+    kubectl delete -k k8s/overlays/local --ignore-not-found
+
+# ── kubernetes: live (CERN OpenShift) ───────────────────────────────────────
+# The CERN OpenShift API is not reachable from GitHub-hosted runners, so deploy is
+# a MANUAL step over the CERN VPN — CI only builds and pushes the image
+# (.github/workflows/build-huskd.yml). These recipes assume the VPN is up, plus
+# `oc login` and an existing {{k8s_namespace}} project.
+# Untested until the local run is proven.
+
+# The image is built by CI, not here: `build-app-image.yml` pushes
+# {{oc_image}}:sha-<short> for every main commit. Deploying by that tag
+# means what reaches the cluster is exactly what CI built and tested — a laptop
+# build could carry uncommitted changes, and would need an emulated amd64 build
+# on Apple silicon anyway.
+# Check that the image for the current commit exists on ghcr before deploying.
+k8s-live-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "warning: working tree is dirty — HEAD ({{oc_sha}}) is not what you have locally" >&2
+    fi
+    if ! git merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
+        echo "warning: HEAD is not on origin/main — CI may not have built {{oc_sha}}" >&2
+    fi
+    echo "looking for {{oc_image}}:{{oc_sha}} on ghcr..."
+    if docker manifest inspect {{oc_image}}:{{oc_sha}} >/dev/null 2>&1; then
+        echo "OK: {{oc_image}}:{{oc_sha}} exists"
+    else
+        echo "NOT FOUND: {{oc_image}}:{{oc_sha}}" >&2
+        echo "Has the build-app-image workflow finished for this commit? Check:" >&2
+        echo "  gh run list --workflow build-app-image.yml -L5" >&2
+        exit 1
+    fi
+
+# Apply the cern overlay WITHOUT changing the image (manifest-only changes).
+k8s-live-apply:
+    oc apply -k k8s/overlays/cern -n {{k8s_namespace}}
+
+# Show what applying the cern overlay would change, against the live cluster.
+k8s-live-diff:
+    oc diff -k k8s/overlays/cern -n {{k8s_namespace}} || true
+
+# Needs the CERN VPN. Pins the CI-built image for the current commit, so it fails
+# fast if that image was never built rather than rolling out something stale.
+# Deploy: verify the CI image exists, apply manifests, pin the SHA, wait for rollout.
+k8s-live-deploy: k8s-live-check k8s-live-apply
+    oc set image deployment/huskd huskd={{oc_image}}:{{oc_sha}} -n {{k8s_namespace}}
+    oc rollout status deployment/huskd -n {{k8s_namespace}} --timeout=10m
+
+# Roll back the live deployment one revision.
+k8s-live-rollback:
+    oc rollout undo deployment/huskd -n {{k8s_namespace}}
+
+# There is no automatic eviction — see the sizing note in k8s/overlays/cern/pvc.yaml.
+# Show how much of the golden-image cache PVC is in use.
+k8s-live-cache:
+    oc exec -n {{k8s_namespace}} deployment/huskd -- du -sh /app/.cache/husk/images/
+
 # ── dev ─────────────────────────────────────────────────────────────────────
 
 # Run the test suite (extra args pass through to pytest).

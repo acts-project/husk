@@ -1,0 +1,52 @@
+# TEMPLATE — copy to config.toml next to this file and fill in your values:
+#     just k8s-init
+# config.toml is gitignored; this template is what's committed.
+#
+# huskd config for the live CERN cluster.
+#
+# Differences from overlays/local: real pool sizes, and advertise_addr set so the
+# `/sd/targets` Prometheus http_sd endpoint hands out an address central
+# Prometheus can actually reach (huskd sits behind a Route here, so the
+# http_addr fallback would advertise the pod-internal bind).
+
+[github]
+app_id = 123456                        # from the App's settings page
+
+[controller]
+http_addr = "0.0.0.0:9100"
+lock_path = "/run/husk/huskd.lock"
+image_cache_dir = "/app/.cache/husk/images"
+shrink_ticks = 3
+# advertise_addr = "husk.app.cern.ch"  # set once the Route hostname is known
+
+[[pool]]
+name = "openstack-cern-oci"
+target = { org = "acts-project", group = "husk" }
+
+[pool.runner]
+version = "2.334.0"
+labels = ["self-hosted", "linux", "x64", "husk-os-oci"]
+prebaked = true
+scrape_cidr = "0.0.0.0/0"
+
+[pool.backend]
+type = "openstack"
+cloud = "cern"
+flavor_name = "m2.small"
+network_name = "CERN_NETWORK"
+keypair = "acts-gha"
+rebuild_microversion = "2.79"
+image_ref = "ghcr.io/acts-project/husk-base:v4"
+min_ready = 4
+max_total = 4
+
+[pool.timeouts]
+poll_interval_sec = 5
+idle_timeout_sec = 1800
+startup_grace_sec = 240
+max_job_duration_sec = 21600
+
+# The libvirt pools are NOT here yet. They need SSH access from the pod to
+# lenovo-gpu-acts (qemu+ssh://), which means a Secret with the private key mounted
+# at /app/.ssh plus a known_hosts entry — and the cluster egress to reach the host
+# at all. Add them once that path is proven; the OpenStack pool works without it.
