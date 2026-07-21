@@ -528,6 +528,48 @@ k8s-live-deploy: k8s-live-check k8s-live-apply
 k8s-live-rollback:
     oc rollout undo deployment/huskd -n {{k8s_namespace}}
 
+# ESCAPE HATCH for iterating on the live cluster without waiting for CI. It builds
+# here, pushes over the CI tag for this commit, and rolls the deployment.
+#
+# Three things it does deliberately:
+#
+#  * --platform linux/amd64 ONLY. CERN is amd64; the local colima cluster runs a
+#    separately built native husk:local, so nothing needs a multi-arch manifest and
+#    building one would just double an already-emulated build.
+#  * Pins the DIGEST, not the tag, when setting the image. The pushed tag is the
+#    one already on the node, and imagePullPolicy is IfNotPresent — so restarting
+#    on the same tag can silently reuse the cached layers and "deploy" the old
+#    build. A digest the node has never seen always pulls.
+#  * Warns when the tree is dirty, because the tag then claims to be a commit whose
+#    content it does not contain.
+#
+# The tag it overwrites no longer matches what CI built from that commit, so the
+# provenance k8s-live-deploy relies on is broken until the next CI build. Use it to
+# iterate; land the change and let CI rebuild before anything you intend to keep.
+#
+# The first amd64 build is SLOW: libvirt-python compiles from source under QEMU.
+# Later builds reuse the local buildx cache and only redo the project layer.
+# Build amd64 here, push over this commit's tag, and roll the live deployment.
+k8s-live-hotdeploy:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tag="{{oc_image}}:{{oc_sha}}"
+    meta="$(mktemp -t husk-build)"
+    trap 'rm -f "$meta"' EXIT
+
+    echo "cluster: $(kubectl config current-context)"
+    echo "image:   $tag  (overwrites the CI-built tag)"
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "WARNING: working tree is dirty — this image is NOT {{oc_sha}}'s content." >&2
+    fi
+
+    docker buildx build --platform linux/amd64 -t "$tag" --push --metadata-file "$meta" .
+
+    digest="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["containerimage.digest"])' "$meta")"
+    echo "pushed digest: $digest"
+    oc set image deployment/huskd huskd={{oc_image}}@"$digest" -n {{k8s_namespace}}
+    oc rollout status deployment/huskd -n {{k8s_namespace}} --timeout=10m
+
 # Both run `huskctl reap` inside the pod, which already has the App key and config
 # mounted — no credentials on your laptop.
 #
