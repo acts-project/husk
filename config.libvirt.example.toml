@@ -19,6 +19,8 @@ lock_path = "/tmp/huskd.lock"
 http_addr = "127.0.0.1:9100"
 shrink_ticks = 3
 # image_cache_dir = "/var/cache/husk/images"   # optional; default ~/.cache/husk/images. Shared by every pool
+# Self-GC'd: a golden no pool still needs is dropped 24h after its last use, so the
+# cache holds the images in service plus roughly a day of rollout churn.
 
 [[pool]]
 name = "libvirt-gpu"          # → backend name + default vm_prefix "husk-libvirt-gpu"

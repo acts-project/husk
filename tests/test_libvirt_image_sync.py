@@ -23,10 +23,17 @@ class FakeSync:
     def __init__(self, digest: str) -> None:
         self.digest = digest
         self.calls = 0
+        self.pins: dict[str, set[str]] = {}
 
     def resolve(self, ref: str, report=None) -> ResolvedImage:
         self.calls += 1
         return ResolvedImage(ref=ref, digest=self.digest, local_path="/cache/img.qcow2")
+
+    def pin(self, owner: str, digests) -> None:
+        self.pins[owner] = set(digests)
+
+    def gc(self, *, force: bool = False) -> None:
+        pass
 
 
 def _backend(**host_overrides):
@@ -323,3 +330,16 @@ def test_no_image_source_is_rejected():
     )
     with pytest.raises(RuntimeError, match="no image source"):
         LibvirtBackend(cfg)
+
+
+def test_sync_pins_the_staged_digest_in_the_controller_cache():
+    # The cache GC keeps the union of every pool's pins, so a pool must declare the
+    # golden it stages from each tick — otherwise a sibling's sweep could evict it.
+    b = _backend()
+    b._sync = FakeSync(CURR)
+    b._ssh = lambda host, cmd, data=None: b"n\n" if cmd.startswith("test -s") else b""
+    b._push_file = lambda host, local, remote, report=None: None
+
+    b.sync_images(b.cfg)
+
+    assert b._sync.pins == {"lv": {CURR}}

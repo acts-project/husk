@@ -18,6 +18,10 @@ in "Phase 4"); this document un-defers that work with a concrete design.
 >   superseded Glance goldens. The **same qcow2 serves both backends** — the goal
 >   in Goal 4. On both, a new `image_ref` is picked up when huskd restarts.
 >
+> The controller cache itself is GC'd too (`ImageSync.gc`): each pool pins the
+> digests it still needs, and a digest nobody pins is dropped 24h after its last
+> use, along with `.pull-*` debris from a huskd killed mid-download.
+>
 > The runner/podman stack is still installed at cloud-init time when a slot boots a
 > *stock* base (`prebaked = false`); pointing `image_ref` at a golden + setting
 > `[runner] prebaked = true` is the boot-speed optimization. **Open:** live-confirm
@@ -192,7 +196,8 @@ live per-slot overlay — overwriting it in place corrupts running slots. So:
   to the current. `Slot.image_stale` is set when they diverge, and the controller
   drains stale idle slots (rebuild adopts the new golden) — same drain path on both
   backends. libvirt `_gc_goldens` removes unreferenced backing files; OpenStack
-  `_gc_glance` deletes superseded `husk-golden-*` Glance images. A changed
+  `_gc_glance` deletes superseded `husk-golden-*` Glance images; `ImageSync.gc`
+  evicts unpinned digests (and dead `.pull-*` dirs) from the controller cache. A changed
   `image_ref` takes effect on the next huskd start (huskd never reloads config).
 
 Each phase is independently useful: A produces artifacts you can place by hand

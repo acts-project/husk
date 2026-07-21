@@ -611,7 +611,7 @@ k8s-reap confirm="":
     echo "context: $(kubectl config current-context)"
     kubectl exec -n {{k8s_namespace}} deployment/huskd -- huskctl reap --config /etc/husk/config.toml
 
-# There is no automatic eviction — see the sizing note in k8s/overlays/cern/pvc.yaml.
+# huskd evicts unpinned goldens itself — see the sizing note in k8s/overlays/cern/pvc.yaml.
 # Show how much of the golden-image cache PVC is in use.
 k8s-live-cache:
     oc exec -n {{k8s_namespace}} deployment/huskd -- du -sh /app/.cache/husk/images/

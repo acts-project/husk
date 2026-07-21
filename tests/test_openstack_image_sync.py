@@ -25,10 +25,17 @@ class FakeSync:
     def __init__(self, digest: str) -> None:
         self.digest = digest
         self.calls = 0
+        self.pins: dict[str, set[str]] = {}
 
     def resolve(self, ref: str, report=None) -> ResolvedImage:
         self.calls += 1
         return ResolvedImage(ref=ref, digest=self.digest, local_path="/cache/img.qcow2")
+
+    def pin(self, owner: str, digests) -> None:
+        self.pins[owner] = set(digests)
+
+    def gc(self, *, force: bool = False) -> None:
+        pass
 
 
 class FakeImage:
@@ -217,3 +224,14 @@ def test_a_bug_building_a_slot_is_not_swallowed_by_gc():
     b = _backend(servers=[Malformed()])
     with pytest.raises(AttributeError):
         b._gc_glance()
+
+
+def test_sync_pins_the_current_digest_in_the_controller_cache():
+    # The cache GC keeps the union of every pool's pins; this pool needs the local
+    # qcow2 kept for a re-upload, and the pin is refreshed even on a no-op tick.
+    b = _backend()
+    b.sync_images(b.cfg)
+    assert b._sync.pins == {"os": {CURR}}
+
+    b.sync_images(b.cfg)  # already current — short-circuits, but must still pin
+    assert b._sync.pins == {"os": {CURR}}

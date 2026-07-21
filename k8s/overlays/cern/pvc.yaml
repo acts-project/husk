@@ -12,15 +12,15 @@ spec:
       #   husk-base:v4  1.96 GB     husk-gpu:v4  4.08 GB   -> 6.0 GB resident today
       #   husk-base:v3  1.93 GB     husk-gpu:v3  3.92 GB   (~2-4% growth per bump)
       #
-      # The cache is keyed by CONTENT DIGEST (image_sync.py:135, one dir per
-      # digest) and has NO eviction — nothing in image_sync or multipool ever
-      # removes an old digest dir. So this does not hold "the current goldens", it
-      # holds every golden ever pulled: each bump of both variants adds ~6 GB and
-      # never gives it back.
+      # The cache is keyed by CONTENT DIGEST (one dir per digest) and evicts
+      # itself (ImageSync.gc): each pool pins the digests it still serves, and a
+      # digest nobody pins goes 24h after its last use — so this holds the goldens
+      # in service plus about a day of rollout churn (~12 GB right after both
+      # variants are bumped), not every golden ever pulled.
       #
-      # 50Gi therefore buys ~7 bump-pairs before manual cleanup is needed. Running
-      # out is not cosmetic: a full cache means the pull for a NEW golden fails,
-      # i.e. it breaks exactly the rollout you were trying to do. Reclaim with
+      # 50Gi therefore leaves plenty of headroom. Watch it anyway: a full cache
+      # means the pull for a NEW golden fails, i.e. it breaks exactly the rollout
+      # you were trying to do. Inspect, and reclaim by hand if ever needed, with
       #   kubectl exec deploy/huskd -n husk -- du -sh /app/.cache/husk/images/*
       #   kubectl exec deploy/huskd -n husk -- rm -rf /app/.cache/husk/images/sha256-<old>
       # (safe while running: a deleted digest is simply re-pulled on next resolve).

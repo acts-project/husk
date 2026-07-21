@@ -16,12 +16,19 @@ single layer is the `*.qcow2` (`application/vnd.husk.qcow2`). We content-address
 by that **layer** digest — the hash of the qcow2 blob itself — so the cache dir
 and the on-host filename are stable and a tag moving to new content is a new
 digest.
+
+The cache is bounded (`gc`): each pool `pin`s the digests it still needs, and a
+digest nobody pins is evicted once it has gone unused for the retention window,
+as is the debris of a pull that died mid-download. Downstream copies have their
+own GC — `LibvirtBackend._gc_goldens` on the hosts, `OpenStackBackend._gc_glance`
+in Glance.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -43,9 +50,34 @@ _MANIFEST_BACKOFF_S = 2.0
 
 _DEFAULT_CACHE = os.path.expanduser("~/.cache/husk/images")
 
+# Cache GC (see ImageSync.gc). A cached golden is multi-GB, so an unbounded cache
+# eats the controller's disk one image rollout at a time.
+#   * A digest nobody pins is kept this long after its last use, so a rollback or
+#     a second huskd/CLI process using the same cache re-uses it instead of
+#     re-pulling — and so a pull that just landed is never reaped before the
+#     backend gets a chance to pin it.
+_UNPINNED_RETENTION_S = 24 * 3600
+#   * A `.pull-*` temp dir this process doesn't own is debris from a huskd that
+#     died mid-pull; nothing will ever finish it. The age floor keeps us off the
+#     in-flight pulls of a *concurrent* process sharing the cache.
+_STALE_PULL_AGE_S = 6 * 3600
+#   * Sweeps are cheap (a listdir + a stat each) but not free; once a quarter
+#     hour is plenty to bound the footprint.
+_GC_INTERVAL_S = 900
+
+# `<algo>-<hex>` — the on-disk spelling of a content digest (":" isn't portable).
+# GC only ever deletes entries matching this or the `.pull-` prefix, so anything
+# else a human parked in the cache dir is left alone.
+_DIGEST_DIR = re.compile(r"^sha\d+-[0-9a-f]{32,}$")
+
 
 def _default_cache_dir() -> str:
     return os.environ.get("HUSK_IMAGE_CACHE", _DEFAULT_CACHE)
+
+
+def _dir_for(digest: str) -> str:
+    """The cache subdir holding a digest's qcow2 (":" isn't a portable filename)."""
+    return digest.replace(":", "-")
 
 
 class ImageSyncError(RuntimeError):
@@ -92,16 +124,24 @@ class ImageSync:
         cache_dir: str | None = None,
         *,
         client_factory=_new_client,
+        retention_s: float = _UNPINNED_RETENTION_S,
     ) -> None:
         self.cache_dir = cache_dir or _default_cache_dir()
         self._client_factory = client_factory
         self._client = None
+        self._retention_s = retention_s
         # One instance is shared across all pools (huskd builds it once), so its
         # concurrency has teeth: guard the lazy client build and single-flight the
         # pull per content digest so two pools resolving the same new ref don't
         # both download it.
         self._locks_guard = threading.Lock()
         self._digest_locks: dict[str, threading.Lock] = {}
+        # GC bookkeeping, all under _locks_guard: who still needs which digest
+        # (pool name -> digests), the temp dirs of our own in-flight pulls, and
+        # when we last swept.
+        self._pins: dict[str, set[str]] = {}
+        self._active_tmp: set[str] = set()
+        self._last_gc = 0.0
 
     def _client_(self):
         # Two pool worker threads can race the first resolve; build the shared
@@ -132,10 +172,12 @@ class ImageSync:
         is a no-op. `report` (if given) receives a live "N/M MiB (P%)" line during
         a slow pull, for the status board."""
         digest, size = self._qcow2_layer(ref)
-        dest = os.path.join(self.cache_dir, digest.replace(":", "-"))
+        dest = os.path.join(self.cache_dir, _dir_for(digest))
         cached = self._qcow2_in(dest)
         if cached is not None:
             log.debug("image %s already cached at %s", ref, cached)
+            self._touch(dest)  # keep GC's "last used" honest
+            self.gc()
             return ResolvedImage(ref=ref, digest=digest, local_path=cached)
 
         # Serialize the pull per digest so two pools resolving the same new ref on
@@ -145,11 +187,16 @@ class ImageSync:
             cached = self._qcow2_in(dest)
             if cached is not None:
                 log.debug("image %s cached by a sibling pull at %s", ref, cached)
+                self._touch(dest)
                 return ResolvedImage(ref=ref, digest=digest, local_path=cached)
             os.makedirs(self.cache_dir, exist_ok=True)
             # Pull into a temp dir then atomically swap into place, so an interrupted
             # pull never leaves a half-written qcow2 that a later run treats as cached.
-            tmp = tempfile.mkdtemp(prefix=".pull-", dir=self.cache_dir)
+            # The dir is registered as ours for the duration so a concurrent GC sweep
+            # doesn't mistake a live pull for a dead one's debris.
+            staged = tmp = tempfile.mkdtemp(prefix=".pull-", dir=self.cache_dir)
+            with self._locks_guard:
+                self._active_tmp.add(staged)
             stop = threading.Event()
             threading.Thread(
                 target=self._log_pull_progress,
@@ -174,12 +221,81 @@ class ImageSync:
                 tmp = None  # consumed by the rename; don't clean it up below
             finally:
                 stop.set()
+                with self._locks_guard:
+                    self._active_tmp.discard(staged)
                 if tmp is not None:
                     shutil.rmtree(tmp, ignore_errors=True)
         local = self._qcow2_in(dest)
         assert local is not None  # we just placed it
         log.info("image %s ready at %s", ref, local)
+        self.gc()
         return ResolvedImage(ref=ref, digest=digest, local_path=local)
+
+    # ------------------------------------------------------------------- gc
+    def pin(self, owner: str, digests) -> None:
+        """Declare the digests `owner` (a pool name) still needs cached, replacing
+        that owner's previous declaration.
+
+        This is what makes GC safe with several pools on one cache: the keep set is
+        the *union* of every pool's pins, so a pool rolling forward releases its old
+        digest without touching a sibling's. A pool that never pins keeps nothing —
+        its images age out on the retention window like any other."""
+        with self._locks_guard:
+            self._pins[owner] = {d for d in digests if d}
+
+    def gc(self, *, force: bool = False) -> None:
+        """Bound the cache's disk footprint: drop superseded goldens and the debris
+        of pulls that died mid-flight.
+
+        Deleted: a `<algo>-<hex>` dir no pool pins whose last use is older than the
+        retention window, and a `.pull-*` temp dir this process doesn't own that is
+        older than `_STALE_PULL_AGE_S` (a crashed huskd's half-download — the
+        in-process `finally` in `resolve` can't clean those up). Everything else in
+        the cache dir is left alone.
+
+        Self-throttled to `_GC_INTERVAL_S` so callers can call it every tick; pass
+        `force=True` to sweep now. Best-effort throughout: a cache we can't read or
+        an entry we can't remove is skipped, never fatal — worst case the next sweep
+        gets it, and a wrongly-deleted golden only costs a re-pull."""
+        now = time.time()
+        with self._locks_guard:
+            if not force and now - self._last_gc < _GC_INTERVAL_S:
+                return
+            self._last_gc = now
+            keep = {_dir_for(d) for pins in self._pins.values() for d in pins}
+            active = set(self._active_tmp)
+        try:
+            entries = os.listdir(self.cache_dir)
+        except OSError:
+            return  # no cache dir yet (or unreadable) — nothing to collect
+        for name in entries:
+            path = os.path.join(self.cache_dir, name)
+            if name.startswith(".pull-"):
+                if path in active:
+                    continue  # our own live pull
+                limit, what = _STALE_PULL_AGE_S, "abandoned pull"
+            elif _DIGEST_DIR.match(name):
+                if name in keep:
+                    continue  # a pool is still serving this digest
+                limit, what = self._retention_s, "unused golden"
+            else:
+                continue  # not ours
+            try:
+                if now - os.path.getmtime(path) < limit:
+                    continue
+            except OSError:
+                continue
+            log.info("GC %s %s from the image cache", what, name)
+            shutil.rmtree(path, ignore_errors=True)
+
+    @staticmethod
+    def _touch(path: str) -> None:
+        """Mark a cache entry used now, so GC's retention window measures time since
+        last use rather than since the pull."""
+        try:
+            os.utime(path, None)
+        except OSError:
+            pass
 
     def _log_pull_progress(
         self, ref: str, tmp: str, stop, total: int = 0, report=None

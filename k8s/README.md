@@ -132,10 +132,11 @@ the VPN exists.)
 
 ### Golden-image cache sizing
 
-The PVC is 50Gi. That is not a guess about the current goldens — it's about growth,
-because **the cache has no eviction**. `image_sync.py` keys it by content digest
-(one directory per digest) and nothing ever removes an old one, so it accumulates
-every golden ever pulled.
+The PVC is 50Gi. `image_sync.py` keys the cache by content digest (one directory
+per digest) and evicts one that no pool still needs 24h after its last use, so the
+steady-state footprint is *the goldens in service* plus a day of rollout churn —
+not every golden ever pulled. Abandoned `.pull-*` downloads (huskd killed
+mid-transfer) are swept too, after 6h.
 
 Measured from the published artifacts (ghcr, 2026-07):
 
@@ -144,12 +145,12 @@ Measured from the published artifacts (ghcr, 2026-07):
 | `husk-base` | 1.93 GB | 1.96 GB |
 | `husk-gpu` | 3.92 GB | 4.08 GB |
 
-So ~6 GB resident today, and roughly +6 GB every time both variants are bumped.
-50Gi buys about seven bump-pairs. Running out is not cosmetic: a full cache fails
-the pull for a *new* golden, breaking exactly the rollout you were attempting.
-Check with `just k8s-live-cache`; reclaim by deleting old digest directories under
-`/app/.cache/husk/images/` (safe while running — a deleted digest is re-pulled on
-next resolve).
+So ~6 GB in service today, and transiently ~12 GB for the day after both variants
+are bumped. 50Gi leaves plenty of headroom; the reason to keep an eye on it is that
+a full cache fails the pull for a *new* golden, breaking exactly the rollout you
+were attempting. Check with `just k8s-live-cache`. Deleting digest directories
+under `/app/.cache/husk/images/` by hand is still safe while running (a deleted
+digest is re-pulled on next resolve), but shouldn't be necessary.
 
 ## Not covered yet
 

@@ -46,6 +46,8 @@ shrink_ticks = 3                       # sustained-surplus ticks before ramp-dow
 # and read the logs before switching to "on" — this deletes GitHub state on a timer.
 # reap_runners = "dry-run"
 # image_cache_dir = "/var/cache/husk/images"  # optional; default ~/.cache/husk/images. Shared by every pool
+# Self-GC'd: a golden no pool still needs is dropped 24h after its last use, so the
+# cache holds the images in service plus roughly a day of rollout churn.
 # Where central Prometheus reaches THIS huskd. /sd/targets hands it out as the
 # address of the libvirt targets, whose guests are private and so are scraped back
 # through huskd. Defaults to http_addr; set it only if huskd is reached on a

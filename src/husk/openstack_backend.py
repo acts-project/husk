@@ -234,6 +234,11 @@ class OpenStackBackend:
                 cfg.image_ref,
             )
             self._backend_ref = cfg.image_ref or ""
+        # Refresh the cache pin + sweep before the short-circuits below: a pool
+        # that's already current is exactly the one whose pin must stay fresh, and
+        # the sweep is self-throttled, so a per-tick call is cheap.
+        self._pin_cache()
+        self._sync.gc()
         ref = self._backend_ref
         if not ref:
             return  # legacy image_name mode — nothing to pull/upload
@@ -250,7 +255,14 @@ class OpenStackBackend:
         self._image_digest = prepared.digest
         self._synced_ref = ref
         log.info("adopted Glance golden %s for %s", self.image_id, ref)
+        self._pin_cache()  # the digest we just adopted, before the next tick's sweep
         self._gc_glance()
+
+    def _pin_cache(self) -> None:
+        """Tell the shared controller cache which golden this pool still needs (the
+        local qcow2 is the source for a re-upload to Glance), so it can collect the
+        ones we rolled off. See `ImageSync.gc`."""
+        self._sync.pin(self._pool, {self._image_digest} if self._image_digest else ())
 
     def staging_ops(self) -> list[OpView]:
         """In-flight / recent image-staging ops, for the status board."""

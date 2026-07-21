@@ -495,6 +495,14 @@ class LibvirtBackend:
             host.image_digest = prepared.digest
             self._synced_ref[name] = ref
             log.info("host %s now serving %s (%s)", name, ref, prepared.golden)
+        # Tell the shared cache which goldens this pool still needs staged from
+        # (adding a host, or re-staging one, copies from the controller cache), so
+        # it can collect the ones we rolled off. Every tick, not just when a stage
+        # happened: the sweep is self-throttled and this is how a pin stays fresh.
+        self._sync.pin(
+            self._pool, {h.image_digest for h in self._hosts.values() if h.image_digest}
+        )
+        self._sync.gc()
         self._gc_goldens()
 
     def staging_ops(self) -> list[OpView]:

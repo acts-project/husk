@@ -210,3 +210,139 @@ def test_manifest_read_failure_is_wrapped_after_retries(tmp_path, monkeypatch):
     with pytest.raises(ImageSyncError, match="could not read manifest"):
         ImageSync(str(tmp_path), client_factory=lambda: Boom()).resolve("ghcr.io/x:v1")
     assert attempts["n"] == 3  # retried before giving up
+
+
+# ------------------------------------------------------------------------ gc
+# The cache holds multi-GB goldens, so it must not grow without bound: a digest
+# no pool pins ages out, and a pull that died mid-download leaves no debris.
+
+
+def _aged(path: str, seconds: float) -> str:
+    """Backdate an entry so the age-based GC rules can be exercised without sleeping."""
+    old = time.time() - seconds
+    os.utime(path, (old, old))
+    return path
+
+
+def _digest_dir(cache, name: str, age: float = 0.0) -> str:
+    path = os.path.join(str(cache), name)
+    os.makedirs(path, exist_ok=True)
+    with open(os.path.join(path, "husk-base.qcow2"), "wb") as f:
+        f.write(b"x")
+    return _aged(path, age)
+
+
+def test_gc_evicts_unpinned_digest_past_retention(tmp_path):
+    sync = _sync(tmp_path, FakeOras())
+    stale = _digest_dir(tmp_path, "sha256-" + "b" * 64, age=48 * 3600)
+    fresh = _digest_dir(tmp_path, "sha256-" + "c" * 64, age=60)
+
+    sync.gc(force=True)
+
+    assert not os.path.exists(stale)
+    assert os.path.exists(fresh)  # inside the retention window → a rollback re-uses it
+
+
+def test_gc_keeps_pinned_digest_however_old(tmp_path):
+    sync = _sync(tmp_path, FakeOras())
+    pinned = _digest_dir(tmp_path, "sha256-" + "b" * 64, age=90 * 24 * 3600)
+    sync.pin("pool-a", {"sha256:" + "b" * 64})
+
+    sync.gc(force=True)
+
+    assert os.path.exists(pinned)  # in service — age is irrelevant
+
+
+def test_gc_keeps_a_siblings_pin(tmp_path):
+    # Several pools share one cache: the keep set is the union of their pins, so a
+    # pool rolling forward must not collect the digest another pool still serves.
+    sync = _sync(tmp_path, FakeOras())
+    a = _digest_dir(tmp_path, "sha256-" + "a" * 64, age=48 * 3600)
+    b = _digest_dir(tmp_path, "sha256-" + "b" * 64, age=48 * 3600)
+    sync.pin("pool-a", {"sha256:" + "a" * 64})
+    sync.pin("pool-b", {"sha256:" + "b" * 64})
+    sync.pin("pool-a", {"sha256:" + "a" * 64})  # re-pin: same digest, still needed
+
+    sync.gc(force=True)
+
+    assert os.path.exists(a) and os.path.exists(b)
+
+
+def test_gc_releases_a_rolled_off_digest(tmp_path):
+    sync = _sync(tmp_path, FakeOras())
+    old = _digest_dir(tmp_path, "sha256-" + "a" * 64, age=48 * 3600)
+    sync.pin("pool-a", {"sha256:" + "a" * 64})
+    sync.pin("pool-a", {"sha256:" + "d" * 64})  # rolled onto a new golden
+
+    sync.gc(force=True)
+
+    assert not os.path.exists(old)
+
+
+def test_gc_sweeps_abandoned_pull_dirs_but_not_live_ones(tmp_path):
+    # A huskd killed mid-pull leaves a .pull-* dir the in-process cleanup never ran
+    # on; only age distinguishes it from a pull another process has in flight.
+    sync = _sync(tmp_path, FakeOras())
+    dead = os.path.join(str(tmp_path), ".pull-dead")
+    live = os.path.join(str(tmp_path), ".pull-live")
+    os.makedirs(dead)
+    os.makedirs(live)
+    _aged(dead, 12 * 3600)
+    _aged(live, 12 * 3600)
+    sync._active_tmp.add(live)  # this process owns it
+
+    sync.gc(force=True)
+
+    assert not os.path.exists(dead)
+    assert os.path.exists(live)
+
+
+def test_gc_leaves_foreign_entries_alone(tmp_path):
+    sync = _sync(tmp_path, FakeOras())
+    junk = os.path.join(str(tmp_path), "notes.txt")
+    with open(junk, "wb") as f:
+        f.write(b"hi")
+    _aged(junk, 365 * 24 * 3600)
+
+    sync.gc(force=True)
+
+    assert os.path.exists(junk)  # only digest dirs and .pull-* are ours to delete
+
+
+def test_gc_is_throttled_between_sweeps(tmp_path):
+    sync = _sync(tmp_path, FakeOras())
+    sync.gc()  # first call sweeps and arms the throttle
+    stale = _digest_dir(tmp_path, "sha256-" + "b" * 64, age=48 * 3600)
+
+    sync.gc()  # too soon — a per-tick caller must not pay for a sweep every tick
+    assert os.path.exists(stale)
+
+    sync.gc(force=True)
+    assert not os.path.exists(stale)
+
+
+def test_resolve_sweeps_and_survives_it(tmp_path):
+    # The pull that just landed is unpinned until the backend adopts it, so the
+    # retention window (not a pin) is what keeps GC off it.
+    oras = FakeOras()
+    sync = _sync(tmp_path, oras)
+    stale = _digest_dir(tmp_path, "sha256-" + "e" * 64, age=48 * 3600)
+
+    r = sync.resolve("ghcr.io/acts-project/husk-base:v1")
+
+    assert os.path.isfile(r.local_path)
+    assert not os.path.exists(stale)
+
+
+def test_cache_hit_refreshes_last_use(tmp_path):
+    oras = FakeOras()
+    sync = _sync(tmp_path, oras)
+    r = sync.resolve("ghcr.io/acts-project/husk-base:v1")
+    dest = os.path.dirname(r.local_path)
+    _aged(dest, 48 * 3600)  # pretend it went unused for two days
+
+    sync.resolve("ghcr.io/acts-project/husk-base:v1")  # ... then it's used again
+    sync.gc(force=True)
+
+    assert os.path.exists(dest)
+    assert oras.pulls == 1  # and it was a cache hit, not a re-pull
