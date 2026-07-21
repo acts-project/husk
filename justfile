@@ -66,6 +66,22 @@ docker-run config="config.toml": docker-build
 
 k8s_namespace := "husk"
 k8s_profile   := "husk"                        # colima profile for the local cluster
+
+# Refuse to run a LOCAL recipe against a remote cluster. `oc login` writes into the
+# same kubeconfig kubectl reads, so a CERN login silently redirects every plain
+# `kubectl` in this file — and the namespace is called `husk` in both places, so
+# nothing about the command looks wrong. Without this, `just k8s-nuke` deletes the
+# CERN namespace rather than the laptop one.
+_local-only:
+    #!/usr/bin/env bash
+    ctx="$(kubectl config current-context 2>/dev/null || echo none)"
+    if [ "$ctx" != "colima-{{k8s_profile}}" ]; then
+        echo "REFUSING: this recipe is local-only, but kubectl points elsewhere." >&2
+        echo "  current: $ctx" >&2
+        echo "  want:    colima-{{k8s_profile}}" >&2
+        echo "Switch with: kubectl config use-context colima-{{k8s_profile}}" >&2
+        exit 1
+    fi
 # Must match what .github/workflows/build-app-image.yml publishes: it pushes to
 # ghcr.io/${{ github.repository }} (the REPO name, husk — not huskd, and distinct
 # from the husk-base/husk-gpu golden VM images), tagged by `type=sha`, whose
@@ -126,6 +142,18 @@ k8s-init:
 k8s-secrets env="local" pem="secrets/private-key.pem" clouds="":
     #!/usr/bin/env bash
     set -euo pipefail
+    # This one serves BOTH environments, so it can't take the _local-only guard —
+    # but writing credentials into the wrong cluster is still worth preventing.
+    # env=local must be the colima context; anything else just announces itself
+    # loudly, since the namespace is `husk` in both places and looks identical.
+    ctx="$(kubectl config current-context 2>/dev/null || echo none)"
+    if [ "{{env}}" = "local" ] && [ "$ctx" != "colima-{{k8s_profile}}" ]; then
+        echo "REFUSING: env=local but kubectl points at '$ctx'." >&2
+        echo "Switch with: kubectl config use-context colima-{{k8s_profile}}" >&2
+        echo "(or pass env=cern if you really mean the remote cluster)" >&2
+        exit 1
+    fi
+    echo "target cluster: $ctx   namespace: {{k8s_namespace}}"
     pem="$(eval echo {{pem}})"
     clouds="$(eval echo '{{clouds}}')"
     if [ -z "$clouds" ]; then
@@ -217,17 +245,9 @@ k8s-build:
 # The image tag is unchanged between builds, so this forces a rollout restart —
 # otherwise the Deployment spec is identical and k8s keeps the old pod running.
 # Build the huskd image locally and deploy it to the colima cluster.
-k8s-local: k8s-build
+k8s-local: _local-only k8s-build
     #!/usr/bin/env bash
     set -euo pipefail
-    # Guard against deploying into the wrong cluster (e.g. still pointed at CERN
-    # from an earlier `oc login`). Cheap check, expensive mistake.
-    ctx="$(kubectl config current-context)"
-    if [ "$ctx" != "colima-{{k8s_profile}}" ]; then
-        echo "kubectl context is '$ctx', expected 'colima-{{k8s_profile}}'." >&2
-        echo "Run: kubectl config use-context colima-{{k8s_profile}}" >&2
-        exit 1
-    fi
     kubectl apply -k k8s/overlays/local
     kubectl rollout restart deployment/huskd -n {{k8s_namespace}}
     just k8s-wait
@@ -393,13 +413,13 @@ k8s-forward:
 # Removing the workload while keeping the namespace and its Secrets is nearly
 # always what's wanted; use k8s-nuke for the full teardown.
 # Tear down the local deployment, keeping the namespace and Secrets.
-k8s-local-down:
+k8s-local-down: _local-only
     kubectl delete deployment,service,configmap -n {{k8s_namespace}} -l app.kubernetes.io/name=huskd --ignore-not-found
 
 # Deletes the namespace and everything in it, INCLUDING the Secrets — you will
 # need `just k8s-secrets` again afterwards.
 # Delete the whole husk namespace, Secrets included.
-k8s-nuke:
+k8s-nuke: _local-only
     kubectl delete namespace {{k8s_namespace}} --ignore-not-found
 
 # ── kubernetes: live (CERN OpenShift) ───────────────────────────────────────
