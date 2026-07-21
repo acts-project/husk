@@ -152,6 +152,38 @@ were attempting. Check with `just k8s-live-cache`. Deleting digest directories
 under `/app/.cache/husk/images/` by hand is still safe while running (a deleted
 digest is re-pulled on next resolve), but shouldn't be necessary.
 
+### Metrics state (the second PVC)
+
+`huskd-metrics-state` (1Gi, mounted at `/var/lib/husk`) holds huskd's accumulated
+counters and histograms — action-failure counts, recycle-duration distributions,
+reconcile aborts. Without it they reset to zero on every pod restart, and since
+huskd has **no config hot-reload**, every config change is a restart. So
+`increase(husk_action_failures_total[30d])` would quietly only see back as far as
+the last deploy, and a "p95 recycle time this month" would really be "since the
+last ConfigMap edit".
+
+Two things make this cheap to reason about:
+
+- **It cannot grow with usage.** No event-time instrument carries a per-slot label
+  (there is a test asserting this), so the series count is bounded by config —
+  pools × actions × reasons × buckets — not by how many slots have passed through.
+  Measured at ~2 KB for two pools and 500 recycles. 1Gi is simply the smallest sane
+  request.
+- **Losing it is not an incident.** huskd logs the failure and starts from zero,
+  which Prometheus reads as an ordinary counter reset. The same is true of a
+  corrupt file or a bucket-boundary change: the policy is "reset loudly", never a
+  migration.
+
+It is a **separate claim from the image cache** on purpose despite being tiny. The
+cache is *expected* to fill up (no eviction, and the documented recovery is `rm -rf`
+inside it) — sharing would mean a full cache also stopped metrics persisting, and
+would put a state file inside a directory people are told to delete things from.
+
+`Recreate` means the old pod detaches the volume before the new one attaches, so
+`ReadWriteOnce` is correct and there is no multi-writer window. huskd flushes every
+60s and once more on shutdown, so a clean rollout loses nothing and an ungraceful
+kill loses at most a minute.
+
 ## Not covered yet
 
 - **libvirt pools.** The cern overlay runs the OpenStack pool only. libvirt needs

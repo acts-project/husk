@@ -616,6 +616,13 @@ k8s-reap confirm="":
 k8s-live-cache:
     oc exec -n {{k8s_namespace}} deployment/huskd -- du -sh /app/.cache/husk/images/
 
+# Confirms the metrics PVC is actually being written — the thing that is easy to
+# get wrong (a read-only mount) fails SILENTLY by design: huskd logs a warning and
+# carries on rather than dying over a bookkeeping file. So check the mtime moves.
+# Show huskd's persisted metrics state (size + when it was last flushed).
+k8s-live-metrics-state:
+    oc exec -n {{k8s_namespace}} deployment/huskd -- ls -l --time-style=full-iso /var/lib/husk/metrics.json
+
 # ── openstack ───────────────────────────────────────────────────────────────
 
 # An application credential is permanently bound to the project it was created
