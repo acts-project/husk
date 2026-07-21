@@ -651,8 +651,32 @@ def reap(
     config: _ConfigOpt = Path("config.toml"),
     secrets_dir: _SecretsOpt = None,
     log_level: _LogLevelOpt = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="List what would be deleted, delete nothing"),
+    ] = False,
+    all_runners: Annotated[
+        bool,
+        typer.Option(
+            "--all",
+            help="Also delete offline runners NOT created by husk (dangerous: "
+            "org-wide, hits other people's runners)",
+        ),
+    ] = False,
 ) -> None:
-    """Delete all offline runner registrations from GitHub, across every target."""
+    """Delete husk's offline runner registrations from GitHub, across every target.
+
+    Scoped by default to names this config's pools mint (their `vm_prefix`), because
+    the underlying listing is the target's ENTIRE runner set — org-wide, and not
+    narrowed by the runner group (that only applies at registration). Without the
+    scope, this deletes any offline runner in the org, including ones husk never
+    created; `--all` opts into exactly that.
+
+    Unlike huskd's built-in reaper (controller.reap_runners), this cannot tell a
+    mid-boot slot from a dead one — it has no backend view — so a slot whose runner
+    has not connected yet may lose its registration and get rebuilt. Prefer the
+    daemon's reaper for routine cleanup; use this for one-off messes.
+    """
     _setup_logging(log_level)
     cfgs = _load_all(config, secrets_dir)
     from husk.github import GitHubClient
@@ -660,6 +684,10 @@ def reap(
     # reap_offline is target-wide and label-agnostic, so one client per target
     # covers every pool serving it.
     tokens = _tokens(cfgs[0])
+    # Every pool's prefix, not just this target's: a client is per target, and
+    # scoping wrongly narrow would leave real orphans behind. Names are unique
+    # per pool (config enforces distinct vm_prefix), so the union is safe.
+    prefixes = [c.backend.vm_prefix for c in cfgs]
 
     async def go():
         from husk.discovery import discover_targets
@@ -684,7 +712,15 @@ def reap(
         try:
             for gh in clients:
                 try:
-                    out.append((str(gh.target), await gh.reap_offline()))
+                    out.append(
+                        (
+                            str(gh.target),
+                            await gh.reap_offline(
+                                prefixes=None if all_runners else prefixes,
+                                dry_run=dry_run,
+                            ),
+                        )
+                    )
                 except Exception as e:  # one bad target must not hide the others
                     typer.echo(f"reap failed for {gh.target}: {e}", err=True)
         finally:
@@ -693,11 +729,13 @@ def reap(
             await tokens.aclose()
         return out
 
+    verb = "would reap" if dry_run else "reaped"
+    scope = "ALL offline runners" if all_runners else f"prefixes {prefixes}"
     total = 0
     for target, names in asyncio.run(go()):
-        typer.echo(f"{target}: reaped {len(names)} offline runner(s): {names}")
+        typer.echo(f"{target}: {verb} {len(names)} offline runner(s): {names}")
         total += len(names)
-    typer.echo(f"reaped {total} offline runner(s) in total")
+    typer.echo(f"{verb} {total} offline runner(s) in total ({scope})")
 
 
 async def _recycle(backend, githubs, *, names, all_slots, force, dry_run):

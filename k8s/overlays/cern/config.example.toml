@@ -17,6 +17,10 @@ http_addr = "0.0.0.0:9100"
 lock_path = "/run/husk/huskd.lock"
 image_cache_dir = "/app/.cache/husk/images"
 shrink_ticks = 3
+# Dead runner registrations pile up (a slot whose runner never connects strands
+# one). "off" | "dry-run" | "on" — scoped to this pool's vm_prefix, and never
+# deletes a registration a live slot might still be booting into.
+reap_runners = "dry-run"
 # advertise_addr = "husk.app.cern.ch"  # set once the Route hostname is known
 
 [[pool]]

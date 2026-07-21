@@ -89,6 +89,43 @@ def _cycle_of(runner: Runner) -> int:
         return -1
 
 
+def orphaned_runners(
+    runners: list[Runner], slots: list[Slot], prefix: str
+) -> list[Runner]:
+    """Offline runner registrations owned by this pool that no live slot needs.
+
+    Two ways a registration becomes garbage (see the module docstring on naming:
+    runners are ``f"{vm}-c{cycle}"``):
+
+      * its `vm` names no slot that exists any more — the slot was destroyed, or
+        ownership moved (pool renamed, `vm_prefix` changed, project switched);
+      * its `vm` is live but the cycle is STRICTLY OLDER than that slot's current
+        cycle — a prior-cycle registration the slot has already moved past.
+
+    Deliberately conservative in three ways, because the cost of a wrong delete
+    (a slot that can never register, then rebuilds after its grace) far exceeds
+    the cost of a missed one (a stale row in the runners list):
+
+      * `prefix` scoping means only this pool's own names are ever candidates;
+      * an offline runner at cycle >= the slot's current cycle is KEPT — that is
+        the mid-boot case, where the JIT config is minted and reads `offline`
+        until the runner process connects;
+      * an unparseable name (no trailing -c<N>) is kept, never guessed at.
+    """
+    live = {s.name: s.cycle for s in slots}
+    out: list[Runner] = []
+    for r in runners:
+        if r.online or not r.name.startswith(prefix):
+            continue
+        vm, sep, tail = r.name.rpartition("-c")
+        if not sep or not tail.isdigit():
+            continue  # not a husk cycle name — leave it alone
+        current = live.get(vm)
+        if current is None or int(tail) < current:
+            out.append(r)
+    return out
+
+
 def match_runner(runners: list[Runner], slot: Slot) -> Runner | None:
     """Find the GitHub runner belonging to `slot`.
 

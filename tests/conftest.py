@@ -48,6 +48,8 @@ def make_config(
     idle_timeout: float = 1800,
     max_job_duration: float = 21600,
     shrink_ticks: int = 3,
+    reap_runners: str = "off",
+    vm_prefix: str = "husk",
 ) -> Config:
     return Config(
         github=GithubConfig(app_id=123456, private_key="-----FAKE PRIVATE KEY-----"),
@@ -66,6 +68,7 @@ def make_config(
             rebuild_microversion="2.79",
             min_ready=min_ready,
             max_total=max_total,
+            vm_prefix=vm_prefix,
         ),
         timeouts=TimeoutsConfig(
             poll_interval_sec=30,
@@ -73,7 +76,11 @@ def make_config(
             startup_grace_sec=startup_grace,
             max_job_duration_sec=max_job_duration,
         ),
-        controller=ControllerConfig(lock_path="/tmp/x.lock", shrink_ticks=shrink_ticks),
+        controller=ControllerConfig(
+            lock_path="/tmp/x.lock",
+            shrink_ticks=shrink_ticks,
+            reap_runners=reap_runners,
+        ),
     )
 
 

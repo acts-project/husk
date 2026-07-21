@@ -453,6 +453,47 @@ k8s-live-deploy: k8s-live-check k8s-live-apply
 k8s-live-rollback:
     oc rollout undo deployment/huskd -n {{k8s_namespace}}
 
+# Both run `huskctl reap` inside the pod, which already has the App key and config
+# mounted — no credentials on your laptop.
+#
+# reap is scoped to the pools' own vm_prefix, so it cannot touch runners husk did
+# not create. Worth knowing WHY that scoping is not optional: the underlying
+# listing is the target's entire runner set, and the runner GROUP does not narrow
+# it (`runner_group` applies only when registering — generate_jitconfig sets
+# runner_group_id; the read path ignores it). `huskctl reap --all` opts out of the
+# scope and is deliberately not exposed here.
+#
+# For routine cleanup prefer the daemon's own reaper (controller.reap_runners),
+# which additionally knows the live slot set and so can tell a mid-boot slot from
+# a dead one. This CLI cannot: it sees GitHub only, so a slot whose runner has yet
+# to connect may lose its registration and be rebuilt.
+# Show which runner registrations reap WOULD delete, deleting nothing.
+k8s-reap-dry:
+    @echo "context: $(kubectl config current-context)"
+    kubectl exec -n {{k8s_namespace}} deployment/huskd -- huskctl reap --config /etc/husk/config.toml --dry-run
+
+# Gated because it deletes GitHub state: run k8s-reap-dry first and read the list.
+# Delete husk's dead runner registrations (requires: just k8s-reap yes).
+k8s-reap confirm="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "{{confirm}}" != "yes" ]; then
+        echo "refusing to reap without confirmation." >&2
+        echo >&2
+        echo "This deletes GitHub runner registrations. It is scoped to husk's own" >&2
+        echo "vm_prefix, so other people's runners are safe — but a slot that is" >&2
+        echo "mid-boot reads 'offline' until its runner connects, and this CLI has no" >&2
+        echo "view of the backend, so it can delete a registration a slot still needs." >&2
+        echo "That slot then never registers and is rebuilt after its grace period." >&2
+        echo >&2
+        echo "See exactly what would go:  just k8s-reap-dry" >&2
+        echo "context: $(kubectl config current-context)" >&2
+        echo "Then, to proceed:           just k8s-reap yes" >&2
+        exit 1
+    fi
+    echo "context: $(kubectl config current-context)"
+    kubectl exec -n {{k8s_namespace}} deployment/huskd -- huskctl reap --config /etc/husk/config.toml
+
 # There is no automatic eviction — see the sizing note in k8s/overlays/cern/pvc.yaml.
 # Show how much of the golden-image cache PVC is in use.
 k8s-live-cache:

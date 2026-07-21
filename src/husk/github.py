@@ -18,6 +18,7 @@ and ignores it entirely. The JIT mint keeps its 409→delete→retry idempotency
 from __future__ import annotations
 
 import logging
+from collections.abc import Container, Sequence
 from typing import Any
 
 import httpx
@@ -31,6 +32,12 @@ log = logging.getLogger("husk.github")
 # Every org has the Default group at id 1; it's the fallback when a configured
 # group name doesn't exist on a given target.
 DEFAULT_RUNNER_GROUP_ID = 1
+
+# Runner listing pagination. The cap bounds a pathological walk (or a server that
+# never returns a short page); 100 is GitHub's per_page maximum, so this covers
+# 10k registrations.
+_PER_PAGE = 100
+_MAX_RUNNER_PAGES = 100
 
 
 class GitHubClient:
@@ -126,12 +133,38 @@ class GitHubClient:
 
     # ------------------------------------------------------------------ reads
     async def _list_raw(self) -> list[dict]:
-        try:
-            r = await self._request("GET", "/actions/runners?per_page=100")
-            r.raise_for_status()
-        except httpx.HTTPError as e:
-            raise GitHubError(f"list runners failed for {self.target}: {e}") from e
-        runners = r.json().get("runners", [])
+        """Every runner on the target, following pagination.
+
+        The page walk is load-bearing, not tidiness: this list is what the
+        controller uses to decide whether a slot has a live runner (see
+        `match_runner`). Truncating it at one page means slots past the cut look
+        runner-less, get classified UNHEALTHY, and are rebuilt forever — a failure
+        that only appears once an org grows past `_PER_PAGE` registrations.
+        """
+        runners: list[dict] = []
+        for page in range(1, _MAX_RUNNER_PAGES + 1):
+            try:
+                r = await self._request(
+                    "GET", f"/actions/runners?per_page={_PER_PAGE}&page={page}"
+                )
+                r.raise_for_status()
+            except httpx.HTTPError as e:
+                raise GitHubError(f"list runners failed for {self.target}: {e}") from e
+            batch = r.json().get("runners", [])
+            runners.extend(batch)
+            # A short page is the last page. (Also stops on an empty first page.)
+            if len(batch) < _PER_PAGE:
+                break
+        else:
+            # Ran the full range without a short page: rather than silently serve a
+            # truncated list — which would fail *closed* into rebuild loops — say so.
+            log.warning(
+                "runner listing for %s hit the %d-page cap (%d runners); "
+                "the list may be truncated",
+                self.target,
+                _MAX_RUNNER_PAGES,
+                len(runners),
+            )
         log.debug(
             "GET runners (%s) -> HTTP %d, %d runner(s): %s",
             self.target,
@@ -206,11 +239,38 @@ class GitHubClient:
             "DELETE runner %d (%s) -> HTTP %d", runner_id, self.target, r.status_code
         )
 
-    async def reap_offline(self) -> list[str]:
-        """Delete every offline runner — clears leftover/dead JIT registrations."""
+    async def reap_offline(
+        self,
+        *,
+        prefixes: Sequence[str] | None = None,
+        keep: Container[str] = (),
+        dry_run: bool = False,
+    ) -> list[str]:
+        """Delete offline runner registrations — the leftover/dead JIT ones.
+
+        Scoping matters here, because the listing this walks is the target's WHOLE
+        runner set: org-wide, and not narrowed by the configured runner group
+        (`runner_group` is a registration-time concept — `generate_jitconfig` sets
+        `runner_group_id`; nothing filters reads by it). Unscoped, this would
+        delete any offline runner in the org, including ones husk never created.
+
+        `prefixes`  — only consider names starting with one of these (each pool's
+                      `vm_prefix`), which makes other people's runners unreachable.
+                      None means no prefix filter: the old, blunt behaviour.
+        `keep`      — exact names never deleted. The caller uses this for runners
+                      that are offline but expected back (a slot mid-boot).
+        `dry_run`   — return what would be deleted, delete nothing.
+        """
         reaped = []
         for x in await self._list_raw():
-            if x["status"] == "offline":
+            if x["status"] != "offline":
+                continue
+            name = x["name"]
+            if prefixes is not None and not any(name.startswith(p) for p in prefixes):
+                continue
+            if name in keep:
+                continue
+            if not dry_run:
                 await self.delete_runner(x["id"])
-                reaped.append(x["name"])
+            reaped.append(name)
         return reaped

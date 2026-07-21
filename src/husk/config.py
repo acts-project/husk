@@ -217,6 +217,17 @@ class ControllerConfig:
     # comes back through huskd). Empty → falls back to http_addr, which is right
     # unless huskd sits behind a NAT/ingress and is reached on a different address.
     advertise_addr: str = ""
+    # Automatic cleanup of dead runner registrations. Each recycle can strand a
+    # prior-cycle registration (see slot.orphaned_runners), and they accumulate
+    # until something reaps them.
+    #   "off"      — never touch GitHub registrations (default)
+    #   "dry-run"  — log exactly what would be deleted, delete nothing
+    #   "on"       — delete them
+    # Defaults to off, and dry-run exists as the intermediate step, because this
+    # is the controller deleting GitHub state on a timer: a bug here removes
+    # registrations that are in use. Watch dry-run for a while before enabling.
+    # Always scoped to the pool's own vm_prefix, in every mode.
+    reap_runners: str = "off"
 
 
 @dataclass(frozen=True)
@@ -491,6 +502,9 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         shrink_ticks: int = Field(3, ge=1)
         advertise_addr: str = ""
         image_cache_dir: str = ""
+        # Literal, not a bool: a typo like "yes" must fail at load rather than
+        # quietly reading as falsy and leaving orphans to pile up unnoticed.
+        reap_runners: Literal["off", "dry-run", "on"] = "off"
 
         @field_validator("http_addr")
         @classmethod
@@ -580,6 +594,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         shrink_ticks=s.controller.shrink_ticks,
         advertise_addr=s.controller.advertise_addr,
         image_cache_dir=s.controller.image_cache_dir,
+        reap_runners=s.controller.reap_runners,
     )
 
     configs = [_pool_config(p, github, controller) for p in s.pool]
