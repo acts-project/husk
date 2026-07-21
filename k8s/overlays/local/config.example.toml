@@ -58,6 +58,13 @@ scrape_cidr = "0.0.0.0/0"
 
 [pool.backend]
 type = "openstack"
+# Distinct per environment, and NOT derived from the pool name (which is shared).
+# vm_prefix names the VMs and hence the GitHub runners ("<prefix>-<ts>-<n>-c<cycle>"),
+# and it is what husk keys on: match_runner, and the reaper's scoping. Two huskds
+# sharing a prefix in one org would each see the other's mid-boot registrations as
+# orphans and delete them. Cheap insurance that holds even if both land in the same
+# OpenStack project.
+vm_prefix = "husk-local"
 # THE isolation control — this profile name selects the OpenStack project, and
 # nothing else separates this pool from the live one. Point it at a personal /
 # test project; leave the production project to the cern overlay.

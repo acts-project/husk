@@ -519,6 +519,24 @@ k8s-reap confirm="":
 k8s-live-cache:
     oc exec -n {{k8s_namespace}} deployment/huskd -- du -sh /app/.cache/husk/images/
 
+# ── openstack ───────────────────────────────────────────────────────────────
+
+# An application credential is permanently bound to the project it was created
+# under, and that binding lives in Keystone — so an app-cred profile has no
+# project field and clouds.yaml CANNOT tell you where it lands. Two differently
+# named profiles may be one project. Since pools sharing a name are kept apart
+# only by the project, this is the check that says whether the boundary is real.
+# Prefers secrets/clouds.yaml (what the pod gets) over ~/.config/openstack.
+# Show which OpenStack project each clouds.yaml profile authenticates into.
+openstack-whoami *profiles:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -f secrets/clouds.yaml ]; then
+        export OS_CLIENT_CONFIG_FILE="$PWD/secrets/clouds.yaml"
+        echo "using $OS_CLIENT_CONFIG_FILE"
+    fi
+    uv run python scripts/openstack-whoami.py {{profiles}}
+
 # ── dev ─────────────────────────────────────────────────────────────────────
 
 # Run the test suite (extra args pass through to pytest).
