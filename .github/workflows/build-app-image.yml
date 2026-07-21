@@ -6,16 +6,18 @@ name: build-app-image
 # push layers to ghcr — PRs from forks never get registry write.
 
 on:
+  # NO paths filter on main, deliberately. Deploys pin the image by immutable
+  # commit SHA (`just k8s-live-deploy` -> ghcr ...:sha-<short>), which only works
+  # if EVERY main commit has an image. With a filter, a commit touching only k8s/,
+  # justfile or docs builds nothing, and deploying from it fails with "image not
+  # found" on a green main — a confusing failure a long way from its cause.
+  # The rebuild is nearly free: an unchanged src/ is a cache hit through every
+  # layer, so a docs-only commit just re-tags.
   push:
     branches: [main]
     tags: ["v*"]
-    paths:
-      - "src/**"
-      - "pyproject.toml"
-      - "uv.lock"
-      - "Dockerfile"
-      - ".dockerignore"
-      - ".github/workflows/build-app-image.yml"
+  # PRs keep the filter: they exist for signal on the image itself, and a docs PR
+  # has nothing to say about whether the Dockerfile still builds.
   pull_request:
     paths:
       - "src/**"

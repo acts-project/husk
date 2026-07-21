@@ -72,13 +72,26 @@ k8s_profile   := "husk"                        # colima profile for the local cl
 # `kubectl` in this file — and the namespace is called `husk` in both places, so
 # nothing about the command looks wrong. Without this, `just k8s-nuke` deletes the
 # CERN namespace rather than the laptop one.
+#
+# Compares the API SERVER, not the context name: `oc project` mints extra contexts
+# for the same cluster (e.g. husk/127-0-0-1:PORT/system:admin alongside
+# colima-husk), so a name check refuses on the local cluster under a different
+# name — and would keep refusing until you noticed why.
 _local-only:
     #!/usr/bin/env bash
+    want="$(kubectl config view -o jsonpath='{.clusters[?(@.name=="colima-{{k8s_profile}}")].cluster.server}' 2>/dev/null)"
+    have="$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null)"
     ctx="$(kubectl config current-context 2>/dev/null || echo none)"
-    if [ "$ctx" != "colima-{{k8s_profile}}" ]; then
+    if [ -z "$want" ]; then
+        echo "REFUSING: no colima-{{k8s_profile}} cluster in kubeconfig." >&2
+        echo "Start it with: just k8s-start" >&2
+        exit 1
+    fi
+    if [ "$have" != "$want" ]; then
         echo "REFUSING: this recipe is local-only, but kubectl points elsewhere." >&2
-        echo "  current: $ctx" >&2
-        echo "  want:    colima-{{k8s_profile}}" >&2
+        echo "  context: $ctx" >&2
+        echo "  server:  ${have:-<none>}" >&2
+        echo "  want:    $want" >&2
         echo "Switch with: kubectl config use-context colima-{{k8s_profile}}" >&2
         exit 1
     fi
@@ -147,13 +160,20 @@ k8s-secrets env="local" pem="secrets/private-key.pem" clouds="":
     # env=local must be the colima context; anything else just announces itself
     # loudly, since the namespace is `husk` in both places and looks identical.
     ctx="$(kubectl config current-context 2>/dev/null || echo none)"
-    if [ "{{env}}" = "local" ] && [ "$ctx" != "colima-{{k8s_profile}}" ]; then
-        echo "REFUSING: env=local but kubectl points at '$ctx'." >&2
+    # Server comparison, not context name — see _local-only.
+    want="$(kubectl config view -o jsonpath='{.clusters[?(@.name=="colima-{{k8s_profile}}")].cluster.server}' 2>/dev/null)"
+    have="$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null)"
+    if [ "{{env}}" = "local" ] && [ "$have" != "$want" ]; then
+        echo "REFUSING: env=local but kubectl points at a non-local cluster." >&2
+        echo "  context: $ctx" >&2
+        echo "  server:  ${have:-<none>}" >&2
         echo "Switch with: kubectl config use-context colima-{{k8s_profile}}" >&2
         echo "(or pass env=cern if you really mean the remote cluster)" >&2
         exit 1
     fi
-    echo "target cluster: $ctx   namespace: {{k8s_namespace}}"
+    echo "target cluster: $ctx"
+    echo "  server:    ${have:-<none>}"
+    echo "  namespace: {{k8s_namespace}}"
     pem="$(eval echo {{pem}})"
     clouds="$(eval echo '{{clouds}}')"
     if [ -z "$clouds" ]; then
@@ -187,7 +207,13 @@ k8s-secrets env="local" pem="secrets/private-key.pem" clouds="":
         echo "warning: k8s/overlays/{{env}}/config.toml wants cloud = \"$profile\"," >&2
         echo "         but $clouds has no such profile. huskd will fail to connect." >&2
     fi
-    kubectl create namespace {{k8s_namespace}} --dry-run=client -o yaml | kubectl apply -f -
+    # Create the namespace only if it is genuinely missing. Applying an existing
+    # one needs update rights on the Namespace object, which a plain OpenShift
+    # project member does not have — so an unconditional apply fails at CERN, where
+    # the project already exists and was made for us.
+    if ! kubectl get namespace {{k8s_namespace}} >/dev/null 2>&1; then
+        kubectl create namespace {{k8s_namespace}}
+    fi
     # --dry-run|apply so re-running rotates the contents instead of erroring.
     # NB "$pem"/"$clouds", not {{pem}}/{{clouds}} — the shell vars are the ~-expanded
     # ones. The Secret KEYS (private-key.pem, clouds.yaml) are what the Deployment
