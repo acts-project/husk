@@ -87,6 +87,34 @@ def _dir_for(digest: str) -> str:
     return digest.replace(":", "-")
 
 
+def _fs_space(path: str) -> tuple[int | None, int | None]:
+    """(capacity, free) in bytes for the filesystem holding `path`, or (None, None).
+
+    Walks up to the nearest existing ancestor, because on a cold start the cache
+    directory has not been created yet while the volume under it very much exists —
+    and an ancestor on the same mount reports the same filesystem, which is the
+    thing we actually want to know about.
+
+    `f_bavail`, not `f_bfree`: the latter counts blocks reserved for root, which
+    huskd (running unprivileged) can never use. Reporting them as free would make
+    the volume look emptier than it is right when that matters most.
+
+    Best-effort — this feeds /metrics, so anything unmeasurable is None and the
+    series is simply omitted."""
+    while True:
+        try:
+            st = os.statvfs(path)
+            return st.f_frsize * st.f_blocks, st.f_frsize * st.f_bavail
+        except FileNotFoundError:
+            parent = os.path.dirname(path.rstrip(os.sep))
+            if not parent or parent == path:
+                return None, None
+            path = parent
+        except OSError:
+            log.debug("could not statvfs %s", path, exc_info=True)
+            return None, None
+
+
 class ImageSyncError(RuntimeError):
     """The registry pull failed, or the artifact had no qcow2 layer."""
 
@@ -368,10 +396,19 @@ class ImageSync:
         )
 
     def cache_usage(self) -> DiskUsage:
-        """How many qcow2 images the controller cache holds, and their total size.
+        """How many qcow2 images the controller cache holds, their total size, and
+        how full the filesystem underneath them is.
 
-        Nothing prunes this cache, so it grows by one golden (multi-GB) per image
-        bump forever — this is the metric that makes that leak visible.
+        `gc` bounds this cache, so the image counts should sit near "the goldens
+        in service" and spike for a day around a rollout. A count that keeps
+        climbing means pins are not being released (or a pool stopped pinning) —
+        which is exactly the kind of drift worth a graph.
+
+        The filesystem figures answer the different question GC does not: how much
+        room is left. Those come apart, because the cache is not the only thing on
+        the volume and GC only reclaims what husk itself put there. On k8s this
+        directory is its own PVC, so this is the number that says whether the next
+        golden pull will fail.
 
         Memoized for `_USAGE_TTL_S` because `/metrics` reads it. In-flight pulls
         (`.pull-*` temp dirs) are excluded: they are not cache content yet, and
@@ -398,7 +435,15 @@ class ImageSync:
             pass  # nothing pulled yet
         except OSError:
             log.debug("could not scan image cache %s", self.cache_dir, exc_info=True)
-        usage = DiskUsage(kind=CACHE, host="", images=images, total_bytes=total)
+        size, avail = _fs_space(self.cache_dir)
+        usage = DiskUsage(
+            kind=CACHE,
+            host="",
+            images=images,
+            total_bytes=total,
+            fs_size_bytes=size,
+            fs_avail_bytes=avail,
+        )
         with self._locks_guard:
             self._usage = (now, usage)
         return usage

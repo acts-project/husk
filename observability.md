@@ -551,8 +551,10 @@ husk_image_bytes{host="gpu-1",kind="overlay"} 88604672.0
 Three populations, two machines (`storage.py`):
 
 - **`cache`** — the controller-local OCI pull cache (`~/.cache/husk/images`).
-  Nothing GCs it, so it grows by one multi-GB golden per image bump forever.
-  This gauge is what makes that leak visible; alert on it.
+  `ImageSync.gc` evicts a digest no pool pins 24h after its last use, so this
+  should sit at the goldens in service and spike for about a day around a
+  rollout. A count that climbs and never comes back down means pins aren't being
+  released — the drift this gauge exists to show.
 - **`golden`** — the backing files staged into each hypervisor's storage pool.
   `_gc_goldens` prunes unreferenced ones, so this should stay flat across a
   rollout, briefly doubling while the new golden lands.
@@ -576,6 +578,78 @@ look like a disk that emptied itself.
 OpenStack pools report no host rows: Nova/Glance own that storage. The Glance
 image listing already returns per-image sizes (`_gc_glance`), so a `kind="glance"`
 row is a small follow-up, not yet exposed.
+
+### Headroom — what actually predicts the outage
+
+`husk_image_bytes` says how much husk is *holding*. It does not say how much room
+is left, and those come apart: on Kubernetes the pull cache is its own PVC whose
+capacity huskd cannot otherwise see, and a hypervisor's storage pool shares a disk
+with everything else on that box, so husk's footprint can be flat while the volume
+fills anyway.
+
+So `/metrics` also carries the filesystem behind each location, named after
+node_exporter's equivalents so the alerting idiom carries straight over:
+
+```
+husk_filesystem_size_bytes{host="",kind="cache"}   53687091200.0
+husk_filesystem_avail_bytes{host="",kind="cache"}  42949672960.0
+```
+
+The alert you actually want on the cache PVC — it fires on *headroom*, so it stays
+correct if the PVC is resized. `ImageSync.gc` does not make it redundant: GC bounds
+what *husk* puts on the volume, and says nothing about anything else sharing it or
+about pins that stop being released.
+
+```promql
+husk_filesystem_avail_bytes{kind="cache"}
+  / husk_filesystem_size_bytes{kind="cache"} < 0.15
+```
+
+Running out is not cosmetic: a full cache fails the pull for a **new** golden,
+breaking exactly the rollout you were attempting.
+
+With GC in place the expected shape is a *sawtooth*, not a ramp — a bump adds a
+golden, and the superseded one is reclaimed 24h later. So a `predict_linear` is
+still worth having, but window it well past that 24h so the teeth average out;
+what it catches is the case GC cannot, a digest that stays pinned forever:
+
+```promql
+predict_linear(husk_filesystem_avail_bytes{kind="cache"}[7d], 14*86400) < 0
+```
+
+Caveats, in order of how likely they are to bite:
+
+- **What `statvfs` reports depends on the storage class — VERIFY THIS ONCE.** The
+  mechanism is the same one `df` and node_exporter use, and a filesystem-mode PVC
+  is an ordinary mount, so it always returns *something*. Whether that something is
+  the PVC's size is the question:
+  - block-backed claims (RBD, EBS, Cinder) sit on a device sized to the claim, so
+    they report the claim. Correct.
+  - **CephFS — what `cephfs-ssd-no-backup` is** — reports the subvolume's
+    `ceph.quota.max_bytes` *if* ceph-csi set one and `client_quota_df` is enabled
+    (both are defaults). If either isn't true, statvfs reports the whole Ceph
+    cluster's capacity, `avail/size` sits near 1.0 forever, and **the alert above
+    silently never fires**.
+  - `emptyDir` and k3s local-path report the *node's* disk, not any limit. So the
+    local overlay's numbers describe your colima VM, not a quota.
+
+  One command settles it on the real cluster: `just k8s-live-cache` now prints
+  `df -h` alongside `du`. If Size reads ~50G the alert is good; if it reads tens of
+  TB, fall back to `kubelet_volume_stats_available_bytes` (authoritative for PVCs,
+  published by the kubelet) or alert on absolute `husk_image_bytes` growth instead.
+- **`avail`, not `free`.** These come from `statvfs(f_bavail)`, which excludes
+  root-reserved blocks huskd can never use. It is the space huskd actually has.
+- **Do not `sum()` them.** They describe a *filesystem*, so if two `kind`s ever
+  share one disk they report identical numbers; aggregate with `max()`/`avg()`.
+  Today only `kind="cache"` reports them — the backends do not measure their
+  hosts' filesystems yet, and a location with no measurement omits the series
+  rather than emitting a `0` that would read as "completely full".
+
+Given the first caveat, `kubelet_volume_stats_*` is the more authoritative source
+for the PVC specifically. The husk-side series exist because they don't depend on
+cluster metrics being scraped, and because they extend to the libvirt hosts, which
+are not in the cluster at all — but if the two disagree about the cache volume,
+believe the kubelet.
 
 -----
 

@@ -10,6 +10,20 @@ from husk.image_sync import ImageSync
 from husk.storage import CACHE, GOLDEN, OVERLAY, DiskUsage, collect
 
 
+def _sample(body: str, metric: str) -> float:
+    """The single value of `metric` in an exposition, via the real parser."""
+    from prometheus_client.parser import text_string_to_metric_families
+
+    values = [
+        s.value
+        for family in text_string_to_metric_families(body)
+        for s in family.samples
+        if s.name == metric
+    ]
+    assert len(values) == 1, f"{metric}: expected one sample, got {values}"
+    return values[0]
+
+
 def _qcow2(path: str, size: int) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as fh:
@@ -24,7 +38,14 @@ def test_cache_usage_counts_and_sums_qcow2(tmp_path):
 
     usage = ImageSync(cache).cache_usage()
 
-    assert usage == DiskUsage(kind=CACHE, host="", images=2, total_bytes=350)
+    # Only the qcow2-content half is asserted here; the filesystem figures depend
+    # on whatever disk tmp_path lives on and have their own tests below.
+    assert (usage.kind, usage.host, usage.images, usage.total_bytes) == (
+        CACHE,
+        "",
+        2,
+        350,
+    )
 
 
 def test_cache_usage_ignores_in_flight_pulls(tmp_path):
@@ -130,6 +151,79 @@ def test_render_storage_exposition():
     for line in body.splitlines():
         if line.startswith(("husk_images", "husk_image_bytes")):
             assert "backend=" not in line
+
+
+# ------------------------------------------------------- filesystem headroom
+def test_cache_usage_reports_filesystem_headroom(tmp_path):
+    """Content size says what husk is holding; this says whether the next golden
+    pull will fit. On k8s the cache is its own PVC, whose capacity huskd cannot
+    otherwise see."""
+    cache = str(tmp_path / "cache")
+    _qcow2(os.path.join(cache, "sha256-aaa", "base.qcow2"), 100)
+
+    usage = ImageSync(cache).cache_usage()
+
+    assert usage.fs_size_bytes and usage.fs_size_bytes > 0
+    assert usage.fs_avail_bytes and 0 < usage.fs_avail_bytes <= usage.fs_size_bytes
+
+
+def test_filesystem_headroom_works_before_the_cache_dir_exists(tmp_path):
+    """Cold start: the PVC is mounted but nothing has been pulled, so the cache
+    directory isn't there yet. The volume still has a capacity worth reporting —
+    `_fs_space` walks up to the nearest existing ancestor to find it."""
+    usage = ImageSync(str(tmp_path / "never" / "pulled")).cache_usage()
+
+    assert (usage.images, usage.total_bytes) == (0, 0)
+    assert usage.fs_size_bytes and usage.fs_size_bytes > 0
+
+
+def test_headroom_uses_available_not_free(tmp_path):
+    """f_bavail, not f_bfree: the difference is the root-reserved blocks, which
+    huskd (unprivileged) can never actually use. Counting them would make the
+    volume look emptier than it is exactly when that matters."""
+    import os as _os
+
+    st = _os.statvfs(str(tmp_path))
+    usage = ImageSync(str(tmp_path)).cache_usage()
+
+    assert usage.fs_avail_bytes == st.f_frsize * st.f_bavail
+    if st.f_bfree != st.f_bavail:  # reserved blocks exist on this filesystem
+        assert usage.fs_avail_bytes < st.f_frsize * st.f_bfree
+
+
+def test_headroom_series_are_rendered():
+    body = render_metrics(
+        storage=[
+            DiskUsage(
+                kind=CACHE,
+                host="",
+                images=2,
+                total_bytes=350,
+                fs_size_bytes=53687091200,
+                fs_avail_bytes=42949672960,
+            )
+        ]
+    )
+
+    # Parsed, not substring-matched: prometheus_client renders large floats in
+    # exponent form and the exponent's zero-padding is platform-dependent
+    # (5.36870912e+010 on macOS, e+10 on Linux), so a literal would pass locally
+    # and fail in CI.
+    assert _sample(body, "husk_filesystem_size_bytes") == 53687091200
+    assert _sample(body, "husk_filesystem_avail_bytes") == 42949672960
+
+
+def test_unmeasured_headroom_is_omitted_not_zero():
+    """A backend that doesn't measure its hosts' filesystems reports None. Emitting
+    0 would read as "completely full" to any sane alert."""
+    body = render_metrics(
+        storage=[DiskUsage(kind=GOLDEN, host="hv1", images=1, total_bytes=100)]
+    )
+
+    assert "# TYPE husk_filesystem_size_bytes gauge" in body
+    assert not [
+        ln for ln in body.splitlines() if ln.startswith("husk_filesystem_size_bytes{")
+    ]
 
 
 def test_render_storage_with_nothing_measured_still_emits_headers():

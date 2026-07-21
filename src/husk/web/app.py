@@ -69,11 +69,14 @@ def build_registry(
 ) -> CollectorRegistry:
     """The registry `/metrics` renders.
 
-    A fresh `CollectorRegistry` rather than `prometheus_client.REGISTRY`: the
-    default one is process-global and auto-registers the platform/GC collectors,
-    which would make two `make_app` calls in one test process collide on duplicate
-    registration. Registering explicitly also means the exposition contains
-    exactly what husk decided to put in it."""
+    A fresh `CollectorRegistry` rather than `prometheus_client.REGISTRY`, because
+    the default one is process-global and already carries the Process/Platform/GC
+    collectors from import time. Sharing it would mean every `make_app` in a test
+    process accumulating collectors on the same registry — each one still gets
+    collected, so the exposition would grow a duplicate copy of every husk series
+    per app ever built — and it would fold in platform metrics husk never chose to
+    publish. An explicit registry makes the exposition exactly what husk put in
+    it."""
     registry = CollectorRegistry()
     registry.register(SnapshotCollector(snapshot_provider, storage_provider))
     if metrics is not None:

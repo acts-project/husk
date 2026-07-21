@@ -78,9 +78,11 @@ Labels = tuple[str, ...]
 class Counter:
     """A monotonic count, keyed by labelset.
 
-    Deliberately minimal: `inc` is the only mutation, so a counter can never go
-    backwards except by a process restart (which Prometheus already models as a
-    reset) or by a `load_dict` at startup."""
+    Deliberately minimal: `inc` and the additive `load_dict` are the only
+    mutations, and neither can lower a value — so within one process a counter is
+    monotonic by construction. The only decrease Prometheus can ever observe is a
+    restart that finds no (or an older) saved state, which is exactly the counter
+    reset `rate()` already handles."""
 
     def __init__(self, name: str, doc: str, labels: Sequence[str]) -> None:
         self.name = name
@@ -483,8 +485,34 @@ class SnapshotCollector:
             "Total size of stored qcow2 images by location",
             labels=["kind", "host"],
         )
+        # How much room is LEFT, which is the number that predicts an outage —
+        # husk's own footprint can be flat while the volume fills for other
+        # reasons, and on k8s the cache is its own PVC whose capacity husk cannot
+        # otherwise see. Named after node_exporter's equivalents so the alerting
+        # idiom carries over.
+        #
+        # These describe the *filesystem* behind a location, so two `kind`s sharing
+        # one disk would report identical numbers: aggregate with max()/avg(),
+        # never sum(). (Today only kind="cache" reports them at all — the backends
+        # do not measure host filesystems yet.)
+        fs_size = GaugeMetricFamily(
+            "husk_filesystem_size_bytes",
+            "Capacity of the filesystem holding these images",
+            labels=["kind", "host"],
+        )
+        fs_avail = GaugeMetricFamily(
+            "husk_filesystem_avail_bytes",
+            "Space available to huskd on that filesystem",
+            labels=["kind", "host"],
+        )
         usage: Iterable[DiskUsage] = (self._storage() if self._storage else None) or []
         for u in usage:
             images.add_metric([u.kind, u.host], u.images)
             image_bytes.add_metric([u.kind, u.host], u.total_bytes)
-        yield from (images, image_bytes)
+            # Omitted rather than emitted as 0 where unmeasured: a 0-capacity
+            # filesystem would read as "completely full" to any sane alert.
+            if u.fs_size_bytes is not None:
+                fs_size.add_metric([u.kind, u.host], u.fs_size_bytes)
+            if u.fs_avail_bytes is not None:
+                fs_avail.add_metric([u.kind, u.host], u.fs_avail_bytes)
+        yield from (images, image_bytes, fs_size, fs_avail)
