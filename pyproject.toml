@@ -49,3 +49,8 @@ packages = ["src/husk"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest-xdist>=3.8.0",
+]
