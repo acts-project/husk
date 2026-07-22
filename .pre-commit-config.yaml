@@ -8,3 +8,13 @@ repos:
     rev: v0.15.15
     hooks:
       - id: ruff-format
+
+  # Offline pass over the workflow files, so an unpinned `uses:` or a template
+  # injection is caught at commit time rather than in CI. Reads .github/zizmor.yml
+  # like the CI job does, but without a GH_TOKEN it skips the checks that need the
+  # GitHub API (known-vulnerable-actions, stale-action-refs, ref resolution for
+  # unpinned-uses) — that's why the `zizmor` CI job stays.
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.28.0
+    hooks:
+      - id: zizmor
