@@ -21,7 +21,28 @@ unit that reads it, the uid-1000 runner user it runs as — lives in images/file
 from __future__ import annotations
 
 import base64
+import importlib.resources
 import re
+import textwrap
+
+# The egress ruleset lives in its own file rather than inline in the template
+# below: it is the security-critical half of this module, it is nftables and not
+# YAML, and authoring it at its own indentation means the conditional fragments
+# spliced into it are written at nft's indentation instead of nft's plus the
+# YAML block scalar's. Read once at import so a missing/miss-packaged file fails
+# at startup rather than on the first slot rebuild.
+#
+# The ruleset is idempotent by construction — it drops and recreates husk's OWN
+# table — because cloud-init's runcmd re-runs on every rebuild, and reapplying
+# must not disturb any other table on the guest.
+_EGRESS_RULESET = (
+    importlib.resources.files("husk")
+    .joinpath("files/husk-egress.nft")
+    .read_text(encoding="utf-8")
+)
+
+# Column the ruleset sits at inside the `content: |` block scalar.
+_YAML_BLOCK_INDENT = " " * 6
 
 RUNNER_CLOUD_INIT = r"""#cloud-config
 # Golden image: everything slow and static is in the image already, so this is
@@ -36,28 +57,7 @@ write_files:
   # cloud-init (NOT baked) so a pool can change it without rebuilding the image.
   - path: /etc/nftables/husk-egress.nft
     content: |
-      #!/usr/sbin/nft -f
-      table inet husk {}
-      delete table inet husk
-
-      table inet husk {
-@@CVMFS_SET@@@@ALLOW_SET@@        chain output {
-          type filter hook output priority 0; policy accept;
-
-          oif "lo" accept
-          ct state established,related accept
-
-          # Keep name resolution + time sync working: CERN's own resolvers/NTP
-          # live inside the blocked ranges, so allow 53/123 to anywhere first.
-          udp dport { 53, 123 } accept
-          tcp dport 53 accept
-
-@@CVMFS_PROXY@@@@ALLOW_RULE@@          # Deny all other egress to CERN-internal networks. Public internet
-          # falls through to `policy accept`. Extend these sets as needed.
-          ip daddr { 128.141.0.0/16, 128.142.0.0/16, 137.138.0.0/16, 188.184.0.0/15 } drop
-          ip6 daddr { 2001:1458::/32, 2001:1459::/32 } drop
-        }
-@@METRICS_INGRESS@@      }
+@@EGRESS_RULESET@@
 
 runcmd:
   # jitconfig is written root-owned above; the runner service runs as `runner`.
@@ -124,13 +124,13 @@ _GPU_ANCHOR = "  # Lock down egress just before the (untrusted) runner starts.\n
 # accept, so it holds even with a wide scrape_cidr, and needs no knowledge of the
 # guest's IP. The runner has no business reading host metrics.
 _METRICS_INGRESS = """\
-        chain input {
-          type filter hook input priority 0; policy accept;
+  chain input {
+    type filter hook input priority 0; policy accept;
 
-          iif "lo" tcp dport 9100 drop
-          tcp dport 9100 @@SADDR@@ { @@SCRAPE_CIDR@@ } accept
-          tcp dport 9100 drop
-        }
+    iif "lo" tcp dport 9100 drop
+    tcp dport 9100 @@SADDR@@ { @@SCRAPE_CIDR@@ } accept
+    tcp dport 9100 drop
+  }
 """
 
 # node_exporter is baked but NOT enabled for boot, and cloud-init starts it only
@@ -276,6 +276,63 @@ def _cvmfs_setup(repos: tuple[str, ...], proxy: str) -> str:
     return out
 
 
+def _egress_ruleset(
+    *,
+    scrape_cidr: str,
+    cvmfs: bool,
+    egress_allow: bool,
+) -> str:
+    """Fill files/husk-egress.nft. Returned at the file's own indentation; the
+    caller indents it into the YAML block scalar.
+
+    Each conditional resolves to nothing when its feature is off, so a plain slot
+    gets exactly the ruleset as authored — that is what makes the features
+    fail-closed rather than merely inert."""
+    if scrape_cidr:
+        saddr = "ip6 saddr" if ":" in scrape_cidr else "ip saddr"
+        ingress = _METRICS_INGRESS.replace("@@SADDR@@", saddr).replace(
+            "@@SCRAPE_CIDR@@", scrape_cidr
+        )
+    else:
+        ingress = ""
+
+    # The two named holes are the same shape: a set declared in the table, an
+    # accept placed BEFORE the CERN-internal drops (nftables takes the first
+    # match, so an accept after them would parse and do nothing), and a runcmd
+    # step that fills the set from an in-guest resolve.
+    cvmfs_set = "  set cvmfs_proxy { type ipv4_addr; }\n" if cvmfs else ""
+    cvmfs_rule = (
+        (
+            "    # Allow the CVMFS HTTP proxy. Its CERN squids live in the\n"
+            "    # CERN-internal ranges dropped below, so this accept must\n"
+            "    # precede them; the set is populated in runcmd after an\n"
+            "    # in-guest resolve of the proxy hostnames.\n"
+            "    ip daddr @cvmfs_proxy accept\n\n"
+        )
+        if cvmfs
+        else ""
+    )
+    allow_set = "  set egress_allow { type ipv4_addr; }\n" if egress_allow else ""
+    allow_rule = (
+        (
+            "    # Allow the operator-listed hosts. They live in the\n"
+            "    # CERN-internal ranges dropped below, so this accept must\n"
+            "    # precede them; the set is populated in runcmd after an\n"
+            "    # in-guest resolve.\n"
+            "    ip daddr @egress_allow accept\n\n"
+        )
+        if egress_allow
+        else ""
+    )
+    return (
+        _EGRESS_RULESET.replace("@@CVMFS_SET@@", cvmfs_set)
+        .replace("@@CVMFS_PROXY@@", cvmfs_rule)
+        .replace("@@ALLOW_SET@@", allow_set)
+        .replace("@@ALLOW_RULE@@", allow_rule)
+        .replace("@@METRICS_INGRESS@@", ingress)
+    )
+
+
 def render_cloud_init(
     jit_blob: str,
     *,
@@ -312,61 +369,34 @@ def render_cloud_init(
     job images are shared with GitHub-hosted runners and so cannot carry anything
     that is only true on a husk slot — the environment can. Empty renders
     byte-identically to a slot without it."""
+    ruleset = _egress_ruleset(
+        scrape_cidr=scrape_cidr,
+        cvmfs=bool(cvmfs_repos),
+        egress_allow=bool(egress_allow_hosts),
+    )
+    cvmfs_wf = cvmfs_setup = ""
+    if cvmfs_repos:
+        cvmfs_wf = _cvmfs_write_files(cvmfs_repos, cvmfs_proxy, cvmfs_quota_mb)
+        cvmfs_setup = _cvmfs_setup(cvmfs_repos, cvmfs_proxy)
+
     template = RUNNER_CLOUD_INIT
     if gpu:
         template = template.replace(_GPU_ANCHOR, _GPU_RUNTIME + _GPU_ANCHOR, 1)
-    template = template.replace(
-        "@@METRICS_START@@\n", _METRICS_START if scrape_cidr else ""
-    )
-    ingress = ""
-    if scrape_cidr:
-        saddr = "ip6 saddr" if ":" in scrape_cidr else "ip saddr"
-        ingress = _METRICS_INGRESS.replace("@@SADDR@@", saddr).replace(
-            "@@SCRAPE_CIDR@@", scrape_cidr
+    return (
+        template.replace(
+            # rstrip: the ruleset's own trailing newline would double the blank
+            # line the template already has before `runcmd:`.
+            "@@EGRESS_RULESET@@",
+            textwrap.indent(ruleset, _YAML_BLOCK_INDENT).rstrip("\n"),
         )
-    template = template.replace("@@METRICS_INGRESS@@", ingress)
-
-    # CVMFS placeholders. All resolve to "" when CVMFS is off, so a pool without
-    # it renders exactly as if the feature did not exist.
-    if cvmfs_repos:
-        cvmfs_set = "        set cvmfs_proxy { type ipv4_addr; }\n"
-        cvmfs_rule = (
-            "          # Allow the CVMFS HTTP proxy. Its CERN squids live in the\n"
-            "          # CERN-internal ranges dropped below, so this accept must\n"
-            "          # precede them; the set is populated in runcmd after an\n"
-            "          # in-guest resolve of the proxy hostnames.\n"
-            "          ip daddr @cvmfs_proxy accept\n\n"
-        )
-        cvmfs_wf = _cvmfs_write_files(cvmfs_repos, cvmfs_proxy, cvmfs_quota_mb)
-        cvmfs_setup = _cvmfs_setup(cvmfs_repos, cvmfs_proxy)
-    else:
-        cvmfs_set = cvmfs_rule = cvmfs_wf = cvmfs_setup = ""
-    template = (
-        template.replace("@@CVMFS_SET@@", cvmfs_set)
-        .replace("@@CVMFS_PROXY@@", cvmfs_rule)
+        .replace("@@METRICS_START@@\n", _METRICS_START if scrape_cidr else "")
         .replace("@@CVMFS_WRITE_FILES@@", cvmfs_wf)
         .replace("@@CVMFS_SETUP@@", cvmfs_setup)
-    )
-
-    # Egress allowlist. Same shape as the CVMFS proxy hole.
-    if egress_allow_hosts:
-        allow_set = "        set egress_allow { type ipv4_addr; }\n"
-        allow_rule = (
-            "          # Allow the operator-listed hosts. They live in the\n"
-            "          # CERN-internal ranges dropped below, so this accept must\n"
-            "          # precede them; the set is populated in runcmd after an\n"
-            "          # in-guest resolve.\n"
-            "          ip daddr @egress_allow accept\n\n"
-        )
-    else:
-        allow_set = allow_rule = ""
-    template = (
-        template.replace("@@ALLOW_SET@@", allow_set)
-        .replace("@@ALLOW_RULE@@", allow_rule)
         .replace("@@ALLOW_SETUP@@", _egress_allow_setup(egress_allow_hosts))
         .replace("@@CONTAINER_ENV@@", _container_env_write_files(container_env))
+        .replace("@@JIT@@", jit_blob)
+        .encode()
     )
-    return template.replace("@@JIT@@", jit_blob).encode()
 
 
 def b64(data: bytes) -> str:
