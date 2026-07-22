@@ -8,12 +8,14 @@ from husk.config import RunnerConfig
 
 
 def _legacy(jit: str, url: str) -> bytes:
-    # The validated recipe = the template with no metrics opted in (no scrape_cidr),
-    # i.e. the ingress placeholder resolves away to nothing.
+    # The validated recipe = the template with nothing opted in (no scrape_cidr, no
+    # cvmfs), i.e. every optional placeholder resolves away to nothing.
     return (
         RUNNER_CLOUD_INIT.replace("@@JIT@@", jit)
         .replace("@@RUNNER_URL@@", url)
         .replace("@@METRICS_INGRESS@@", "")
+        .replace("@@CVMFS_SET@@", "")
+        .replace("@@CVMFS_PROXY@@", "")
     ).encode()
 
 

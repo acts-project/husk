@@ -88,6 +88,18 @@ ARGS=(
   # Container stack + runner native deps + firewall ENGINE (ruleset is runtime).
   --install "podman,podman-docker,fuse-overlayfs,slirp4netns,netavark,aardvark-dns,libicu,sudo,curl,jq,git,nftables,tar"
 
+  # CernVM-FS client + autofs wiring (baked; cloud-init supplies the per-pool repo
+  # list, the HTTP proxy, and the per-cycle eager-mounts). cvmfs-config-default
+  # pulls the CERN config-repo so any *.cern.ch repo resolves; `cvmfs_config setup`
+  # wires autofs under /cvmfs and creates the cvmfs user. autofs is enabled so it
+  # is up at boot (cloud-init also starts it each cycle). The cvmfs-release RPM adds
+  # the pinned client's yum repo. No network to the Stratum-1/proxy is needed here —
+  # the boot-time firewall + eager-mount own that (see cloudinit.py).
+  --run-command 'dnf -y install https://ecsft.cern.ch/dist/cvmfs/cvmfs-release/cvmfs-release-latest.noarch.rpm'
+  --run-command "dnf -y install cvmfs-${CVMFS_VERSION} cvmfs-config-default"
+  --run-command 'cvmfs_config setup'
+  --run-command 'systemctl enable autofs'
+
   # Unprivileged runner user (uid 1000 lines up with /run/user/1000 in the unit).
   --run-command 'id -u runner >/dev/null 2>&1 || useradd -u 1000 -m -s /bin/bash runner'
   --run-command 'passwd -l runner'

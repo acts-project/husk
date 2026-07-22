@@ -107,6 +107,20 @@ idle_timeout_sec = 1800                # rebuild idle slots to refresh credentia
 startup_grace_sec = 300               # post-rebuild grace for the runner to register
 max_job_duration_sec = 21600          # 6h — stop (not destroy) busy slots beyond this
 
+# CernVM-FS (/cvmfs) for this pool's slots. Opt-in; omit the table for no CVMFS.
+# The client + autofs are BAKED into the golden image, so this REQUIRES
+# [pool.runner] prebaked = true (a stock image has no client — the loader rejects
+# the combination). Each cycle cloud-init writes the client config, eager-mounts
+# every listed repo, binds each /cvmfs/<repo> into every job container (per-repo,
+# not a whole-/cvmfs bind — the autofs root readdir is denied under the rootless
+# user namespace), and opens ONE firewall hole for the proxy: it resolves the
+# proxy hostnames in-guest and allows their IPs, since CERN's squids live inside
+# the CERN-internal ranges the egress firewall otherwise drops.
+# [pool.cvmfs]
+# repositories = ["sft.cern.ch", "atlas.cern.ch", "atlas-condb.cern.ch", "atlas-nightlies.cern.ch"]
+# http_proxy = "http://ca-proxy-atlas.cern.ch:3128;http://ca-proxy.cern.ch:3128"  # CERN Squid (`;` = failover)
+# quota_limit_mb = 4000                # CVMFS_QUOTA_LIMIT; mind the slot's root disk (m2.small = 10 GiB)
+
 # ───────────────────────────── pool 2: libvirt GPU ──────────────────────────
 [[pool]]
 name = "libvirt-gpu"

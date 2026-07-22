@@ -74,6 +74,8 @@ def test_prebaked_false_is_unchanged_full_path():
         RUNNER_CLOUD_INIT.replace("@@JIT@@", "J")
         .replace("@@RUNNER_URL@@", "U")
         .replace("@@METRICS_INGRESS@@", "")
+        .replace("@@CVMFS_SET@@", "")
+        .replace("@@CVMFS_PROXY@@", "")
         .encode()
     )
     gpu = render_cloud_init("J", "U", gpu=True).decode()

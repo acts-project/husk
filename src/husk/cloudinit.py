@@ -15,6 +15,7 @@ uid 1000 so `/run/user/1000` lines up with the systemd unit.
 from __future__ import annotations
 
 import base64
+import re
 
 RUNNER_CLOUD_INIT = r"""#cloud-config
 packages:
@@ -148,7 +149,7 @@ write_files:
       delete table inet husk
 
       table inet husk {
-        chain output {
+@@CVMFS_SET@@        chain output {
           type filter hook output priority 0; policy accept;
 
           oif "lo" accept
@@ -159,7 +160,7 @@ write_files:
           udp dport { 53, 123 } accept
           tcp dport 53 accept
 
-          # Deny all other egress to CERN-internal networks. Public internet
+@@CVMFS_PROXY@@          # Deny all other egress to CERN-internal networks. Public internet
           # falls through to `policy accept`. Extend these sets as needed.
           ip daddr { 128.141.0.0/16, 128.142.0.0/16, 137.138.0.0/16, 188.184.0.0/15 } drop
           ip6 daddr { 2001:1458::/32, 2001:1459::/32 } drop
@@ -270,7 +271,7 @@ write_files:
   - path: /var/lib/husk/jitconfig
     permissions: '0600'
     content: "@@JIT@@"
-
+@@CVMFS_WRITE_FILES@@
   # Coarse egress firewall ruleset — the tunable security policy, kept in
   # cloud-init (NOT baked). MUST stay byte-identical to the full template's copy;
   # guarded by tests/test_cloudinit_prebaked.py::test_prebaked_firewall_matches_full.
@@ -281,7 +282,7 @@ write_files:
       delete table inet husk
 
       table inet husk {
-        chain output {
+@@CVMFS_SET@@        chain output {
           type filter hook output priority 0; policy accept;
 
           oif "lo" accept
@@ -292,7 +293,7 @@ write_files:
           udp dport { 53, 123 } accept
           tcp dport 53 accept
 
-          # Deny all other egress to CERN-internal networks. Public internet
+@@CVMFS_PROXY@@          # Deny all other egress to CERN-internal networks. Public internet
           # falls through to `policy accept`. Extend these sets as needed.
           ip daddr { 128.141.0.0/16, 128.142.0.0/16, 137.138.0.0/16, 188.184.0.0/15 } drop
           ip6 daddr { 2001:1458::/32, 2001:1459::/32 } drop
@@ -306,7 +307,7 @@ runcmd:
   # GPU runtime activation is spliced here for GPU pools (before the firewall).
   # Lock down egress just before the (untrusted) runner starts.
   - /usr/sbin/nft -f /etc/nftables/husk-egress.nft
-  # The runner unit is baked but NOT enabled for boot; cloud-init starts it each
+@@CVMFS_SETUP@@  # The runner unit is baked but NOT enabled for boot; cloud-init starts it each
   # cycle once the fresh JIT config is in place (Type=simple returns immediately).
   - systemctl daemon-reload
 @@METRICS_START@@
@@ -369,6 +370,82 @@ _METRICS_INGRESS = """\
 _METRICS_START = "  - systemctl start husk-node-exporter.service\n"
 
 
+# ── CernVM-FS ────────────────────────────────────────────────────────────────
+# CVMFS is prebaked-only: the client + autofs are baked into the golden image
+# (images/build.sh), so cloud-init lays only the per-pool dynamic layer —
+# default.local (proxy + repos + quota), the containers.conf.d drop-in that binds
+# each repo into every job container, the in-guest firewall hole for the proxy,
+# and the eager-mount of each repo. Empty repo list → every CVMFS placeholder
+# resolves away and the output is exactly the non-CVMFS render.
+
+
+def _proxy_hosts(http_proxy: str) -> list[str]:
+    """Hostnames in a CVMFS_HTTP_PROXY value (`;`/`|`-separated proxy URLs), for
+    the in-guest firewall resolve. `DIRECT`/`auto` and empties are skipped, so a
+    DIRECT config simply opens no proxy hole (its Stratum-1s must then be publicly
+    reachable — the coarse firewall still drops CERN-internal)."""
+    hosts: list[str] = []
+    for part in re.split(r"[;|]", http_proxy):
+        part = part.strip()
+        if not part or part.upper() in {"DIRECT", "AUTO"}:
+            continue
+        netloc = part.split("://", 1)[-1].split("/", 1)[0]  # strip scheme + path
+        host = netloc.rsplit(":", 1)[0]  # strip :port (squids are hostnames, not v6)
+        if host and host not in hosts:
+            hosts.append(host)
+    return hosts
+
+
+def _cvmfs_write_files(repos: tuple[str, ...], proxy: str, quota_mb: int) -> str:
+    """The two write_files entries: the CVMFS client config, and the podman
+    drop-in that binds each repo into EVERY job container. Per-repo binds, not a
+    whole-/cvmfs bind — the autofs root readdir is denied under the rootless
+    userns, but a bind of an already-mounted repo tree is not."""
+    volumes = ", ".join(f'"/cvmfs/{r}:/cvmfs/{r}"' for r in repos)
+    return (
+        "  # CernVM-FS client config (client + autofs are baked; this is the\n"
+        "  # per-pool dynamic layer: proxy, repo list, cache quota).\n"
+        "  - path: /etc/cvmfs/default.local\n"
+        "    content: |\n"
+        f'      CVMFS_HTTP_PROXY="{proxy}"\n'
+        f"      CVMFS_REPOSITORIES={','.join(repos)}\n"
+        f"      CVMFS_QUOTA_LIMIT={quota_mb}\n"
+        "\n"
+        "  # Default per-repo bind mounts for every job container. podman applies\n"
+        "  # containers.conf.d to BOTH the CLI shim and the API socket, so this\n"
+        "  # covers `container:` jobs and step-level `docker run` alike.\n"
+        "  - path: /etc/containers/containers.conf.d/10-cvmfs.conf\n"
+        "    content: |\n"
+        "      [containers]\n"
+        f"      volumes = [{volumes}]\n"
+    )
+
+
+def _cvmfs_setup(repos: tuple[str, ...], proxy: str) -> str:
+    """runcmd steps, spliced AFTER the firewall apply: open the proxy hole (the
+    nft table + empty set now exist), then eager-mount each repo so the per-repo
+    binds above land on already-mounted trees."""
+    out = ""
+    hosts = _proxy_hosts(proxy)
+    if hosts:
+        out += (
+            "  # Open the firewall to the CVMFS proxy: resolve the squid hostnames\n"
+            "  # in-guest (DNS/53 stays allowed post-lockdown) and add their IPs to\n"
+            "  # the nft set, so rotating A-records self-heal on every recycle.\n"
+            "  - |\n"
+            f"    ips=$(getent ahostsv4 {' '.join(hosts)} | awk '{{print $1}}' "
+            "| sort -u | paste -sd, -)\n"
+            '    [ -n "$ips" ] && nft add element inet husk cvmfs_proxy "{ $ips }"\n'
+        )
+    out += (
+        "  # Eager-mount the configured repos so a per-repo bind makes them visible\n"
+        "  # inside rootless job containers (autofs triggers don't cross the userns).\n"
+        "  - systemctl start autofs\n"
+        f'  - for r in {" ".join(repos)}; do cvmfs_config probe "$r" || true; done\n'
+    )
+    return out
+
+
 def render_cloud_init(
     jit_blob: str,
     runner_url: str,
@@ -376,6 +453,9 @@ def render_cloud_init(
     gpu: bool = False,
     prebaked: bool = False,
     scrape_cidr: str = "",
+    cvmfs_repos: tuple[str, ...] = (),
+    cvmfs_proxy: str = "",
+    cvmfs_quota_mb: int = 4000,
 ) -> bytes:
     """Render the cloud-init user-data for one slot.
 
@@ -398,8 +478,16 @@ def render_cloud_init(
     no ingress rule and no exporter running, i.e. nothing listening, which is why
     a pool whose scraper source isn't known yet can simply leave it out. Requires
     `prebaked` (node_exporter only exists in the golden image); the config loader
-    rejects the combination, and it is ignored here on a stock image."""
+    rejects the combination, and it is ignored here on a stock image.
+
+    `cvmfs_repos`/`cvmfs_proxy`/`cvmfs_quota_mb` turn on CernVM-FS: cloud-init writes
+    the client config + a per-repo containers.conf.d bind drop-in, opens the proxy
+    hole in the firewall, and eager-mounts each repo before the runner starts. Also
+    prebaked-only (the client is baked) and fail-closed — empty `cvmfs_repos` renders
+    identically to a non-CVMFS slot. The loader rejects CVMFS + stock; ignored here
+    on a stock image."""
     metrics = scrape_cidr if (scrape_cidr and prebaked) else ""
+    cvmfs = cvmfs_repos if (cvmfs_repos and prebaked) else ()
     if prebaked:
         template = PREBAKED_RUNNER_CLOUD_INIT
         if gpu:
@@ -422,6 +510,30 @@ def render_cloud_init(
             "@@SCRAPE_CIDR@@", metrics
         )
     template = template.replace("@@METRICS_INGRESS@@", ingress)
+
+    # CVMFS placeholders. SET/PROXY live in BOTH ruleset copies (so the drift guard
+    # sees identical text); WRITE_FILES/SETUP exist only in the prebaked template,
+    # where .replace on the stock template is a harmless no-op. All resolve to ""
+    # when CVMFS is off.
+    if cvmfs:
+        cvmfs_set = "        set cvmfs_proxy { type ipv4_addr; }\n"
+        cvmfs_rule = (
+            "          # Allow the CVMFS HTTP proxy. Its CERN squids live in the\n"
+            "          # CERN-internal ranges dropped below, so this accept must\n"
+            "          # precede them; the set is populated in runcmd after an\n"
+            "          # in-guest resolve of the proxy hostnames.\n"
+            "          ip daddr @cvmfs_proxy accept\n\n"
+        )
+        cvmfs_wf = _cvmfs_write_files(cvmfs, cvmfs_proxy, cvmfs_quota_mb)
+        cvmfs_setup = _cvmfs_setup(cvmfs, cvmfs_proxy)
+    else:
+        cvmfs_set = cvmfs_rule = cvmfs_wf = cvmfs_setup = ""
+    template = (
+        template.replace("@@CVMFS_SET@@", cvmfs_set)
+        .replace("@@CVMFS_PROXY@@", cvmfs_rule)
+        .replace("@@CVMFS_WRITE_FILES@@", cvmfs_wf)
+        .replace("@@CVMFS_SETUP@@", cvmfs_setup)
+    )
     return (
         template.replace("@@JIT@@", jit_blob)
         .replace("@@RUNNER_URL@@", runner_url)

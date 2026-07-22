@@ -89,6 +89,12 @@ per-slot, per-job, or meant to change without a rebuild.
   CDI-on-first-boot oneshot (`husk-cdi.service`). CDI generation stays first-boot
   — it needs the driver loaded against a present GPU, which an offline build
   can't provide.
+- The **CernVM-FS client** (`cvmfs` pinned in `versions.env` + `cvmfs-config-default`)
+  and `autofs`, wired by `cvmfs_config setup`. The slow/static capability is baked;
+  the per-pool repo list, HTTP proxy, cache quota, and the per-cycle eager-mounts
+  are cloud-init's (below). `autofs` **is** enabled for boot (unlike the runner
+  units) since it only arms the `/cvmfs` automount map — nothing mounts or reaches
+  the network until cloud-init probes a repo.
 
 **Delivered by cloud-init each create/recycle (dynamic):**
 
@@ -103,6 +109,15 @@ per-slot, per-job, or meant to change without a rebuild.
   `husk-node-exporter.service` if `scrape_cidr` is set (after the ruleset, so
   `:9100` is never briefly open), then `systemctl start husk-runner.service` (the
   sole boot orchestrator, as today), then a non-blocking `husk-bootreport`.
+- **CernVM-FS** when the pool sets `[pool.cvmfs]` (requires `prebaked`): the client
+  config (`/etc/cvmfs/default.local` — proxy, repo list, quota), a
+  `containers.conf.d` drop-in that binds each `/cvmfs/<repo>` into every job
+  container (**per-repo**, not a whole-`/cvmfs` bind — the autofs root readdir is
+  denied under the rootless user namespace, but a bind of an already-mounted repo
+  tree is not), a proxy hole in the ruleset (a `cvmfs_proxy` set populated by an
+  **in-guest** resolve of the proxy hostnames, since CERN squids sit inside the
+  dropped CERN-internal ranges), and an eager-mount of each repo — all after the
+  `nft` apply and before the runner, so the binds land on already-mounted trees.
 - Wall-clock backstop (`shutdown -h +N`).
 
 > **Side effect of baking the packages:** the reason the firewall is applied at
