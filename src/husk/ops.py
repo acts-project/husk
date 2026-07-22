@@ -164,6 +164,17 @@ class OpStore:
                 raise KeyError(key)
             return op.result
 
+    def forget(self, key: str) -> None:
+        """Drop an op so the next `submit` re-runs it from scratch.
+
+        Single-flight means a DONE op is never re-run, which is right while its
+        result is still true. It stops being right when the result is discovered
+        to be wrong later — a staged image that turns out not to be bootable. The
+        owner of that knowledge drops the key and the next tick re-stages, instead
+        of the whole daemon needing a restart to forget one cached answer."""
+        with self._lock:
+            self._ops.pop(key, None)
+
     def view(self, key: str) -> OpView | None:
         with self._lock:
             op = self._ops.get(key)

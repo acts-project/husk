@@ -11,6 +11,7 @@ coroutine the CLI awaits to run it on the main event loop.
                   huskd's SSH channel to the hypervisor (the guest is on a private
                   net; only its host can reach it). OpenStack guests are routable
                   and are scraped directly, so they never come through here.
+  GET /livez    — 200 whenever the event loop is answering (process liveness)
   GET /healthz  — 200 if every pool has a recent reconcile, else 503
   GET /events   — Server-Sent Events stream of the per-pool snapshots
 
@@ -215,9 +216,22 @@ def make_app(
             return Response(f"{e}\n", status=502)
         return Response(body, content_type="text/plain; version=0.0.4; charset=utf-8")
 
+    @app.get("/livez")
+    async def livez():
+        # Deliberately unconditional: answering at all means the process is up and
+        # its event loop isn't wedged, which is the only thing a restart would fix.
+        # This is what the k8s probes point at — including readiness. Gating traffic
+        # on reconcile freshness (what /healthz reports) took the dashboard and
+        # /metrics away exactly when a pool was degraded, and a first reconcile that
+        # has to upload a golden image can outlast any sane startup budget, which
+        # turned a slow upload into a restart loop.
+        return Response("ok\n", status=200, content_type="text/plain")
+
     @app.get("/healthz")
     async def healthz():
-        # Healthy only when every pool has published a recent reconcile.
+        # Reconcile freshness, for humans and alerting — NOT for the k8s probes
+        # (see /livez). Healthy only when every pool has published a recent
+        # reconcile.
         snaps = _snaps()
         ok = bool(snaps) and all(
             (time.time() - s.last_reconcile_epoch) <= STALE_AFTER_SEC for s in snaps

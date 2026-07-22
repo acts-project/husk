@@ -30,6 +30,18 @@ class ListSlotsError(BackendError):
     """
 
 
+class CreateSlotError(BackendError):
+    """A create the backend rejected for a reason it can already explain.
+
+    The message is the whole point: it carries the diagnosis, so the controller
+    logs one actionable line instead of a stack trace. A traceback through the
+    SDK's create/_translate_response/raise_from_response frames says nothing an
+    operator can act on — the cloud's own complaint plus the state that caused it
+    says everything. Unexpected failures still raise bare and still get a
+    traceback, because for those the frames ARE the information.
+    """
+
+
 @runtime_checkable
 class Backend(Protocol):
     """Infrastructure backend that owns a pool of recyclable slots."""

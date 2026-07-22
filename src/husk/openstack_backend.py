@@ -20,7 +20,7 @@ from datetime import datetime
 
 import openstack
 
-from husk.backend import ListSlotsError
+from husk.backend import CreateSlotError, ListSlotsError
 from husk.cloudinit import b64
 from husk.config import BackendConfig
 from husk.image_sync import ImageSync
@@ -301,12 +301,37 @@ class OpenStackBackend:
 
         The "uploading" progress is reported only on an actual upload — a reused
         image is a no-op, so a restart against an already-staged golden shows no
-        spurious upload activity."""
+        spurious upload activity.
+
+        A present image is only reusable if it is ACTIVE. Anything else is a name
+        with no bootable data behind it — most often `queued`, left by an upload
+        this process was killed in the middle of, which is routine because the
+        upload takes minutes and a rollout is Recreate. Reusing one by name is
+        unrecoverable: Nova rejects every create with "Image <id> is not active",
+        and each restart takes this same branch and adopts it again. So a
+        non-active record is deleted and re-uploaded. Nothing else can be
+        legitimately mid-upload here — huskd holds a single-instance lock, and
+        within it this runs as a single-flight keyed op."""
         name = f"{GLANCE_PREFIX}{resolved.short}"
         existing = conn.image.find_image(name)
         if existing is not None:
-            log.debug("Glance already has golden %s (%s)", name, existing.id)
-            return existing.id
+            # getattr, not attribute access: an unreadable status must fall through
+            # to re-upload, not raise. This runs inside an op worker, where a stray
+            # exception is retried with backoff for _RETRY_GIVEUP_S before anyone
+            # sees it — a ten-minute stall to report a typo.
+            status = getattr(existing, "status", "")
+            if status == "active":
+                log.debug("Glance already has golden %s (%s)", name, existing.id)
+                return existing.id
+            log.warning(
+                "Glance golden %s (%s) is %s, not active — deleting the dead "
+                "record and re-uploading (an interrupted upload leaves one, and "
+                "booting from it fails forever)",
+                name,
+                existing.id,
+                status or "unreadable",
+            )
+            conn.image.delete_image(existing, ignore_missing=True)
         if report is not None:
             report("uploading golden to Glance")
         log.info("uploading golden %s to Glance (qcow2, may take a while)", name)
@@ -371,22 +396,82 @@ class OpenStackBackend:
 
     def create_slot(self, *, user_data: bytes, name: str, cycle: int) -> Slot:
         image_id = self._require_image()
-        server = self.conn.compute.create_server(
-            name=name,
-            image_id=image_id,
-            flavor_id=self.flavor_id,
-            networks=[{"uuid": self.network_id}],
-            key_name=self.cfg.keypair,
-            user_data=b64(user_data),
-            metadata={
-                "managed-by": MANAGED_BY,
-                POOL_KEY: self._pool,
-                "husk-cycle": str(cycle),
-                "husk-provisioned-at": f"{time.time():.0f}",
-            },
-        )
+        try:
+            server = self.conn.compute.create_server(
+                name=name,
+                image_id=image_id,
+                flavor_id=self.flavor_id,
+                networks=[{"uuid": self.network_id}],
+                key_name=self.cfg.keypair,
+                user_data=b64(user_data),
+                metadata={
+                    "managed-by": MANAGED_BY,
+                    POOL_KEY: self._pool,
+                    "husk-cycle": str(cycle),
+                    "husk-provisioned-at": f"{time.time():.0f}",
+                },
+            )
+        except Exception as e:
+            # A 4xx from Nova is a statement about our request, not a transport
+            # failure: quota, a bad flavor/network, or an image that is not
+            # bootable. The SDK traceback is six frames of its own plumbing and
+            # never names the cause, so translate it into one line that does.
+            # 5xx and network errors fall through untouched — those genuinely
+            # want a traceback.
+            if 400 <= getattr(e, "http_status", 0) < 500:
+                status = self._image_status(image_id)
+                # Only drop on a POSITIVE "not active". An unreadable status (a
+                # Glance blip during an unrelated 4xx, e.g. quota) is ambiguous,
+                # and re-staging costs a multi-GB upload — so ambiguity keeps the
+                # image and just reports it.
+                if status and status != "active":
+                    self._drop_unusable_image(image_id, status)
+                raise CreateSlotError(
+                    f"{e} [image={image_id}, "
+                    f"ref={self._backend_ref or self.cfg.image_name}, "
+                    f"glance_status={status or 'unknown'}]"
+                ) from e
+            raise
         log.debug("create_server %s -> id=%s status=%s", name, server.id, server.status)
         return self._slot(server)
+
+    def _image_status(self, image_id: str) -> str:
+        """The Glance status of the image we just tried to boot, or "" if it cannot
+        be read (including because it no longer exists).
+
+        Nova says "Image <uuid> is not active" without saying what it IS, and the
+        difference matters: `saving` heals on its own, `queued` never will. Runs on
+        a failure path, so it must not raise a second error over the first."""
+        try:
+            return getattr(self.conn.image.get_image(image_id), "status", "") or ""
+        except Exception:  # noqa: BLE001 — diagnosis only; never mask the real error
+            return ""
+
+    def _drop_unusable_image(self, image_id: str, status: str) -> None:
+        """Forget a staged golden Nova has just refused to boot, so the next tick
+        re-stages it instead of retrying the same dead id forever.
+
+        Without this the pool is stuck until someone restarts huskd: `sync_images`
+        short-circuits on `_synced_ref`, so a staged image is never re-examined,
+        and an image that was ACTIVE when adopted but is not now (an interrupted
+        upload, a deleted image) is invisible to it. The create path is the only
+        place that learns the truth, so it is the place that has to forget.
+
+        Legacy image_name mode is exempt: there is nothing to re-stage, and
+        clearing `image_id` would wedge the pool rather than heal it."""
+        if not self._backend_ref:
+            return
+        log.warning(
+            "Glance image %s is %s, not active — dropping it and re-staging %s "
+            "(creates will fail until the upload completes)",
+            image_id,
+            status or "unreadable",
+            self._backend_ref,
+        )
+        self.image_id = None
+        self._synced_ref = ""
+        self._image_digest = None
+        self._ops.forget(f"glance:{self._backend_ref}")
 
     def rebuild_slot(self, slot: Slot, *, user_data: bytes, cycle: int) -> None:
         # Minimal CERN-compatible rebuild: NO name field, pinned microversion.

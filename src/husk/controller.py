@@ -19,8 +19,9 @@ import asyncio
 import itertools
 import logging
 import time
+from dataclasses import replace
 
-from husk.backend import ListSlotsError
+from husk.backend import CreateSlotError, ListSlotsError
 from husk.bootreport import parse_bootreport
 from husk.cloudinit import render_cloud_init
 from husk.config import Config
@@ -51,6 +52,10 @@ RUNNER_SNAPSHOT_MAX_AGE_S = 180.0
 # How often the opt-in runner reaper runs. Orphans appear at recycle speed
 # (minutes at best), so reaping every tick would burn API budget listing nothing.
 _REAP_INTERVAL_S = 300.0
+
+# How often a long image sync republishes its staging ops onto the snapshot, so
+# the dashboard shows the upload progressing instead of an unexplained wait.
+_OPS_PUBLISH_INTERVAL_S = 2.0
 
 # Max serial-console reads per bring-up while chasing a slot's husk-bootreport
 # block (the block flushes shortly after the runner registers). At a ~30s poll
@@ -198,7 +203,7 @@ class Controller:
         # 0. IMAGE SYNC — ensure each host holds the configured golden image
         #    before any create/rebuild this tick (a no-op once synced; on a ref
         #    change it stages the new image and slots drain onto it below).
-        await asyncio.to_thread(self._sync_images)
+        await self._sync_images_publishing_ops()
 
         # 1. FAIL-SAFE SNAPSHOT — a raise aborts the whole tick (no mutations).
         #    Slot data is always read fresh here (never cached): the backend is the
@@ -463,6 +468,28 @@ class Controller:
             classified.append((s, runner, state))
         return classified
 
+    async def _sync_images_publishing_ops(self) -> None:
+        """`_sync_images` in a thread, republishing the backend's staging ops onto
+        the current snapshot while it runs.
+
+        A first sync that pulls a golden from the registry and uploads it to Glance
+        takes minutes, and it happens before this tick can publish any slot data —
+        so without this the dashboard sits on the seeded empty snapshot with nothing
+        to explain the wait. The ops list is exactly that explanation, and it only
+        exists once the upload is underway, hence polling it rather than publishing
+        once up front. `last_reconcile_epoch` is deliberately untouched: no reconcile
+        has completed, and /healthz must keep saying so."""
+        task = asyncio.create_task(asyncio.to_thread(self._sync_images))
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=_OPS_PUBLISH_INTERVAL_S)
+                if self.snapshot is not None:
+                    self.snapshot = replace(self.snapshot, ops=self._backend_ops())
+                if done:
+                    break
+        finally:
+            await task  # propagate a raise (and never leave the task orphaned)
+
     # ----------------------------------------------------------- remediation
     def _backend_ops(self) -> list:
         """The backend's in-flight/recent async ops (image staging) for the status
@@ -583,6 +610,15 @@ class Controller:
             slot = await asyncio.to_thread(
                 self.backend.create_slot, user_data=user_data, name=vm, cycle=0
             )
+        except CreateSlotError as e:
+            # The backend already diagnosed this one, so the message IS the
+            # report. No traceback: creates are retried every tick while the pool
+            # is below min_ready, and a persistent cause (a dead image, exhausted
+            # quota) would otherwise emit a 30-line trace per slot per tick —
+            # burying the one line that says what to fix.
+            log.error("create of slot %s failed: %s", vm, e)
+            self.metrics.action_failures.inc(self.pool, "create")
+            return
         except Exception:
             log.exception("create of slot %s failed", vm)
             self.metrics.action_failures.inc(self.pool, "create")

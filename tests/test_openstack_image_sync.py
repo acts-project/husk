@@ -12,6 +12,7 @@ import dataclasses
 
 import pytest
 
+from husk.backend import CreateSlotError
 from husk.config import BackendConfig
 from husk.image_sync import ResolvedImage
 from husk.openstack_backend import GLANCE_PREFIX, OpenStackBackend
@@ -39,9 +40,13 @@ class FakeSync:
 
 
 class FakeImage:
-    def __init__(self, id: str, name: str) -> None:
+    # `status` matters: only an ACTIVE image is reusable, and huskd deletes and
+    # re-uploads anything else (an interrupted upload leaves a data-less record
+    # that Nova refuses to boot from, forever).
+    def __init__(self, id: str, name: str, status: str = "active") -> None:
         self.id = id
         self.name = name
+        self.status = status
 
 
 class FakeImageProxy:
@@ -51,6 +56,12 @@ class FakeImageProxy:
 
     def find_image(self, name):
         return next((im for im in self.images_list if im.name == name), None)
+
+    def get_image(self, image_id):
+        im = next((im for im in self.images_list if im.id == image_id), None)
+        if im is None:
+            raise KeyError(image_id)  # Glance 404s a deleted image
+        return im
 
     def images(self):
         return list(self.images_list)
@@ -111,6 +122,8 @@ def _backend(ref: str = REF, servers=None) -> OpenStackBackend:
     b._synced_ref = ""
     b._image_digest = None
     b.image_id = None
+    b.flavor_id = "flavor-1"
+    b.network_id = "net-1"
     b._image_conn = b.conn  # upload via the same fake conn (no second connect)
     # Stage synchronously so a single sync_images() adopts (prod uses a thread).
     b._ops = OpStore(spawn=lambda fn: fn())
@@ -235,3 +248,103 @@ def test_sync_pins_the_current_digest_in_the_controller_cache():
 
     b.sync_images(b.cfg)  # already current — short-circuits, but must still pin
     assert b._sync.pins == {"os": {CURR}}
+
+
+# ------------------------------------------------- dead goldens / self-healing
+class Nova400(Exception):
+    """Nova's rejection of a create, as the SDK raises it."""
+
+    http_status = 400
+
+    def __str__(self) -> str:
+        return "Image img-new-0 is not active."
+
+
+def test_a_queued_golden_is_replaced_rather_than_reused():
+    """An upload huskd was killed in the middle of leaves a Glance record with no
+    data behind it. Reusing it by name is unrecoverable — Nova refuses every
+    create with "is not active", and every restart adopts it again."""
+    b = _backend()
+    b.conn.image.images_list.append(
+        FakeImage("img-dead", f"{GLANCE_PREFIX}cccccccccccc", status="queued")
+    )
+
+    b.sync_images(b.cfg)
+
+    assert "img-dead" in b.conn.image.deleted
+    assert b.image_id == "img-new-0"  # a real upload happened
+    assert b.conn.created, "expected a re-upload, not a silent reuse"
+
+
+def test_an_active_golden_is_still_reused():
+    b = _backend()
+    b.conn.image.images_list.append(
+        FakeImage("img-good", f"{GLANCE_PREFIX}cccccccccccc", status="active")
+    )
+
+    b.sync_images(b.cfg)
+
+    assert b.image_id == "img-good"
+    assert not b.conn.created, "an active golden must not be re-uploaded"
+    assert "img-good" not in b.conn.image.deleted
+
+
+def test_a_rejected_create_names_the_cause_without_a_traceback():
+    b = _backend()
+    b.sync_images(b.cfg)
+
+    def boom(**kw):
+        raise Nova400()
+
+    b.conn.compute.create_server = boom
+    # The image goes bad AFTER staging — exactly the case sync_images cannot see.
+    b.conn.image.images_list[0].status = "queued"
+
+    with pytest.raises(CreateSlotError) as e:
+        b.create_slot(user_data=b"x", name="husk-1", cycle=0)
+
+    msg = str(e.value)
+    assert "is not active" in msg  # Nova's own words
+    assert "glance_status=queued" in msg  # ...and what it would not say
+
+
+def test_a_create_rejected_for_a_dead_image_re_stages_it():
+    """Otherwise the pool is stuck until someone restarts huskd: sync_images
+    short-circuits on _synced_ref and never re-examines a staged image."""
+    b = _backend()
+    b.sync_images(b.cfg)
+    assert b.image_id == "img-new-0"
+
+    def boom(**kw):
+        raise Nova400()
+
+    b.conn.compute.create_server = boom
+    b.conn.image.images_list[0].status = "queued"
+
+    with pytest.raises(CreateSlotError):
+        b.create_slot(user_data=b"x", name="husk-1", cycle=0)
+
+    assert b.image_id is None and b._synced_ref == ""  # forgot the dead one
+    b.sync_images(b.cfg)  # next tick re-stages, no restart needed
+    assert b.image_id == "img-new-1"
+
+
+def test_a_create_rejected_for_quota_keeps_the_image():
+    """Not every 4xx is about the image. Dropping a good golden on a quota error
+    would throw away a multi-GB upload and re-do it for nothing."""
+    b = _backend()
+    b.sync_images(b.cfg)
+
+    class QuotaExceeded(Nova400):
+        def __str__(self) -> str:
+            return "Quota exceeded for instances."
+
+    def boom(**kw):
+        raise QuotaExceeded()
+
+    b.conn.compute.create_server = boom  # image stays active
+
+    with pytest.raises(CreateSlotError):
+        b.create_slot(user_data=b"x", name="husk-1", cycle=0)
+
+    assert b.image_id == "img-new-0"  # untouched

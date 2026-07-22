@@ -29,6 +29,30 @@ from husk.target import Target
 TEST_TARGET = Target.org("acts-project")
 
 
+@pytest.fixture(autouse=True)
+def _ops_fail_fast(monkeypatch):
+    """Shrink OpStore's retry budget for every test.
+
+    Op work functions run under tenacity, which backs off and retries for
+    `_RETRY_GIVEUP_S` (600s in production, correct for a flaky registry) before
+    the op is even marked FAILED. A test that waits on such an op therefore turns
+    any exception in that code — an AttributeError, a typo — into a ten-minute
+    hang with no output, instead of a failure. That has cost real debugging time.
+
+    Production defaults stay untouched; this only changes what a *test* is willing
+    to wait for."""
+    from husk.ops import OpStore
+
+    original = OpStore.__init__
+
+    def fast_init(self, **kw):
+        kw.setdefault("retry_giveup_s", 0.5)
+        kw.setdefault("retry_max_wait_s", 0.05)
+        original(self, **kw)
+
+    monkeypatch.setattr(OpStore, "__init__", fast_init)
+
+
 def render_metrics(snapshots=(), *, storage=None, metrics=None) -> str:
     """The `/metrics` body for the given state, without standing up a server.
 

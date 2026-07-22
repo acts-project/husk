@@ -339,6 +339,20 @@ def test_healthz_503_when_no_pools():
     assert code == 503 and body == b"stale\n"
 
 
+def test_livez_ok_even_with_no_pools():
+    # Liveness is process-level on purpose: it is what the k8s probes (readiness
+    # included) dial, so a pool that has never reconciled — a cold start uploading
+    # a golden — must not cost us the dashboard/metrics endpoint or a restart.
+    code, body = _client_get(make_app(lambda: []), "/livez")
+    assert code == 200 and body == b"ok\n"
+
+
+def test_livez_ok_when_every_pool_is_stale():
+    stale = replace(_snap(), last_reconcile_epoch=time.time() - 3600)
+    code, body = _client_get(make_app(lambda: [stale]), "/livez")
+    assert code == 200 and body == b"ok\n"
+
+
 def test_healthz_503_when_stale():
     stale = replace(_snap(), last_reconcile_epoch=time.time() - 120)
     code, body = _client_get(make_app(lambda: [stale]), "/healthz")
