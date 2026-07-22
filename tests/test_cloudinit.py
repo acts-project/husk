@@ -18,7 +18,7 @@ import pathlib
 
 import pytest
 
-from husk.cloudinit import RUNNER_CLOUD_INIT, render_cloud_init
+from husk.cloudinit import render_cloud_init
 from husk.config import RunnerConfig
 
 from golden_cases import CASES
@@ -36,9 +36,11 @@ def test_render_matches_golden(name):
     assert render_cloud_init("JITBLOB", **CASES[name]) == expected
 
 
-def test_no_placeholders_survive_any_combination():
+def test_no_template_syntax_survives_any_combination():
     for name, kw in CASES.items():
-        assert "@@" not in render_cloud_init("JIT", **kw).decode(), name
+        out = render_cloud_init("JIT", **kw).decode()
+        assert "{%" not in out and "{#" not in out, name
+        assert "@@" not in out, name  # no leftovers from the pre-Jinja templates
 
 
 # ── the image carries the static layer; cloud-init does not ──────────────────
@@ -99,10 +101,28 @@ def test_runner_config_defaults_gpu_off():
     assert cfg.gpu is False
 
 
-def test_there_is_exactly_one_template():
-    # The stock/prebaked split is gone. If a second template ever reappears, the
-    # duplicated nft ruleset — and the drift guard it needed — comes back with it.
+def test_there_is_exactly_one_cloud_init_template():
+    # The stock/prebaked split is gone. If a second document template reappears,
+    # the duplicated nft ruleset — and the drift guard it needed — comes with it.
     import husk.cloudinit as m
 
-    assert [n for n in vars(m) if n.endswith("CLOUD_INIT")] == ["RUNNER_CLOUD_INIT"]
-    assert "@@RUNNER_URL@@" not in RUNNER_CLOUD_INIT
+    names = sorted(p.name for p in m._TEMPLATE_DIR.iterdir() if p.suffix == ".j2")
+    assert names == ["cloud-init.yaml.j2", "husk-egress.nft.j2"]
+
+
+def test_a_missing_template_variable_raises():
+    # StrictUndefined: this document configures a firewall, so a forgotten value
+    # must fail loudly rather than render as an empty string.
+    import jinja2
+
+    import husk.cloudinit as m
+
+    with pytest.raises(jinja2.UndefinedError):
+        m._ENV.from_string("{{ nope }}").render()
+
+
+def test_values_are_quoted_not_interpolated_raw():
+    # A value containing a quote must not be able to end the YAML scalar early
+    # and reshape the document.
+    out = render_cloud_init('ab"cd').decode()
+    assert r'content: "ab\"cd"' in out

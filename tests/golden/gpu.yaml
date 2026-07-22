@@ -38,7 +38,6 @@ runcmd:
   # jitconfig is written root-owned above; the runner service runs as `runner`.
   - mkdir -p /var/lib/husk
   - chown -R runner:runner /var/lib/husk
-  # GPU runtime activation is spliced here for GPU pools (before the firewall).
   # GPU runtime activation (every boot — the kmod load + CDI spec are
   # hardware-dependent and cannot be baked into the image).
   - modprobe nvidia

@@ -45,12 +45,14 @@ runcmd:
   # jitconfig is written root-owned above; the runner service runs as `runner`.
   - mkdir -p /var/lib/husk
   - chown -R runner:runner /var/lib/husk
-  # GPU runtime activation is spliced here for GPU pools (before the firewall).
   # Lock down egress just before the (untrusted) runner starts.
   - /usr/sbin/nft -f /etc/nftables/husk-egress.nft
   # The runner unit is baked but NOT enabled for boot; cloud-init starts it each
   # cycle once the fresh JIT config is in place (Type=simple returns immediately).
   - systemctl daemon-reload
+  # node_exporter is baked but NOT enabled for boot, and is started only AFTER
+  # the ruleset is applied — so :9100 is never briefly open to the world. Before
+  # the runner, so metrics are live for the whole job.
   - systemctl start husk-node-exporter.service
   - systemctl start husk-runner.service
   # Boot-timing report to the serial console (baked oneshot, ordered After the

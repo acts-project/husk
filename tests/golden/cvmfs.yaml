@@ -16,7 +16,9 @@ write_files:
 
   # Default per-repo bind mounts for every job container. podman applies
   # containers.conf.d to BOTH the CLI shim and the API socket, so this
-  # covers `container:` jobs and step-level `docker run` alike.
+  # covers `container:` jobs and step-level `docker run` alike. Per-repo, not a
+  # whole-/cvmfs bind — the autofs root readdir is denied under the rootless
+  # userns, but a bind of an already-mounted repo tree is not.
   - path: /etc/containers/containers.conf.d/10-cvmfs.conf
     content: |
       [containers]
@@ -60,7 +62,6 @@ runcmd:
   # jitconfig is written root-owned above; the runner service runs as `runner`.
   - mkdir -p /var/lib/husk
   - chown -R runner:runner /var/lib/husk
-  # GPU runtime activation is spliced here for GPU pools (before the firewall).
   # Lock down egress just before the (untrusted) runner starts.
   - /usr/sbin/nft -f /etc/nftables/husk-egress.nft
   # Open the firewall to the CVMFS proxy: resolve the squid hostnames

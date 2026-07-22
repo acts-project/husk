@@ -1,3 +1,17 @@
+{#
+  Cloud-init user-data for one husk slot, on top of a golden image.
+
+  Everything slow and static — podman, the Docker→Podman shim, the runner binary
+  and its units, node_exporter, the CernVM-FS client — is baked (images/build.sh,
+  images/files/). What is left here is what cannot be baked: the per-cycle JIT
+  config, the egress firewall (the one tunable security policy), GPU activation
+  against hardware that does not exist at image-build time, and starting the
+  runner.
+
+  Every conditional resolves to nothing when its feature is off, so a slot
+  without a given feature renders exactly as if the feature did not exist. The
+  golden files in tests/golden/ hold that to the byte.
+-#}
 #cloud-config
 # Golden image: everything slow and static is in the image already, so this is
 # intentionally minimal. See render_cloud_init.
@@ -5,21 +19,24 @@
 write_files:
   - path: /var/lib/husk/jitconfig
     permissions: '0600'
-    content: "JITBLOB"
+    content: {{ jit | yamlstr }}
+{% if container_env %}
   # Environment for every job container (see [pool.container] env). The
   # image is shared with GitHub-hosted runners, so fleet-specific facts
   # arrive as environment, not as image content.
   - path: /etc/containers/containers.conf.d/20-env.conf
     content: |
       [containers]
-      env = ["TERM=xterm", "APT_MIRROR=http://mirror.cern.ch"]
+      env = [{{ container_env | map('yamlstr') | join(', ') }}]
+{% endif %}
+{% if cvmfs_repos %}
   # CernVM-FS client config (client + autofs are baked; this is the
   # per-pool dynamic layer: proxy, repo list, cache quota).
   - path: /etc/cvmfs/default.local
     content: |
-      CVMFS_HTTP_PROXY="http://squid.cern.ch:3128"
-      CVMFS_REPOSITORIES=sft.cern.ch
-      CVMFS_QUOTA_LIMIT=8000
+      CVMFS_HTTP_PROXY="{{ cvmfs_proxy }}"
+      CVMFS_REPOSITORIES={{ cvmfs_repos | join(',') }}
+      CVMFS_QUOTA_LIMIT={{ cvmfs_quota_mb }}
 
   # Default per-repo bind mounts for every job container. podman applies
   # containers.conf.d to BOTH the CLI shim and the API socket, so this
@@ -29,90 +46,59 @@ write_files:
   - path: /etc/containers/containers.conf.d/10-cvmfs.conf
     content: |
       [containers]
-      volumes = ["/cvmfs/sft.cern.ch:/cvmfs/sft.cern.ch"]
+      volumes = [{{ cvmfs_volumes | map('yamlstr') | join(', ') }}]
+{% endif %}
 
   # Coarse egress firewall ruleset — the tunable security policy, kept in
   # cloud-init (NOT baked) so a pool can change it without rebuilding the image.
   - path: /etc/nftables/husk-egress.nft
     content: |
-      #!/usr/sbin/nft -f
-      table inet husk {}
-      delete table inet husk
-
-      table inet husk {
-        set cvmfs_proxy { type ipv4_addr; }
-        set egress_allow { type ipv4_addr; }
-        chain output {
-          type filter hook output priority 0; policy accept;
-
-          oif "lo" accept
-          ct state established,related accept
-
-          # Keep name resolution + time sync working: CERN's own resolvers/NTP
-          # live inside the blocked ranges, so allow 53/123 to anywhere first.
-          udp dport { 53, 123 } accept
-          tcp dport 53 accept
-
-          # Allow the CVMFS HTTP proxy. Its CERN squids live in the
-          # CERN-internal ranges dropped below, so this accept must
-          # precede them; the set is populated in runcmd after an
-          # in-guest resolve of the proxy hostnames.
-          ip daddr @cvmfs_proxy accept
-
-          # Allow the operator-listed hosts. They live in the
-          # CERN-internal ranges dropped below, so this accept must
-          # precede them; the set is populated in runcmd after an
-          # in-guest resolve.
-          ip daddr @egress_allow accept
-
-          # Deny all other egress to CERN-internal networks. Public internet
-          # falls through to `policy accept`. Extend these sets as needed.
-          ip daddr { 128.141.0.0/16, 128.142.0.0/16, 137.138.0.0/16, 188.184.0.0/15 } drop
-          ip6 daddr { 2001:1458::/32, 2001:1459::/32 } drop
-        }
-        chain input {
-          type filter hook input priority 0; policy accept;
-
-          iif "lo" tcp dport 9100 drop
-          tcp dport 9100 ip saddr { 192.168.122.1/32 } accept
-          tcp dport 9100 drop
-        }
-      }
+{{ egress_ruleset }}
 
 runcmd:
   # jitconfig is written root-owned above; the runner service runs as `runner`.
   - mkdir -p /var/lib/husk
   - chown -R runner:runner /var/lib/husk
+{% if gpu %}
   # GPU runtime activation (every boot — the kmod load + CDI spec are
   # hardware-dependent and cannot be baked into the image).
   - modprobe nvidia
   - nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+{% endif %}
   # Lock down egress just before the (untrusted) runner starts.
   - /usr/sbin/nft -f /etc/nftables/husk-egress.nft
+{% if egress_allow_hosts %}
   # Open the firewall to the allowlisted hosts (CERN package mirrors and
   # the like): resolve in-guest, since these are load-balanced aliases
   # whose addresses rotate, and add the IPs to the nft set. Soft failure —
   # an unresolvable host opens no hole and the slot still boots.
   - |
-    ips=$(getent ahostsv4 linuxsoft.cern.ch | awk '{print $1}' | sort -u | paste -sd, -)
+    ips=$(getent ahostsv4 {{ egress_allow_hosts | join(' ') }} | awk '{print $1}' | sort -u | paste -sd, -)
     [ -n "$ips" ] && nft add element inet husk egress_allow "{ $ips }"
+{% endif %}
+{% if cvmfs_proxy_hosts %}
   # Open the firewall to the CVMFS proxy: resolve the squid hostnames
   # in-guest (DNS/53 stays allowed post-lockdown) and add their IPs to
   # the nft set, so rotating A-records self-heal on every recycle.
   - |
-    ips=$(getent ahostsv4 squid.cern.ch | awk '{print $1}' | sort -u | paste -sd, -)
+    ips=$(getent ahostsv4 {{ cvmfs_proxy_hosts | join(' ') }} | awk '{print $1}' | sort -u | paste -sd, -)
     [ -n "$ips" ] && nft add element inet husk cvmfs_proxy "{ $ips }"
+{% endif %}
+{% if cvmfs_repos %}
   # Eager-mount the configured repos so a per-repo bind makes them visible
   # inside rootless job containers (autofs triggers don't cross the userns).
   - systemctl start autofs
-  - for r in sft.cern.ch; do cvmfs_config probe "$r" || true; done
+  - for r in {{ cvmfs_repos | join(' ') }}; do cvmfs_config probe "$r" || true; done
+{% endif %}
   # The runner unit is baked but NOT enabled for boot; cloud-init starts it each
   # cycle once the fresh JIT config is in place (Type=simple returns immediately).
   - systemctl daemon-reload
+{% if scrape_cidr %}
   # node_exporter is baked but NOT enabled for boot, and is started only AFTER
   # the ruleset is applied — so :9100 is never briefly open to the world. Before
   # the runner, so metrics are live for the whole job.
   - systemctl start husk-node-exporter.service
+{% endif %}
   - systemctl start husk-runner.service
   # Boot-timing report to the serial console (baked oneshot, ordered After the
   # runner so it never delays registration). Always-on: it only reads timestamps
