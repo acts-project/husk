@@ -607,20 +607,32 @@ k8s-live-deploy: (k8s-validate "cern") k8s-live-check k8s-live-preflight k8s-liv
 k8s-live-rollback:
     oc rollout undo deployment/huskd -n {{k8s_namespace}}
 
-# ESCAPE HATCH for iterating on the live cluster without waiting for CI. It builds
-# here, pushes over the CI tag for this commit, and rolls the deployment.
+# ESCAPE HATCH for iterating on the live cluster without waiting for CI: build the
+# image here and push it over this commit's CI tag. It PUSHES ONLY — deploying is
+# still `just k8s-live-deploy`, which validates the config and applies the overlay.
 #
-# Three things it does deliberately:
+# That split is the whole point. The recipe this replaced also rolled the
+# deployment, which meant it shipped new CODE against whatever ConfigMap was
+# already live: it never ran `oc apply -k`. A change that moves a config key and
+# the model that reads it in the same commit then lands as an initContainer
+# rejecting a key the daemon understands, and the pod sits in Init:CrashLoopBackOff
+# — with no logs, because `kubectl logs --all-containers` skips init containers.
+# Pushing and deploying are separate concerns; only one of them needs the config.
+#
+# Two things it does deliberately:
 #
 #  * --platform linux/amd64 ONLY. CERN is amd64; the local colima cluster runs a
 #    separately built native husk:local, so nothing needs a multi-arch manifest and
 #    building one would just double an already-emulated build.
-#  * Pins the DIGEST, not the tag, when setting the image. The pushed tag is the
-#    one already on the node, and imagePullPolicy is IfNotPresent — so restarting
-#    on the same tag can silently reuse the cached layers and "deploy" the old
-#    build. A digest the node has never seen always pulls.
 #  * Warns when the tree is dirty, because the tag then claims to be a commit whose
 #    content it does not contain.
+#
+# It prints the pushed DIGEST, and you should usually deploy with it rather than
+# the tag: both containers are imagePullPolicy IfNotPresent, so a node that already
+# cached this tag (from CI's build of the same commit, or an earlier push) can
+# silently reuse those layers and "deploy" the old image. A digest the node has
+# never seen always pulls. `k8s-live-deploy` sets the tag, which is right for a CI
+# image — after a local push, re-pin by digest with the command this prints.
 #
 # The tag it overwrites no longer matches what CI built from that commit, so the
 # provenance k8s-live-deploy relies on is broken until the next CI build. Use it to
@@ -628,16 +640,15 @@ k8s-live-rollback:
 #
 # The first amd64 build is SLOW: libvirt-python compiles from source under QEMU.
 # Later builds reuse the local buildx cache and only redo the project layer.
-# Build amd64 here, push over this commit's tag, and roll the live deployment.
-k8s-live-hotdeploy:
+# Build amd64 here and push over this commit's CI tag. Deploys nothing.
+k8s-live-push:
     #!/usr/bin/env bash
     set -euo pipefail
     tag="{{oc_image}}:{{oc_sha}}"
     meta="$(mktemp -t husk-build)"
     trap 'rm -f "$meta"' EXIT
 
-    echo "cluster: $(kubectl config current-context)"
-    echo "image:   $tag  (overwrites the CI-built tag)"
+    echo "image: $tag  (overwrites the CI-built tag)"
     if [ -n "$(git status --porcelain)" ]; then
         echo "WARNING: working tree is dirty — this image is NOT {{oc_sha}}'s content." >&2
     fi
@@ -645,9 +656,14 @@ k8s-live-hotdeploy:
     docker buildx build --platform linux/amd64 -t "$tag" --push --metadata-file "$meta" .
 
     digest="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["containerimage.digest"])' "$meta")"
+    echo
     echo "pushed digest: $digest"
-    oc set image deployment/huskd huskd={{oc_image}}@"$digest" validate-config={{oc_image}}@"$digest" -n {{k8s_namespace}}
-    oc rollout status deployment/huskd -n {{k8s_namespace}} --timeout=10m
+    echo
+    echo "deploy it with (validates the config, applies the overlay, pins the tag):"
+    echo "    just k8s-live-deploy"
+    echo "then re-pin by digest, so IfNotPresent cannot serve a cached copy of this tag:"
+    echo "    oc set image deployment/huskd huskd={{oc_image}}@$digest validate-config={{oc_image}}@$digest -n {{k8s_namespace}}"
+    echo "    oc rollout status deployment/huskd -n {{k8s_namespace}} --timeout=10m"
 
 # Both run `huskctl reap` inside the pod, which already has the App key and config
 # mounted — no credentials on your laptop.
