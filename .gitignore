@@ -37,3 +37,6 @@ secrets/
 # The k8s overlays' real configs (k8s/overlays/*/config.toml) are already covered
 # by the bare `config.toml` rule above. The committed templates are the
 # config.example.toml next to each — see k8s/README.md.
+
+# macOS Finder metadata — was tracked once; never useful in a diff.
+.DS_Store
