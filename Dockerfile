@@ -73,10 +73,13 @@ WORKDIR /app
 # (controller.http_addr) to reach it from outside the container.
 EXPOSE 9100
 
-# /healthz is 503 until every pool has reconciled recently, 200 once healthy —
-# exactly the container liveness signal we want. Assumes the default :9100 port.
+# /livez, not /healthz: the latter is 503 until a pool has reconciled recently, and
+# a cold start's golden-image upload can outlast any start-period — which would mark
+# the container unhealthy (and restart it, under an orchestrator that acts on that)
+# mid-upload, forever. Reconcile staleness is an alerting signal, not a restart one.
+# Assumes the default :9100 port.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD ["python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9100/healthz', timeout=3).status==200 else 1)"]
+    CMD ["python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9100/livez', timeout=3).status==200 else 1)"]
 
 # huskd IS the ASGI host: it drives hypercorn on the main event loop AND runs the
 # reconcile loop on a background thread under one process-wide lock, with

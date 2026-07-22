@@ -118,20 +118,28 @@ spec:
             # always means a restart) doesn't silently truncate a 30d query window.
             - name: metrics-state
               mountPath: /var/lib/husk
+          # All three probes point at /livez, never /healthz. /healthz reports
+          # reconcile *freshness*, which is 503 until the first reconcile lands —
+          # and a first reconcile that has to upload a golden image to Glance can
+          # take longer than any sane startup budget. Wiring that to readiness took
+          # the Service's only endpoint away (dashboard + /metrics 503 through the
+          # ingress) precisely while huskd was doing its slowest legitimate work,
+          # and wiring it to liveness/startup restarted the pod mid-upload, into the
+          # same upload, forever. /livez answers as soon as the event loop does,
+          # which is the only condition a restart or a re-route can actually fix.
+          # Staleness is an alerting signal: scrape /healthz or alert on the
+          # husk reconcile-age metric.
           livenessProbe:
             httpGet:
-              path: /healthz
+              path: /livez
               port: http
-            # /healthz is 503 until every pool has reconciled recently. A first
-            # reconcile has to pull the golden and talk to the backend, so the
-            # startup budget is generous: 12 * 15s = 3 min before liveness counts.
             initialDelaySeconds: 30
             periodSeconds: 30
             timeoutSeconds: 5
             failureThreshold: 3
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /livez
               port: http
             initialDelaySeconds: 10
             periodSeconds: 10
@@ -139,7 +147,7 @@ spec:
             failureThreshold: 3
           startupProbe:
             httpGet:
-              path: /healthz
+              path: /livez
               port: http
             periodSeconds: 15
             failureThreshold: 12

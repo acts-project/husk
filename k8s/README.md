@@ -22,9 +22,16 @@ never shared storage: it must not survive the pod, and the kernel drops it on cr
 kubelet dials the pod IP for probes — a loopback bind makes every probe fail with
 connection refused.
 
-**`/healthz` is the readiness signal.** It returns 503 until every pool has
-reconciled recently. A cold start has to pull a ~2 GB golden and talk to the
-backend, so a `startupProbe` gives it 3 minutes before liveness starts counting.
+**`/livez` is what all three probes dial**, and it is 200 as soon as the event
+loop answers. Do not point them at `/healthz`: that reports reconcile *freshness*
+and stays 503 until the first reconcile lands, which on a cold start means after
+a ~2 GB golden has been pulled and uploaded to Glance. As a readiness gate that
+takes the Service's only endpoint away — the dashboard and `/metrics` go 503
+through the ingress — exactly while huskd is doing its slowest legitimate work;
+as a liveness/startup gate it restarts the pod mid-upload, into the same upload.
+
+**`/healthz` is the staleness signal** — for alerting, not for probes. Scrape it,
+or alert on reconcile age from `/metrics`.
 
 ## Config and secrets
 
