@@ -149,7 +149,7 @@ write_files:
       delete table inet husk
 
       table inet husk {
-@@CVMFS_SET@@        chain output {
+@@CVMFS_SET@@@@ALLOW_SET@@        chain output {
           type filter hook output priority 0; policy accept;
 
           oif "lo" accept
@@ -160,7 +160,7 @@ write_files:
           udp dport { 53, 123 } accept
           tcp dport 53 accept
 
-@@CVMFS_PROXY@@          # Deny all other egress to CERN-internal networks. Public internet
+@@CVMFS_PROXY@@@@ALLOW_RULE@@          # Deny all other egress to CERN-internal networks. Public internet
           # falls through to `policy accept`. Extend these sets as needed.
           ip daddr { 128.141.0.0/16, 128.142.0.0/16, 137.138.0.0/16, 188.184.0.0/15 } drop
           ip6 daddr { 2001:1458::/32, 2001:1459::/32 } drop
@@ -197,7 +197,7 @@ runcmd:
   # the runner executes below runs under the coarse husk egress firewall.
   - /usr/sbin/nft -f /etc/nftables/husk-egress.nft
 
-  # cloud-init runcmd is the SOLE orchestrator each boot (first boot AND every
+@@ALLOW_SETUP@@  # cloud-init runcmd is the SOLE orchestrator each boot (first boot AND every
   # rebuild — Phase 1 proved runcmd re-runs). The unit is NOT enabled for
   # boot-time start, so multi-user.target can't launch it before cloud-init has
   # reinstalled run.sh. `start` (not enable --now); Type=simple returns once
@@ -282,7 +282,7 @@ write_files:
       delete table inet husk
 
       table inet husk {
-@@CVMFS_SET@@        chain output {
+@@CVMFS_SET@@@@ALLOW_SET@@        chain output {
           type filter hook output priority 0; policy accept;
 
           oif "lo" accept
@@ -293,7 +293,7 @@ write_files:
           udp dport { 53, 123 } accept
           tcp dport 53 accept
 
-@@CVMFS_PROXY@@          # Deny all other egress to CERN-internal networks. Public internet
+@@CVMFS_PROXY@@@@ALLOW_RULE@@          # Deny all other egress to CERN-internal networks. Public internet
           # falls through to `policy accept`. Extend these sets as needed.
           ip daddr { 128.141.0.0/16, 128.142.0.0/16, 137.138.0.0/16, 188.184.0.0/15 } drop
           ip6 daddr { 2001:1458::/32, 2001:1459::/32 } drop
@@ -307,7 +307,7 @@ runcmd:
   # GPU runtime activation is spliced here for GPU pools (before the firewall).
   # Lock down egress just before the (untrusted) runner starts.
   - /usr/sbin/nft -f /etc/nftables/husk-egress.nft
-@@CVMFS_SETUP@@  # The runner unit is baked but NOT enabled for boot; cloud-init starts it each
+@@ALLOW_SETUP@@@@CVMFS_SETUP@@  # The runner unit is baked but NOT enabled for boot; cloud-init starts it each
   # cycle once the fresh JIT config is in place (Type=simple returns immediately).
   - systemctl daemon-reload
 @@METRICS_START@@
@@ -396,6 +396,32 @@ def _proxy_hosts(http_proxy: str) -> list[str]:
     return hosts
 
 
+def _egress_allow_setup(hosts: tuple[str, ...]) -> str:
+    """runcmd step, spliced AFTER the firewall apply: resolve the allowlisted
+    hostnames in-guest and add their IPs to the `egress_allow` set.
+
+    Resolved per cycle rather than pinned as CIDRs because the hosts this exists
+    for are load-balanced CERN aliases — linuxsoft.cern.ch is a rotating A-record
+    set, so a literal address would work until it silently didn't. Same reasoning
+    (and same mechanism) as the CVMFS proxy hole; DNS stays allowed after lockdown
+    precisely so this resolve can happen here.
+
+    Failure is deliberately soft: `[ -n "$ips" ]` means an unresolvable host opens
+    no hole and the slot still boots, degrading to "that package mirror is
+    unreachable" rather than "the slot never registers"."""
+    if not hosts:
+        return ""
+    return (
+        "  # Open the firewall to the allowlisted hosts (CERN package mirrors and\n"
+        "  # the like): resolve in-guest, since these are load-balanced aliases\n"
+        "  # whose addresses rotate, and add the IPs to the nft set.\n"
+        "  - |\n"
+        f"    ips=$(getent ahostsv4 {' '.join(hosts)} | awk '{{print $1}}' "
+        "| sort -u | paste -sd, -)\n"
+        '    [ -n "$ips" ] && nft add element inet husk egress_allow "{ $ips }"\n'
+    )
+
+
 def _cvmfs_write_files(repos: tuple[str, ...], proxy: str, quota_mb: int) -> str:
     """The two write_files entries: the CVMFS client config, and the podman
     drop-in that binds each repo into EVERY job container. Per-repo binds, not a
@@ -456,6 +482,7 @@ def render_cloud_init(
     cvmfs_repos: tuple[str, ...] = (),
     cvmfs_proxy: str = "",
     cvmfs_quota_mb: int = 4000,
+    egress_allow_hosts: tuple[str, ...] = (),
 ) -> bytes:
     """Render the cloud-init user-data for one slot.
 
@@ -485,7 +512,18 @@ def render_cloud_init(
     hole in the firewall, and eager-mounts each repo before the runner starts. Also
     prebaked-only (the client is baked) and fail-closed — empty `cvmfs_repos` renders
     identically to a non-CVMFS slot. The loader rejects CVMFS + stock; ignored here
-    on a stock image."""
+    on a stock image.
+
+    `egress_allow_hosts` punches named holes in the coarse egress firewall for hosts
+    inside the dropped CERN-internal ranges — CERN's package mirrors above all, which
+    a job's `dnf install` needs and which the firewall otherwise blackholes. Unlike
+    the CVMFS knobs this applies on stock images too: it depends on nothing baked,
+    only on DNS being reachable after lockdown. Empty renders byte-identically to a
+    slot without it.
+
+    Note the asymmetry with the install-time traffic in runcmd above: that runs
+    *before* the firewall is applied and so needs no allowlisting. This is for the
+    untrusted job, which runs after."""
     metrics = scrape_cidr if (scrape_cidr and prebaked) else ""
     cvmfs = cvmfs_repos if (cvmfs_repos and prebaked) else ()
     if prebaked:
@@ -533,6 +571,26 @@ def render_cloud_init(
         .replace("@@CVMFS_PROXY@@", cvmfs_rule)
         .replace("@@CVMFS_WRITE_FILES@@", cvmfs_wf)
         .replace("@@CVMFS_SETUP@@", cvmfs_setup)
+    )
+
+    # Egress allowlist. Same shape as the CVMFS proxy hole, and in both ruleset
+    # copies for the same reason (the drift guard compares them as text). No
+    # prebaked gate: nothing here is baked.
+    if egress_allow_hosts:
+        allow_set = "        set egress_allow { type ipv4_addr; }\n"
+        allow_rule = (
+            "          # Allow the operator-listed hosts. They live in the\n"
+            "          # CERN-internal ranges dropped below, so this accept must\n"
+            "          # precede them; the set is populated in runcmd after an\n"
+            "          # in-guest resolve.\n"
+            "          ip daddr @egress_allow accept\n\n"
+        )
+    else:
+        allow_set = allow_rule = ""
+    template = (
+        template.replace("@@ALLOW_SET@@", allow_set)
+        .replace("@@ALLOW_RULE@@", allow_rule)
+        .replace("@@ALLOW_SETUP@@", _egress_allow_setup(egress_allow_hosts))
     )
     return (
         template.replace("@@JIT@@", jit_blob)

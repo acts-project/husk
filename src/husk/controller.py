@@ -528,6 +528,9 @@ class Controller:
                 cvmfs_quota_mb=(
                     self.cfg.cvmfs.quota_limit_mb if self.cfg.cvmfs else 4000
                 ),
+                egress_allow_hosts=(
+                    self.cfg.egress.allow_hosts if self.cfg.egress else ()
+                ),
             )
             await asyncio.to_thread(
                 self.backend.rebuild_slot, slot, user_data=user_data, cycle=cycle
@@ -605,6 +608,9 @@ class Controller:
                 cvmfs_proxy=self.cfg.cvmfs.http_proxy if self.cfg.cvmfs else "",
                 cvmfs_quota_mb=(
                     self.cfg.cvmfs.quota_limit_mb if self.cfg.cvmfs else 4000
+                ),
+                egress_allow_hosts=(
+                    self.cfg.egress.allow_hosts if self.cfg.egress else ()
                 ),
             )
             slot = await asyncio.to_thread(

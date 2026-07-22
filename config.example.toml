@@ -133,6 +133,17 @@ max_job_duration_sec = 21600          # 6h — stop (not destroy) busy slots bey
 # http_proxy = "http://ca-proxy-atlas.cern.ch:3128;http://ca-proxy.cern.ch:3128"  # CERN Squid (`;` = failover)
 # quota_limit_mb = 4000                # CVMFS_QUOTA_LIMIT; mind the slot's root disk (m2.small = 10 GiB)
 
+# Named holes in the coarse egress firewall. It drops the CERN-internal ranges
+# wholesale, which is the security property — but that also blackholes CERN's own
+# package mirrors, so a job running `dnf install` inside a CERN-built image fails
+# with a timeout far from the cause. List hostnames, not addresses: they are
+# resolved in-guest on every recycle, because the hosts worth listing are
+# load-balanced aliases whose A-records rotate. Unlike [pool.cvmfs] this works on
+# stock images too (nothing about it is baked). Each entry grants the slot's JOBS
+# full outbound access to that host, so keep the list short.
+# [pool.egress]
+# allow_hosts = ["linuxsoft.cern.ch"]  # CERN package mirror (dnf/yum in job containers)
+
 # ───────────────────────────── pool 2: libvirt GPU ──────────────────────────
 [[pool]]
 name = "libvirt-gpu"

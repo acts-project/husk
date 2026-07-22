@@ -192,6 +192,26 @@ class CvmfsConfig:
 
 
 @dataclass(frozen=True)
+class EgressConfig:
+    """Named holes in the coarse egress firewall (opt-in; None when [pool.egress]
+    is omitted).
+
+    The firewall drops CERN-internal ranges wholesale, which is the security
+    property — but it also blackholes CERN's own package mirrors, so a job that
+    runs `dnf install` inside a CERN-built container image fails at a point far
+    from the cause. This is the escape hatch, kept explicit and per-pool rather
+    than widening the dropped ranges for everyone.
+
+    `allow_hosts` are hostnames, not addresses, and are resolved in-guest on every
+    recycle: the hosts worth listing are load-balanced aliases whose A-records
+    rotate, so a pinned IP is a hole that quietly stops working. Listing a host
+    grants the slot's *jobs* full outbound access to it, so keep the list to
+    infrastructure the pool genuinely needs."""
+
+    allow_hosts: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class HostConfig:
     """One libvirt VM-host in the backend's pool (libvirt backend only).
 
@@ -297,6 +317,7 @@ class Config:
     timeouts: TimeoutsConfig = field(default_factory=TimeoutsConfig)
     controller: ControllerConfig = field(default_factory=ControllerConfig)
     cvmfs: CvmfsConfig | None = None  # opt-in CernVM-FS; None when [pool.cvmfs] absent
+    egress: EgressConfig | None = None  # opt-in firewall holes; None when absent
 
 
 def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
@@ -453,6 +474,24 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
                     )
             return v
 
+    class _Egress(_Strict):
+        allow_hosts: list[str] = Field(min_length=1)
+
+        @field_validator("allow_hosts")
+        @classmethod
+        def _look_like_hostnames(cls, v: list[str]) -> list[str]:
+            # These are pasted into a `getent ahostsv4` command line in-guest, so a
+            # URL, a CIDR or a stray space would either resolve to nothing (silent
+            # no-hole) or inject an extra argument. Bare hostnames only.
+            for h in v:
+                if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*\.[a-z]{2,}", h):
+                    raise ValueError(
+                        f"egress allow_hosts entry {h!r} must be a bare hostname "
+                        "like linuxsoft.cern.ch (no scheme, port, path or CIDR — "
+                        "it is resolved in-guest on each recycle)"
+                    )
+            return v
+
     class _Host(_Strict):
         name: str
         libvirt_uri: str
@@ -538,6 +577,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         backend: _Backend = Field(default_factory=_Backend)
         timeouts: _Timeouts = Field(default_factory=_Timeouts)
         cvmfs: _Cvmfs | None = None  # opt-in CernVM-FS (requires prebaked)
+        egress: _Egress | None = None  # opt-in egress firewall holes
 
         @model_validator(mode="after")
         def _backend_fields_match_its_type(self):
@@ -782,10 +822,12 @@ def _pool_config(p, github: GithubConfig, controller: ControllerConfig) -> Confi
         if p.cvmfs
         else None
     )
+    egress = EgressConfig(allow_hosts=tuple(p.egress.allow_hosts)) if p.egress else None
     return Config(
         github=github,
         target=p.target.resolved(),
         cvmfs=cvmfs,
+        egress=egress,
         runner=RunnerConfig(
             version=p.runner.version,
             labels=derive_labels(

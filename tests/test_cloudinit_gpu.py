@@ -16,6 +16,9 @@ def _legacy(jit: str, url: str) -> bytes:
         .replace("@@METRICS_INGRESS@@", "")
         .replace("@@CVMFS_SET@@", "")
         .replace("@@CVMFS_PROXY@@", "")
+        .replace("@@ALLOW_SET@@", "")
+        .replace("@@ALLOW_RULE@@", "")
+        .replace("@@ALLOW_SETUP@@", "")
     ).encode()
 
 
