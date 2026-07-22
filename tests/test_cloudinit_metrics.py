@@ -111,7 +111,7 @@ name = "p1"
 target = { org = "acts-project", group = "husk" }
 [pool.runner]
 version = "2.334.0"
-labels = ["self-hosted"]
+arch = "x64"
 prebaked = false
 scrape_cidr = "10.0.0.0/8"
 [pool.backend]

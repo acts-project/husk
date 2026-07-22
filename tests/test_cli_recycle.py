@@ -49,7 +49,7 @@ name = "openstack-cpu"
 target = { org = "acts-project", group = "husk" }
 [pool.runner]
 version = "2.334.0"
-labels = ["self-hosted", "cpu"]
+arch = "x64"
 [pool.backend]
 type = "openstack"
 cloud = "cern"
@@ -61,7 +61,7 @@ name = "libvirt-gpu"
 target = { org = "acts-project", group = "husk" }
 [pool.runner]
 version = "2.334.0"
-labels = ["self-hosted", "gpu"]
+arch = "x64"
 [pool.backend]
 type = "libvirt"
 image_ref = "ghcr.io/acts-project/husk-gpu:v1"

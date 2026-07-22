@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
+from husk.labels import derive_labels
 from husk.target import Target
 
 log = logging.getLogger("husk.config")
@@ -113,7 +114,23 @@ class GithubConfig:
 @dataclass(frozen=True)
 class RunnerConfig:
     version: str
+    # DERIVED, never written by hand: `husk.labels.derive_labels` computes this
+    # from the pool's facts at load time (see that module for the scheme). The
+    # TOML knob is `extra_labels`, which contributes the tail of this list.
     labels: list[str]
+    # Guest CPU architecture — "x64" or "arm64", in GitHub's spelling because it
+    # is both a label and the runner tarball's name (see `url`). One statement of
+    # the fact drives both, so a pool cannot advertise an arch it did not install
+    # the runner for.
+    arch: str = "x64"
+    # Size class ("standard"/"large"), or None for accelerator pools, which carry
+    # no size label at all — husk.labels explains why.
+    size: str | None = "standard"
+    # "" (none), "nvidia" or "amd". A vendor rather than a bool because the label
+    # scheme needs to name the compute runtime (cuda/rocm), and because a second
+    # vendor is a config edit rather than a schema change this way.
+    gpu_vendor: str = ""
+    gpu_model: str = ""  # optional, e.g. "a100" → the `gpu-a100` label
     # Runner-group NAME, not id: group ids are not portable across orgs, so the
     # client resolves this per target, falling back to Default/1 where no group of
     # this name exists (huskd serves orgs it does not administer, so the group it
@@ -125,7 +142,6 @@ class RunnerConfig:
     # rather than silently ignored. The loader flattens it to here, next to the
     # other knobs the GitHub client consumes.
     runner_group: str = "Default"
-    gpu: bool = False  # GPU pools: cloud-init activates the NVIDIA driver + CDI
     prebaked: bool = False  # golden-image pools: skip the install steps (baked in)
     # Source allowed to scrape the slot's node_exporter on :9100 — the sole access
     # control for it (no TLS/auth). Per-pool because the client differs by backend:
@@ -137,10 +153,17 @@ class RunnerConfig:
     scrape_cidr: str = ""
 
     @property
+    def gpu(self) -> bool:
+        """Whether a GPU is attached — the question cloud-init asks (activate the
+        driver + CDI or not). Derived from `gpu_vendor` rather than stored beside
+        it, so there is no way to configure a pool that has a vendor but no GPU."""
+        return bool(self.gpu_vendor)
+
+    @property
     def url(self) -> str:
         return (
             f"https://github.com/actions/runner/releases/download/v{self.version}/"
-            f"actions-runner-linux-x64-{self.version}.tar.gz"
+            f"actions-runner-linux-{self.arch}-{self.version}.tar.gz"
         )
 
 
@@ -358,10 +381,49 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
 
     class _Runner(_Strict):
         version: str
-        labels: list[str] = Field(min_length=1)
-        gpu: bool = False
+        # Facts, not labels — the label set is derived from these (husk.labels).
+        arch: Literal["x64", "arm64"] = "x64"
+        # Deliberately no default: an accelerator pool must leave it unset (it
+        # carries no size label), so "unset" has to be distinguishable from
+        # "standard" rather than collapsing into it.
+        size: Literal["standard", "large"] | None = None
+        gpu: Literal["nvidia", "amd"] | None = None
+        gpu_model: str = ""
         prebaked: bool = False
         scrape_cidr: str = ""
+        # Capability labels husk has no vocabulary for. Appended verbatim; the
+        # husk-* namespace is reserved (see husk.labels.check_extra_label).
+        extra_labels: list[str] = []
+
+        @field_validator("extra_labels")
+        @classmethod
+        def _are_mintable_labels(cls, v: list[str]) -> list[str]:
+            from husk.labels import check_extra_label
+
+            for label in v:
+                check_extra_label(label)  # raises → validation error
+            return v
+
+        @model_validator(mode="after")
+        def _size_and_gpu_are_exclusive(self):
+            """Size classes and accelerator labels are alternative ways to name a
+            hardware class, never both — husk.labels explains the leak that
+            stacking them reopens. Defaulting `size` here (rather than on the
+            field) is what lets a GPU pool stay size-less without the operator
+            having to write `size = none`."""
+            if self.gpu:
+                if self.size:
+                    raise ValueError(
+                        f"size = {self.size!r} on a gpu = {self.gpu!r} pool: GPU pools "
+                        "carry no size label, because a size selector would then "
+                        "match GPU hardware. Drop `size`; use gpu_model to "
+                        "distinguish GPU shapes."
+                    )
+            else:
+                if self.gpu_model:
+                    raise ValueError('gpu_model needs gpu = "nvidia" or gpu = "amd"')
+                self.size = self.size or "standard"
+            return self
 
         @field_validator("scrape_cidr")
         @classmethod
@@ -517,8 +579,9 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
                         )
                 if r.gpu and not any(h.gpu_pci_addresses for h in b.hosts):
                     raise ValueError(
-                        "runner.gpu = true but no host declares gpu_pci_addresses — "
-                        "the slots would boot without a GPU attached"
+                        f"runner.gpu = {r.gpu!r} but no host declares "
+                        "gpu_pci_addresses — the slots would boot without a GPU "
+                        "attached, while advertising labels that promise one"
                     )
             else:
                 if b.hosts:
@@ -662,6 +725,12 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
     names = [c.backend.name for c in configs]
     if len(set(names)) != len(names):
         raise RuntimeError(f"duplicate pool name across [[pool]] entries: {names}")
+    for c in configs:
+        # The one place intent (the pool's facts) and effect (what jobs can select)
+        # can be diffed by eye. Without it, "why is my job queued" means reading
+        # the derivation rules and simulating them against the TOML.
+        log.info("pool %s labels: %s", c.backend.name, " ".join(c.runner.labels))
+
     prefixes = [c.backend.vm_prefix for c in configs]
     if len(set(prefixes)) != len(prefixes):
         raise RuntimeError(
@@ -719,11 +788,23 @@ def _pool_config(p, github: GithubConfig, controller: ControllerConfig) -> Confi
         cvmfs=cvmfs,
         runner=RunnerConfig(
             version=p.runner.version,
-            labels=list(p.runner.labels),
+            labels=derive_labels(
+                pool_name=p.name,
+                backend_type=b.type,
+                arch=p.runner.arch,
+                size=p.runner.size,
+                gpu_vendor=p.runner.gpu or "",
+                gpu_model=p.runner.gpu_model,
+                cvmfs=cvmfs is not None,
+                extra=p.runner.extra_labels,
+            ),
+            arch=p.runner.arch,
+            size=p.runner.size,
             # Flattened from the target table: groups are org-only, so that is
             # the only place the schema lets you write one.
             runner_group=p.target.group,
-            gpu=p.runner.gpu,
+            gpu_vendor=p.runner.gpu or "",
+            gpu_model=p.runner.gpu_model,
             prebaked=p.runner.prebaked,
             scrape_cidr=p.runner.scrape_cidr,
         ),

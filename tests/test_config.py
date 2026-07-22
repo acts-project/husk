@@ -17,7 +17,7 @@ name = "openstack-cern"
 target = {{ org = "acts-project", group = "husk" }}
 [pool.runner]
 version = "2.334.0"
-labels = ["self-hosted"]
+arch = "x64"
 [pool.backend]
 cloud = "cern"
 image_name = "ALMA10 - x86_64"
@@ -172,7 +172,7 @@ name = "openstack-cpu"
 target = { org = "acts-project", group = "husk" }
 [pool.runner]
 version = "2.334.0"
-labels = ["self-hosted", "husk-cpu"]
+arch = "x64"
 [pool.backend]
 type = "openstack"
 cloud = "cern"
@@ -187,8 +187,8 @@ name = "libvirt-gpu"
 target = { org = "acts-project", group = "husk" }
 [pool.runner]
 version = "2.334.0"
-labels = ["self-hosted", "gpu"]
-gpu = true
+arch = "x64"
+gpu = "nvidia"
 prebaked = true
 [pool.backend]
 type = "libvirt"
@@ -339,7 +339,7 @@ def _pools(*names: str) -> str:
     head = "[github]\napp_id = 1\n"
     body = "".join(
         f'[[pool]]\nname = "{n}"\ntarget = {{ org = "acme" }}\n'
-        f'[pool.runner]\nversion="1"\nlabels=["{n}"]\n'
+        f'[pool.runner]\nversion="1"\narch="x64"\n'
         "[pool.backend]\n"
         'cloud="cern"\nimage_name="img"\nflavor_name="m2.small"\nnetwork_name="net"\n'
         for n in names
@@ -364,9 +364,7 @@ def _pool_toml(tmp_path, *, runner: str = "", backend: str = "") -> str:
     followed by [pool.backend]) and appended to [pool.backend] (which ends it)."""
     toml = _TOML.format(extra="")
     if runner:
-        toml = toml.replace(
-            'labels = ["self-hosted"]\n', f'labels = ["self-hosted"]\n{runner}\n'
-        )
+        toml = toml.replace('arch = "x64"\n', f'arch = "x64"\n{runner}\n')
     p = tmp_path / "c.toml"
     p.write_text(toml + (f"{backend}\n" if backend else ""))
     return str(p)

@@ -71,7 +71,19 @@ target = { org = "acts-project", group = "husk" }
 
 [pool.runner]
 version = "2.334.0"
-labels = ["self-hosted", "linux", "x64", "husk-cpu"]   # jobs route here via these labels
+# Labels are DERIVED from the facts below, never listed by hand — a hand-written
+# list drifts (a pool keeps advertising `gpu` after its GPU host is removed and
+# nothing disagrees). huskd logs the computed set per pool at startup.
+#   arch  = "x64" | "arm64"   → the label AND the runner tarball it downloads
+#   size  = "standard" | "large"  (omit entirely on GPU pools; see pool 2)
+# This pool derives:
+#   self-hosted linux x64 x86_64 husk husk-pool-openstack-cpu
+#   husk-backend-openstack husk-size-standard
+arch = "x64"
+size = "standard"
+# Capability labels husk has no vocabulary for. The husk-* namespace is reserved
+# for derived labels and is rejected here.
+# extra_labels = ["acts"]
 # prebaked = true  # set ONLY when image_ref points at a husk golden: cloud-init then
 #                  # skips the runner/podman install and `version` must match the image.
 # In-guest metrics (observability.md). Opens :9100 (node_exporter, baked into the
@@ -128,8 +140,23 @@ target = { org = "acts-project", group = "husk" }
 
 [pool.runner]
 version = "2.334.0"
-labels = ["self-hosted", "linux", "x64", "gpu"]   # jobs route here via "gpu"
-gpu = true                             # activate the NVIDIA driver (modprobe + CDI) each boot
+arch = "x64"
+# The GPU VENDOR ("nvidia" | "amd"), which both activates the driver (modprobe +
+# CDI) each boot and mints the accelerator labels. Note there is no `size` here:
+# GPU pools carry no size label, because `runs-on: [..., husk-size-large]` would
+# then match GPU hardware — the accelerator labels ARE the class. Setting both is
+# a config error.
+#
+# This pool derives:
+#   self-hosted linux x64 x86_64 husk husk-pool-libvirt-gpu husk-backend-libvirt
+#   gpu gpu-nvidia gpu-a100 cuda
+#
+# `cuda`/`rocm` promise a DEVICE, not a toolkit — the toolkit arrives in the job's
+# container image, and most CUDA/HIP jobs only compile, which any CPU slot can do.
+# Compile-only legs belong on a CPU pool with a CUDA image; sending them here just
+# starves the jobs that need the hardware.
+gpu = "nvidia"
+gpu_model = "a100"                     # optional → the `gpu-a100` label
 prebaked = true                        # husk-gpu golden: skip install (version must match the image)
 # In-guest metrics (observability.md). On libvirt the guest is on a private net
 # that only its hypervisor can reach, so huskd bridges the scrape: it SSHes to the

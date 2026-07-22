@@ -370,6 +370,10 @@ def validate(
             f"{b.name}: {b.type} target={c.target} prefix={b.vm_prefix} "
             f"min_ready={b.min_ready} max_total={b.max_total}"
         )
+        # Labels are derived, so this is the only place to see what a config
+        # change actually did to job routing before rolling it out. A pool that
+        # parses fine can still advertise the wrong thing.
+        typer.echo(f"  labels: {' '.join(c.runner.labels)}")
     typer.echo(f"ok: {len(cfgs)} pool(s) in {config}")
 
 

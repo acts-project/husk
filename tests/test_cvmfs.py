@@ -128,7 +128,7 @@ name = "cern"
 target = {{ org = "acts-project" }}
 [pool.runner]
 version = "2.334.0"
-labels = ["self-hosted"]
+arch = "x64"
 prebaked = {prebaked}
 [pool.backend]
 cloud = "cern"
