@@ -145,6 +145,30 @@ class RunnerConfig:
 
 
 @dataclass(frozen=True)
+class CvmfsConfig:
+    """CernVM-FS access for a pool's slots (opt-in; None when [pool.cvmfs] is
+    omitted). The client is baked into the golden image, so this REQUIRES
+    prebaked = true; cloud-init supplies only the dynamic per-cycle bits.
+
+    `repositories` are eager-mounted on the host before the runner starts and
+    bound one-by-one into every job container. A whole-`/cvmfs` bind trips an
+    autofs-root readdir denial under the rootless user namespace; a per-repo bind
+    of an already-mounted tree does not (validated on the real engine), which is
+    why they must be pre-mounted and listed explicitly rather than left to autofs
+    to trigger from inside a container.
+
+    `http_proxy` is the verbatim CVMFS_HTTP_PROXY value — a CERN Squid chain, e.g.
+    "http://ca-proxy-atlas.cern.ch:3128;http://ca-proxy.cern.ch:3128". Its
+    hostnames are resolved in-guest each cycle to open the one hole the coarse
+    egress firewall needs (the CERN squids live inside the dropped CERN-internal
+    ranges), so rotating A-records self-heal on every recycle."""
+
+    repositories: tuple[str, ...]
+    http_proxy: str
+    quota_limit_mb: int = 4000
+
+
+@dataclass(frozen=True)
 class HostConfig:
     """One libvirt VM-host in the backend's pool (libvirt backend only).
 
@@ -249,6 +273,7 @@ class Config:
     backend: BackendConfig
     timeouts: TimeoutsConfig = field(default_factory=TimeoutsConfig)
     controller: ControllerConfig = field(default_factory=ControllerConfig)
+    cvmfs: CvmfsConfig | None = None  # opt-in CernVM-FS; None when [pool.cvmfs] absent
 
 
 def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
@@ -347,6 +372,25 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
                 ipaddress.ip_network(v, strict=False)  # raises → validation error
             return v
 
+    class _Cvmfs(_Strict):
+        repositories: list[str] = Field(min_length=1)
+        http_proxy: str = Field(min_length=1)
+        quota_limit_mb: int = Field(4000, gt=0)
+
+        @field_validator("repositories")
+        @classmethod
+        def _look_like_repo_names(cls, v: list[str]) -> list[str]:
+            # These become /cvmfs/<repo> mount points and container bind paths
+            # verbatim; a scheme or slash would produce a broken mount, not a
+            # config error. FQDN-ish repo names only (e.g. sft.cern.ch).
+            for r in v:
+                if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*\.[a-z]{2,}", r):
+                    raise ValueError(
+                        f"cvmfs repository {r!r} must be a bare repo name like "
+                        "sft.cern.ch (no scheme, no slashes)"
+                    )
+            return v
+
     class _Host(_Strict):
         name: str
         libvirt_uri: str
@@ -431,6 +475,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         runner: _Runner
         backend: _Backend = Field(default_factory=_Backend)
         timeouts: _Timeouts = Field(default_factory=_Timeouts)
+        cvmfs: _Cvmfs | None = None  # opt-in CernVM-FS (requires prebaked)
 
         @model_validator(mode="after")
         def _backend_fields_match_its_type(self):
@@ -498,6 +543,13 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
             if r.scrape_cidr and not r.prebaked:
                 raise ValueError(
                     "scrape_cidr requires prebaked = true (node_exporter is baked "
+                    "into the golden image; a stock image has none)"
+                )
+            # Same reasoning for CernVM-FS: the client + autofs are baked into the
+            # golden image, so a stock-image pool has nothing to mount /cvmfs with.
+            if self.cvmfs and not r.prebaked:
+                raise ValueError(
+                    "cvmfs requires prebaked = true (the CernVM-FS client is baked "
                     "into the golden image; a stock image has none)"
                 )
             return self
@@ -652,9 +704,19 @@ def _pool_config(p, github: GithubConfig, controller: ControllerConfig) -> Confi
             for h in b.hosts
         ),
     )
+    cvmfs = (
+        CvmfsConfig(
+            repositories=tuple(p.cvmfs.repositories),
+            http_proxy=p.cvmfs.http_proxy,
+            quota_limit_mb=p.cvmfs.quota_limit_mb,
+        )
+        if p.cvmfs
+        else None
+    )
     return Config(
         github=github,
         target=p.target.resolved(),
+        cvmfs=cvmfs,
         runner=RunnerConfig(
             version=p.runner.version,
             labels=list(p.runner.labels),

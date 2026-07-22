@@ -496,6 +496,11 @@ class Controller:
                 gpu=self.cfg.runner.gpu,
                 prebaked=self.cfg.runner.prebaked,
                 scrape_cidr=self.cfg.runner.scrape_cidr,
+                cvmfs_repos=self.cfg.cvmfs.repositories if self.cfg.cvmfs else (),
+                cvmfs_proxy=self.cfg.cvmfs.http_proxy if self.cfg.cvmfs else "",
+                cvmfs_quota_mb=(
+                    self.cfg.cvmfs.quota_limit_mb if self.cfg.cvmfs else 4000
+                ),
             )
             await asyncio.to_thread(
                 self.backend.rebuild_slot, slot, user_data=user_data, cycle=cycle
@@ -569,6 +574,11 @@ class Controller:
                 gpu=self.cfg.runner.gpu,
                 prebaked=self.cfg.runner.prebaked,
                 scrape_cidr=self.cfg.runner.scrape_cidr,
+                cvmfs_repos=self.cfg.cvmfs.repositories if self.cfg.cvmfs else (),
+                cvmfs_proxy=self.cfg.cvmfs.http_proxy if self.cfg.cvmfs else "",
+                cvmfs_quota_mb=(
+                    self.cfg.cvmfs.quota_limit_mb if self.cfg.cvmfs else 4000
+                ),
             )
             slot = await asyncio.to_thread(
                 self.backend.create_slot, user_data=user_data, name=vm, cycle=0
