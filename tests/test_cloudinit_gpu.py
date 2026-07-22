@@ -19,6 +19,7 @@ def _legacy(jit: str, url: str) -> bytes:
         .replace("@@ALLOW_SET@@", "")
         .replace("@@ALLOW_RULE@@", "")
         .replace("@@ALLOW_SETUP@@", "")
+        .replace("@@CONTAINER_ENV@@", "")
     ).encode()
 
 

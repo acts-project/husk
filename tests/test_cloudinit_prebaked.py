@@ -79,6 +79,7 @@ def test_prebaked_false_is_unchanged_full_path():
         .replace("@@ALLOW_SET@@", "")
         .replace("@@ALLOW_RULE@@", "")
         .replace("@@ALLOW_SETUP@@", "")
+        .replace("@@CONTAINER_ENV@@", "")
         .encode()
     )
     gpu = render_cloud_init("J", "U", gpu=True).decode()

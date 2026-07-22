@@ -49,7 +49,7 @@ write_files:
     permissions: '0600'
     content: "@@JIT@@"
 
-  - path: /home/runner/.config/containers/storage.conf
+@@CONTAINER_ENV@@  - path: /home/runner/.config/containers/storage.conf
     content: |
       [storage]
       driver = "overlay"
@@ -271,7 +271,7 @@ write_files:
   - path: /var/lib/husk/jitconfig
     permissions: '0600'
     content: "@@JIT@@"
-@@CVMFS_WRITE_FILES@@
+@@CONTAINER_ENV@@@@CVMFS_WRITE_FILES@@
   # Coarse egress firewall ruleset — the tunable security policy, kept in
   # cloud-init (NOT baked). MUST stay byte-identical to the full template's copy;
   # guarded by tests/test_cloudinit_prebaked.py::test_prebaked_firewall_matches_full.
@@ -396,6 +396,41 @@ def _proxy_hosts(http_proxy: str) -> list[str]:
     return hosts
 
 
+# podman's shipped default for this key. A containers.conf.d drop-in REPLACES a
+# list-valued key rather than appending to it, so writing `env` without carrying
+# the default forward would silently unset TERM for every job container — the kind
+# of change that shows up much later as a tool rendering escape codes into a log.
+_PODMAN_DEFAULT_ENV = ("TERM=xterm",)
+
+
+def _container_env_write_files(env: tuple[str, ...]) -> str:
+    """A containers.conf.d drop-in exporting `env` into EVERY job container.
+
+    This is the seam that lets a fleet change what a job sees without changing the
+    image the job runs. The ACTS images are shared between GitHub-hosted runners
+    and husk slots, so anything baked into them would have to be true in both
+    places; an environment variable is true only here. podman applies
+    containers.conf.d to both the CLI shim and the API socket, so this reaches
+    `container:` jobs and step-level `docker run` alike — the same mechanism, and
+    the same validated path, as the CVMFS binds.
+
+    The variables are husk's half of a contract: husk states a fact about where
+    the slot is (e.g. which package mirror is near it), and the workflow decides
+    whether it cares. Nothing here knows what any given variable means."""
+    if not env:
+        return ""
+    items = ", ".join(f'"{v}"' for v in (*_PODMAN_DEFAULT_ENV, *env))
+    return (
+        "  # Environment for every job container (see [pool.container] env). The\n"
+        "  # image is shared with GitHub-hosted runners, so fleet-specific facts\n"
+        "  # arrive as environment, not as image content.\n"
+        "  - path: /etc/containers/containers.conf.d/20-env.conf\n"
+        "    content: |\n"
+        "      [containers]\n"
+        f"      env = [{items}]\n"
+    )
+
+
 def _egress_allow_setup(hosts: tuple[str, ...]) -> str:
     """runcmd step, spliced AFTER the firewall apply: resolve the allowlisted
     hostnames in-guest and add their IPs to the `egress_allow` set.
@@ -483,6 +518,7 @@ def render_cloud_init(
     cvmfs_proxy: str = "",
     cvmfs_quota_mb: int = 4000,
     egress_allow_hosts: tuple[str, ...] = (),
+    container_env: tuple[str, ...] = (),
 ) -> bytes:
     """Render the cloud-init user-data for one slot.
 
@@ -523,7 +559,12 @@ def render_cloud_init(
 
     Note the asymmetry with the install-time traffic in runcmd above: that runs
     *before* the firewall is applied and so needs no allowlisting. This is for the
-    untrusted job, which runs after."""
+    untrusted job, which runs after.
+
+    `container_env` exports variables into every job container. It exists because
+    job images are shared with GitHub-hosted runners and so cannot carry anything
+    that is only true on a husk slot — the environment can. Empty renders
+    byte-identically to a slot without it."""
     metrics = scrape_cidr if (scrape_cidr and prebaked) else ""
     cvmfs = cvmfs_repos if (cvmfs_repos and prebaked) else ()
     if prebaked:
@@ -591,6 +632,7 @@ def render_cloud_init(
         template.replace("@@ALLOW_SET@@", allow_set)
         .replace("@@ALLOW_RULE@@", allow_rule)
         .replace("@@ALLOW_SETUP@@", _egress_allow_setup(egress_allow_hosts))
+        .replace("@@CONTAINER_ENV@@", _container_env_write_files(container_env))
     )
     return (
         template.replace("@@JIT@@", jit_blob)

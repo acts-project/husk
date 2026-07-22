@@ -11,6 +11,8 @@ the golden image, only on DNS still being reachable after lockdown."""
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -170,3 +172,74 @@ image_name = "img"
 
 {extra}
 """
+
+
+# ── job-container environment ────────────────────────────────────────────────
+#
+# Lives here because it shares the "husk states a fact, the workflow decides"
+# shape with the allowlist above: both exist so a slot can differ from a
+# GitHub-hosted runner without the shared job image having to know.
+
+ENV = ("HUSK_APT_MIRROR=http://ch.archive.ubuntu.com/ubuntu",)
+
+
+@pytest.mark.parametrize("prebaked", [True, False])
+def test_no_container_env_renders_identically(prebaked):
+    assert render_cloud_init(
+        "JIT", "URL", prebaked=prebaked, container_env=()
+    ) == render_cloud_init("JIT", "URL", prebaked=prebaked)
+
+
+@pytest.mark.parametrize("prebaked", [True, False])
+def test_container_env_drop_in_written(prebaked):
+    out = render_cloud_init("JIT", "URL", prebaked=prebaked, container_env=ENV).decode()
+    assert "/etc/containers/containers.conf.d/20-env.conf" in out
+    assert "HUSK_APT_MIRROR=http://ch.archive.ubuntu.com/ubuntu" in out
+
+
+def test_container_env_carries_podman_default_forward():
+    """A containers.conf.d drop-in REPLACES a list key rather than appending, so
+    omitting the shipped default would silently unset TERM in every job."""
+    out = render_cloud_init("JIT", "URL", prebaked=True, container_env=ENV).decode()
+    assert 'env = ["TERM=xterm", "HUSK_APT_MIRROR=' in out
+
+
+def test_container_env_is_valid_yaml_and_leaves_no_placeholder():
+    import yaml
+
+    out = render_cloud_init(
+        "JIT",
+        "URL",
+        prebaked=True,
+        container_env=ENV,
+        cvmfs_repos=("sft.cern.ch",),
+        cvmfs_proxy="http://ca-proxy.cern.ch:3128",
+        egress_allow_hosts=("linuxsoft.cern.ch",),
+    ).decode()
+    assert "@@" not in out
+    paths = [f["path"] for f in yaml.safe_load(out)["write_files"]]
+    assert "/etc/containers/containers.conf.d/20-env.conf" in paths
+    assert "/etc/containers/containers.conf.d/10-cvmfs.conf" in paths
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "NOEQUALS",  # not an assignment
+        "2BAD=x",  # NAME must not start with a digit
+        'X="q"',  # quotes would break containers.conf
+        "X=a\nY=b",  # newline likewise
+    ],
+)
+def test_config_rejects_bad_container_env(tmp_path, monkeypatch, bad):
+    """podman failing to parse containers.conf breaks EVERY container on the slot,
+    so a typo here must not survive config load."""
+    from husk.config import load_config
+
+    p = tmp_path / "c.toml"
+    # json.dumps gives a TOML-legal escaped string, so the quote/newline cases
+    # reach the validator instead of failing as malformed TOML.
+    p.write_text(_pool_toml(f"[pool.container]\nenv = [{json.dumps(bad)}]\n"))
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", _PEM)
+    with pytest.raises((ValidationError, ValueError)):
+        load_config(p)

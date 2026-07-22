@@ -144,6 +144,15 @@ max_job_duration_sec = 21600          # 6h — stop (not destroy) busy slots bey
 # [pool.egress]
 # allow_hosts = ["linuxsoft.cern.ch"]  # CERN package mirror (dnf/yum in job containers)
 
+# Environment exported into EVERY job container on this pool's slots, via a
+# containers.conf.d drop-in (so it reaches `container:` jobs and step-level
+# `docker run` alike). This is the seam for facts that are true of the slot but
+# not of a GitHub-hosted runner: job images are shared between the two, so such a
+# fact cannot live in the image. huskd assigns no meaning to any of these — it
+# states the fact, the workflow decides whether it cares.
+# [pool.container]
+# env = ["HUSK_APT_MIRROR=http://ch.archive.ubuntu.com/ubuntu"]
+
 # ───────────────────────────── pool 2: libvirt GPU ──────────────────────────
 [[pool]]
 name = "libvirt-gpu"

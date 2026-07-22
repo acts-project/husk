@@ -212,6 +212,24 @@ class EgressConfig:
 
 
 @dataclass(frozen=True)
+class ContainerConfig:
+    """What every job container on this pool's slots gets (opt-in; None when
+    [pool.container] is omitted).
+
+    The point of entry is deliberately the *environment* and not the image. Job
+    images are shared between GitHub-hosted runners and husk slots, so a fact that
+    holds only on a slot — which package mirror is near it, say — cannot be baked
+    in without being wrong in the other half of the fleet. An env var is scoped to
+    exactly the machines the fact is true of.
+
+    husk assigns no meaning to any of these: it states the fact and the workflow
+    decides whether to act on it. That is what keeps the knowledge one-directional
+    — a repo need not know it is at CERN, and husk need not know what apt is."""
+
+    env: tuple[str, ...]  # "NAME=value" entries, verbatim
+
+
+@dataclass(frozen=True)
 class HostConfig:
     """One libvirt VM-host in the backend's pool (libvirt backend only).
 
@@ -318,6 +336,9 @@ class Config:
     controller: ControllerConfig = field(default_factory=ControllerConfig)
     cvmfs: CvmfsConfig | None = None  # opt-in CernVM-FS; None when [pool.cvmfs] absent
     egress: EgressConfig | None = None  # opt-in firewall holes; None when absent
+    container: ContainerConfig | None = (
+        None  # opt-in job-container env; None when absent
+    )
 
 
 def load_config(path: str, *, secrets_dir: str | None = None) -> Config:
@@ -492,6 +513,31 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
                     )
             return v
 
+    class _Container(_Strict):
+        env: list[str] = Field(min_length=1)
+
+        @field_validator("env")
+        @classmethod
+        def _look_like_assignments(cls, v: list[str]) -> list[str]:
+            # Each entry is emitted into a TOML string list in containers.conf. A
+            # quote or newline would break that file, and podman failing to parse
+            # containers.conf breaks EVERY container on the slot, not just this
+            # setting — so the blast radius of a typo here is the whole pool.
+            for e in v:
+                name, sep, _ = e.partition("=")
+                if not sep or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                    raise ValueError(
+                        f"container env entry {e!r} must be NAME=value with a "
+                        "shell-legal NAME"
+                    )
+                if '"' in e or "\\" in e or "\n" in e:
+                    raise ValueError(
+                        f"container env entry {e!r} may not contain quotes, "
+                        "backslashes or newlines (it is written into "
+                        "containers.conf, which podman must still be able to parse)"
+                    )
+            return v
+
     class _Host(_Strict):
         name: str
         libvirt_uri: str
@@ -578,6 +624,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         timeouts: _Timeouts = Field(default_factory=_Timeouts)
         cvmfs: _Cvmfs | None = None  # opt-in CernVM-FS (requires prebaked)
         egress: _Egress | None = None  # opt-in egress firewall holes
+        container: _Container | None = None  # opt-in job-container env
 
         @model_validator(mode="after")
         def _backend_fields_match_its_type(self):
@@ -823,11 +870,13 @@ def _pool_config(p, github: GithubConfig, controller: ControllerConfig) -> Confi
         else None
     )
     egress = EgressConfig(allow_hosts=tuple(p.egress.allow_hosts)) if p.egress else None
+    container = ContainerConfig(env=tuple(p.container.env)) if p.container else None
     return Config(
         github=github,
         target=p.target.resolved(),
         cvmfs=cvmfs,
         egress=egress,
+        container=container,
         runner=RunnerConfig(
             version=p.runner.version,
             labels=derive_labels(

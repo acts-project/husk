@@ -99,3 +99,12 @@ poll_interval_sec = 5
 idle_timeout_sec = 1800
 startup_grace_sec = 240
 max_job_duration_sec = 21600
+
+# Exported into every job container. The ACTS job images are shared with
+# GitHub-hosted runners, so a fact that only holds here cannot be baked into them
+# — it has to arrive as environment. HUSK_APT_MIRROR names a mirror near this
+# pool: archive.ubuntu.com measured 48 kB/s from CERN against ~1.9 MB/s for the
+# Swiss mirror, which was most of the runtime of any job doing an apt-get.
+# huskd attaches no meaning to these; the workflow decides whether to use them.
+[pool.container]
+env = ["HUSK_APT_MIRROR=http://ch.archive.ubuntu.com/ubuntu"]
