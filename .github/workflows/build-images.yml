@@ -74,11 +74,31 @@ jobs:
             /etc/systemd/system/husk-poweroff.service \
             /etc/containers/containers.conf \
             /etc/cloud/cloud.cfg.d/90-husk-datasource.cfg \
-            /var/lib/systemd/linger/runner ; do
+            /var/lib/systemd/linger/runner \
+            /usr/local/bin/node_exporter \
+            /etc/systemd/system/husk-node-exporter.service \
+            /usr/local/bin/husk-bootreport \
+            /etc/systemd/system/husk-bootreport.service ; do
             if [ "$(guestfish --ro -a "$img" -i exists "$p")" != "true" ]; then
               echo "MISSING: $p"; fail=1
             fi
           done
+          echo "==> boot-report / metrics wiring"
+          # The textfile collector is two halves that fail silently and separately:
+          # a directory node_exporter reads, and the flag telling it to. Missing
+          # either one costs no boot and no error — the metrics are just never
+          # there. Assert both, since that is exactly the class of drop this step
+          # exists to catch.
+          if [ "$(guestfish --ro -a "$img" -i is-dir /var/lib/node_exporter/textfile)" != "true" ]; then
+            echo "MISSING: /var/lib/node_exporter/textfile (dir)"; fail=1
+          fi
+          guestfish --ro -a "$img" -i cat /etc/systemd/system/husk-node-exporter.service \
+            | grep -q -- '--collector.textfile.directory=/var/lib/node_exporter/textfile' \
+            || { echo "MISSING: textfile collector flag on node_exporter"; fail=1; }
+          # It runs as a python3 script on the guest; a shebang that isn't there
+          # turns every boot report into a silent no-op.
+          guestfish --ro -a "$img" -i exists /usr/bin/python3 | grep -q true \
+            || { echo "MISSING: /usr/bin/python3 (husk-bootreport interpreter)"; fail=1; }
           echo "==> baked packages"
           guestfish --ro -a "$img" -i command "rpm -q podman nftables podman-docker libicu"
           if [ "${{ matrix.variant }}" = "gpu" ]; then
