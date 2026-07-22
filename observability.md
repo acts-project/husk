@@ -12,8 +12,9 @@ left open.
 > **nothing is deployed on any host** — see Phase O4 below for why, and what it
 > costs. Sections below that describe a "dumb host proxy" are superseded by that.
 >
-> - **O1 ✅** boot-timing exfil: huskd reads the `husk-bootreport` block off the
->   serial console and exposes `husk_slot_boot_*`.
+> - **O1 ✅ (superseded by O5)** boot-timing exfil once worked by huskd polling the
+>   serial console and parsing the `husk-bootreport` block. The slot now publishes
+>   its own timing through node_exporter instead — see Phase O5.
 > - **O2 ✅** node_exporter is baked into both golden variants
 >   (`images/build.sh`, `husk-node-exporter.service`, no TLS/auth) and cloud-init
 >   opens `:9100` to the pool's `scrape_cidr` and starts it. **Takes effect on an
@@ -43,8 +44,9 @@ left open.
    CPU/mem/IO-bound and size pools accordingly. This is the primary new ask.
 2. **Host-level metrics for the libvirt hypervisors** — the boxes husk owns
    (node_exporter + per-domain libvirt metrics). OpenStack hypervisors aren't ours.
-3. **Surface the boot-timing report** (`husk-bootreport`) that is baked into the
-   golden image today but goes only to the serial console and is never collected.
+3. **Surface the boot-timing report** (`husk-bootreport`) — done, but not the way
+   this list first assumed: the slot publishes it itself (Phase O5), rather than
+   huskd reading it back off the console.
 4. **Attribute in-guest metrics to a pool and a GitHub job** — a metric join, so a
    spike on `10.1.2.3:9100` is legible as "pool X, job Y, cycle N."
 5. **Keep the controller out of the metrics hot path.** huskd orchestrates
@@ -72,7 +74,7 @@ Conflating them is the main design trap.
 
 | | **Control-plane facts** | **In-guest resource metrics** |
 |---|---|---|
-| Examples | boot/recycle timing, slot state, desired/ready counts, `husk-bootreport` breakdown | CPU, memory, disk, net *during* a job |
+| Examples | recycle timing, slot state, desired/ready counts | CPU, memory, disk, net *during* a job; the slot's own boot/cloud-init timing |
 | Source of truth | the controller already observes these | only the guest knows |
 | Lifetime of source | long (the controller) | ephemeral (the slot) |
 | Right pattern | **expose from huskd `/metrics`** — one stable target | **scrape the guest directly** (node_exporter) |
@@ -240,8 +242,8 @@ consumes it. **Two scrape jobs, matching the two layers** — deliberately not o
 ```yaml
 scrape_configs:
   # ── Layer 1: the controller ────────────────────────────────────────────────
-  # huskd's own state-derived gauges: husk_slots*, husk_slot_boot_*, and the
-  # husk_slot_info join table. ONE static target that never changes.
+  # huskd's own state-derived gauges: husk_slots*, husk_slot_last_*_seconds, and
+  # the husk_slot_info join table. ONE static target that never changes.
   - job_name: huskd
     static_configs:
       - targets: ["huskd.internal:9100"]      # → GET /metrics
@@ -304,18 +306,16 @@ image or set up once per host.**
 
 ### huskd-orchestrated (code in this repo, no manual steps)
 
-1. **Extend `/metrics` (`render_prometheus`) with the boot-timing breakdown.**
-   Parse the `husk-bootreport` block from the console log (see below) and emit
-   `husk_slot_boot_*` per-unit gauges alongside the existing
-   `husk_slot_last_cloudinit_seconds` / `husk_slot_last_recycle_seconds`. Pure
-   controller work; Prometheus scrapes the one existing controller target.
-2. **Console-log exfil (the `husk-bootreport` consumer).**
-   - OpenStack: call Nova `get_console_output` after the slot's runner comes
-     online; parse the `===== husk-bootreport =====` block.
-   - libvirt: set `console_log_path` in the domain XML
-     (`libvirt_backend.py:724`, currently unset by design), read the serial log
-     file. Requires the host-setup file-ownership fix noted in that comment — so
-     this half straddles into per-node setup (see below).
+1. ~~**Extend `/metrics` with the boot-timing breakdown**, parsed from the console
+   log.~~ **Superseded.** This was built and then removed: the breakdown it could
+   produce stopped at cloud-init *module* granularity, and it only ever worked on
+   OpenStack. The slot publishes its own timing instead — see "Boot timing: the
+   slot reports on itself" below. huskd's own clock still supplies
+   `husk_slot_last_cloudinit_seconds` / `husk_slot_last_recycle_seconds`, which is
+   the outer frame that guest-side numbers sit inside.
+2. ~~**Console-log exfil.**~~ **Superseded** by the same change. The console is
+   still readable on demand at `GET /slot/<backend>/<slot>/console`, for a slot
+   that never came up far enough to publish anything; nothing polls it.
 3. **The `husk_slot_info` join table** on `/metrics`:
    ```
    husk_slot_info{backend="cern-cpu", slot="...", ip="...",
@@ -405,8 +405,7 @@ split into two halves that behave very differently.
 
 ### Snapshot-derived — `SnapshotCollector`
 
-`husk_slots*`, `husk_slot_last_*_seconds`, `husk_slot_boot_seconds`,
-`husk_slot_cycle`, `husk_slot_info`, `husk_image*`. These describe the **present**,
+`husk_slots*`, `husk_slot_last_*_seconds`, `husk_slot_cycle`, `husk_slot_info`, `husk_image*`. These describe the **present**,
 and huskd already holds a complete immutable description of the present: the
 per-pool `ControllerState` the reconcile loop swaps in each tick. They are rendered
 straight from it at scrape time and are never stored.
@@ -424,8 +423,7 @@ sample and Prometheus's own staleness handling finishes the job.
 `husk_reconcile_duration_seconds`, `husk_action_failures_total`,
 `husk_slots_created_total`, `husk_slots_destroyed_total`,
 `husk_slot_recycles_total`, `husk_recycle_duration_seconds`,
-`husk_cloudinit_duration_seconds`, `husk_boot_phase_seconds`,
-`husk_github_polls_total`, `husk_github_poll_failures_total`,
+`husk_cloudinit_duration_seconds`, `husk_github_polls_total`, `husk_github_poll_failures_total`,
 `husk_guest_scrape_failures_total`.
 
 These describe **what happened between scrapes**, which no snapshot can express: a
@@ -463,9 +461,9 @@ bring-up. It answers "why is *this* slot slow" — which is what the dashboard w
 bumped the image": `quantile()` over a gauge is the quantile *across slots at one
 instant*, not across events over time.
 
-So both exist. The gauges stayed; `husk_recycle_duration_seconds`,
-`husk_cloudinit_duration_seconds` and `husk_boot_phase_seconds` were added as
-histograms, observed at the moment a bring-up completes.
+So both exist. The gauges stayed; `husk_recycle_duration_seconds` and
+`husk_cloudinit_duration_seconds` were added as histograms, observed at the moment
+a bring-up completes.
 
 ```promql
 histogram_quantile(0.95, sum by (le, backend) (
@@ -653,27 +651,97 @@ believe the kubelet.
 
 -----
 
-## Boot-timing exfil (the `husk-bootreport` consumer)
+## Boot timing: the slot reports on itself
 
-The producer shipped in v3: `husk-bootreport.service` is baked and cloud-init
-starts it after the runner; it dumps `systemd-analyze` + `cloud-init analyze blame`
-to the serial console between `===== husk-bootreport =====` markers. **Nothing
-reads it today** — it's write-only (`libvirt_backend.py` leaves `console_log_path`
-unset; `openstack_backend.py` never calls `get_console_output`).
+**The slot publishes its own boot timing through node_exporter.** huskd does not
+read it back off the serial console any more — that path (Phase O1) is gone.
 
-The consumer is a control-plane concern (layer 1), so it lives in huskd:
+### Why it moved
 
-- **Trigger:** once per recycle, after the slot's runner is detected online (huskd
-  already has this signal — `timing.on_runner_online`).
-- **OpenStack:** `get_console_output(instance)` via the SDK; parse the marked block.
-- **libvirt:** read the serial log file (needs `console_log_path` set +
-  host-side file ownership fix).
-- **Parse → `SlotTiming`:** add per-unit fields (e.g. `network-online.target`
-  wait, podman socket wait) and expose as `husk_slot_boot_*` gauges. Also renders
-  on the existing dashboard.
+Console exfil worked, but it had three limits that were structural rather than
+fixable:
 
-Both exfil channels are **control-plane / host-side** (console API, serial file) —
-no in-guest network, so they sidestep the runner egress firewall entirely.
+- **It only ever covered OpenStack.** The libvirt half needed `console_log_path`
+  in the domain XML plus a host-side ownership/relabel fix, which never landed —
+  so half the fleet reported nothing.
+- **It could not see inside `runcmd`.** `cloud-init analyze blame` reports at
+  *module* granularity: everything cloud-init's `runcmd` does — the firewall
+  apply, the in-guest DNS resolves, the CVMFS mounts, every `systemctl start` —
+  is one entry, `modules-final/config-scripts_user`. The question "is the egress
+  allowlist resolve costing us time?" is not answerable from it.
+- **It cost a polling loop.** Up to 10 Nova console reads per bring-up, chasing a
+  block that flushes at an unpredictable moment, plus dedup state to reject the
+  previous cycle's block still sitting in the ring buffer.
+
+### How it works now
+
+1. **cloud-init times itself.** Each interesting step in `runcmd` is followed by a
+   marker: `read -r t _ < /proc/uptime; echo "<label> $t" >> /run/husk/timings`.
+   That is a fork and an append — well under a millisecond — so instrumenting the
+   sequence does not measurably lengthen it. `/proc/uptime` rather than `date`
+   because it is monotonic, and chrony steps the clock during exactly this window.
+   `/run/husk` is root-owned tmpfs: the job runs as `runner` and cannot forge
+   markers, and the file is empty again every boot.
+2. **The expensive analysis is deferred.** `husk-bootreport.service` is baked,
+   `After=husk-runner.service`, and started `--no-block` — so `systemd-analyze`
+   and `cloud-init analyze blame` run while the runner is already registering with
+   GitHub, never on the path to it.
+3. **It writes a textfile.** `/usr/local/bin/husk-bootreport` turns the markers and
+   the blame output into `/var/lib/node_exporter/textfile/husk_boot.prom`, written
+   atomically (tmp + rename — the collector will read a half-written file
+   otherwise). node_exporter serves it as **static gauges for the remaining
+   lifetime of that slot cycle**, and it joins to `husk_slot_info` through the
+   labels the scrape already carries.
+4. **It still prints to the console.** The human-readable block goes to
+   journal+console as before, because that is the one channel that survives a slot
+   which never came up far enough to be scraped.
+
+> **Do not defer this with `systemd-run … systemctl is-system-running --wait`.**
+> That was tried in O1 to make `systemd-analyze time` emit a clean total, and it
+> inflated libvirt recycle from ~60s to ~110s: `--wait` blocks on boot-transaction
+> stragglers (serial-device settling). A baked unit merely *ordered after* the
+> runner does not have that problem. The cost of the clean total is that
+> `systemd-analyze time` often prints nothing at all this early — accepted, and
+> the runcmd markers cover the window it would have described.
+
+### What you get
+
+| Metric | Labels | What it answers |
+|---|---|---|
+| `husk_cloudinit_step_seconds` | `step` | How long each `runcmd` step took — this is the per-phase breakdown console exfil could never give |
+| `husk_cloudinit_marker_uptime_seconds` | `marker` | When each step finished, as seconds since boot |
+| `husk_cloudinit_runcmd_seconds` | — | Total time in `runcmd` |
+| `husk_boot_phase_seconds` | `phase` | kernel / initrd / userspace / total, when `systemd-analyze time` has them |
+| `husk_boot_unit_seconds` | `unit` | Slowest systemd units (top 10) |
+| `husk_cloudinit_stage_seconds` | `stage` | Slowest cloud-init modules (top 10) |
+| `husk_bootreport_written_timestamp_seconds` | — | When the report was generated (freshness) |
+
+Step labels are a fixed vocabulary — `runcmd_start`, `gpu_activated`,
+`firewall_applied`, `egress_resolved`, `cvmfs_proxy_resolved`, `cvmfs_mounted`,
+`exporter_started`, `runner_started` — and only the ones a pool's features
+actually render appear. Cardinality is bounded and stable across cycles.
+
+Worked example, the question that prompted this:
+
+```promql
+# Is the egress allowlist resolve costing us boot time?
+max by (slot) (husk_cloudinit_step_seconds{step="egress_resolved"})
+```
+
+A successful resolve is milliseconds. A *dead* entry in `allow_hosts` waits out
+the resolver timeout on every single cycle, and because the step is deliberately
+soft-failing (`[ -n "$ips" ]`), nothing else would ever tell you.
+
+### Requirements and gaps
+
+- **Needs a golden-image rebuild + rollout** (`husk-bootreport`,
+  `husk-bootreport.service`, the node_exporter textfile flag, the textfile dir).
+  Per the O1 experience: **canary recycle time before rolling out.**
+- **Needs `scrape_cidr` set** — node_exporter is fail-closed, so a pool without it
+  starts no exporter and publishes nothing.
+- **A slot that dies before the exporter starts publishes nothing at all.** That
+  is what `GET /slot/<backend>/<slot>/console` is for: an on-demand read of the
+  serial console, resolved through huskd's own snapshot. Nothing polls it.
 
 -----
 
@@ -713,10 +781,11 @@ add-back** (client key on central only) — not built now.
 
 Independent tracks; ship in any order.
 
-- **Phase O1 ✅ — boot-timing exfil (huskd only, OpenStack first).** `get_console_output`
-  → parse `husk-bootreport` → `husk_slot_boot_*` on `/metrics` + dashboard. No
-  image change, no per-node setup. Highest value / lowest cost; validates the
-  console-parse path. libvirt half follows once the serial-log host fix lands.
+- **Phase O1 ✅ → removed in O5.** Boot-timing exfil by `get_console_output` +
+  parsing `husk-bootreport` in huskd. It worked, and it was the right first move
+  (no image change, no per-node setup), but it only ever covered OpenStack — the
+  libvirt half needed a serial-log host fix that never landed — and it could not
+  see inside cloud-init's `runcmd`. Replaced by Phase O5.
 - **Phase O2 ✅ — node_exporter in the image.** node_exporter (pinned +
   checksummed in `images/versions.env`) and `husk-node-exporter.service` are baked
   into both variants, running as a dedicated unprivileged user, **no TLS/auth**.

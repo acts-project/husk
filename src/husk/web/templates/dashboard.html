@@ -11,33 +11,17 @@ const secs = v => v==null ? "-" : Math.round(v)+"s";
 const pct = v => v==null ? "-" : Math.round(v*100)+"%";
 const esc = s => (s==null ? "" : ""+s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 
-// A nested breakdown of the recycle (issue→online) duration, shown on hover.
-// The controller splits recycle into spawn + cloud-init (its own clock); the
-// husk-bootreport then sub-breaks the guest boot *within* cloud-init (guest
-// clock — so it doesn't sum to recycle, hence the derived remainder line).
+// A breakdown of the recycle (issue→online) duration, shown on hover — the
+// controller's own clock, split into spawn + cloud-init. The finer-grained guest
+// view (per-runcmd-step timings, systemd/cloud-init blame) is no longer read off
+// the console into here: the slot publishes it itself, via node_exporter's
+// textfile collector, as husk_cloudinit_step_seconds & co. Prometheus is the
+// place to drill into a slow boot; this tooltip stays the at-a-glance version.
 function recycleTip(v) {
   if (v.recycle_seconds == null) return "";
   const L = [`recycle ${secs(v.recycle_seconds)}`];
   if (v.boot_seconds != null)      L.push(`  spawn        ${secs(v.boot_seconds)}`);
   if (v.cloudinit_seconds != null) L.push(`  cloud-init   ${secs(v.cloudinit_seconds)}`);
-  if (v.boot_total_seconds != null) {
-    const p = [];
-    if (v.boot_kernel_seconds != null)    p.push(`kernel ${v.boot_kernel_seconds}s`);
-    if (v.boot_initrd_seconds != null)    p.push(`initrd ${v.boot_initrd_seconds}s`);
-    if (v.boot_userspace_seconds != null) p.push(`userspace ${v.boot_userspace_seconds}s`);
-    L.push(`    guest boot ${secs(v.boot_total_seconds)}` + (p.length ? `  (${p.join(" + ")})` : ""));
-    if (v.cloudinit_seconds != null)
-      L.push(`    runner+register+detect ${secs(v.cloudinit_seconds - v.boot_total_seconds)}`);
-  }
-  // Slowest-piece drill-down from the blame sections (systemd + cloud-init).
-  if (v.boot_units && v.boot_units.length) {
-    L.push("  slowest units:");
-    v.boot_units.forEach(u => L.push(`    ${u[1]}s ${u[0]}`));
-  }
-  if (v.boot_cloudinit_stages && v.boot_cloudinit_stages.length) {
-    L.push("  slowest cloud-init stages:");
-    v.boot_cloudinit_stages.forEach(u => L.push(`    ${u[1]}s ${u[0]}`));
-  }
   return L.join("\n");
 }
 

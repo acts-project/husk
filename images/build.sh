@@ -118,8 +118,10 @@ ARGS=(
   --copy-in "$FILES/husk-docker-sock.conf:/etc/tmpfiles.d/"
   --copy-in "$FILES/husk-runner.service:/etc/systemd/system/"
   --copy-in "$FILES/husk-poweroff.service:/etc/systemd/system/"
-  # Boot-timing report to the serial console; NOT enabled (cloud-init starts it).
+  # Boot-timing report; NOT enabled (cloud-init starts it, after the runner).
   --copy-in "$FILES/husk-bootreport.service:/etc/systemd/system/"
+  --copy-in "$FILES/husk-bootreport:/usr/local/bin/"
+  --run-command 'chmod 0755 /usr/local/bin/husk-bootreport'
   --copy-in "$FILES/90-husk-datasource.cfg:/etc/cloud/cloud.cfg.d/"
 
   # Bake the runner binary + its native deps so recycle doesn't reinstall them.
@@ -138,6 +140,10 @@ ARGS=(
   # Dedicated unprivileged user — never `runner` (which is what the untrusted job runs as).
   --run-command 'id -u node_exporter >/dev/null 2>&1 || useradd -r -s /sbin/nologin node_exporter'
   --copy-in "$FILES/husk-node-exporter.service:/etc/systemd/system/"
+  # Textfile collector directory: husk-bootreport (a root oneshot) writes the
+  # boot-timing .prom here, node_exporter reads it unprivileged. Root-owned so
+  # the untrusted job cannot forge metrics; must exist before the first scrape.
+  --run-command 'install -d -m 0755 -o root -g root /var/lib/node_exporter/textfile'
 
   # Ownership (copy-in lands as root; fix up the runner-owned trees).
   --run-command 'chown -R runner:runner /opt/actions-runner /var/lib/husk /home/runner'

@@ -96,6 +96,24 @@ class MultiPoolController:
     def controllers(self) -> list[Controller]:
         return self._controllers
 
+    def console_output(self, backend: str, slot_id: str) -> str | None:
+        """A slot's serial console, by pool name and slot id — the read behind
+        `/slot/<backend>/<slot>/console`. Returns None when the pool is unknown or
+        the backend has no console for it; the seam is best-effort by contract
+        (husk.backend.Backend.console_output) and never raises."""
+        ctrl = next(
+            (c for c in self._controllers if c.cfg.backend.name == backend), None
+        )
+        if ctrl is None:
+            return None
+        # Re-list rather than reuse the reconcile tick's slots: this is an
+        # on-demand debug read, so one extra API call is cheaper than holding
+        # backend Slot objects alive between ticks just for it.
+        slot = next((s for s in ctrl.backend.list_slots() if s.id == slot_id), None)
+        if slot is None:
+            return None
+        return ctrl.backend.console_output(slot)
+
     def snapshots(self) -> list[ControllerState]:
         """The current per-pool snapshots (one per pool; the in-memory HTTP source).
         Each `c.snapshot` is an immutable frozen dataclass swapped atomically per

@@ -1,11 +1,16 @@
 [Unit]
-Description=Husk boot timing report (systemd + cloud-init) to the serial console
+Description=Husk boot timing report (console block + node_exporter textfile)
 # Ordered after the runner so the report never sits on the registration critical
 # path: husk-runner.service is Type=simple (forks immediately) and is already
-# talking to GitHub in parallel while this runs. Reads only timestamps that
-# systemd + cloud-init already record every boot, so it adds no boot-time cost.
-# NOT enabled for boot — cloud-init `systemctl start`s it each cycle, exactly
-# like husk-runner.service (which isn't part of the boot transaction).
+# talking to GitHub in parallel while this runs. NOT enabled for boot —
+# cloud-init `systemctl start --no-block`s it each cycle, exactly like
+# husk-runner.service (which isn't part of the boot transaction).
+#
+# This ordering is load-bearing and must stay exactly this shape. Deferring the
+# report with `systemd-run … timeout 5 systemctl is-system-running --wait`
+# inflated libvirt recycle from ~60s to ~110s, because `--wait` blocks on
+# boot-transaction stragglers (serial-device settling). A baked unit merely
+# ordered after the runner does not. Do not add a wait here.
 After=husk-runner.service
 
 [Service]
@@ -13,16 +18,14 @@ Type=oneshot
 RemainAfterExit=yes
 # journal+console so the numbers land BOTH in the journal and on the serial
 # console, which the hypervisor captures with no SSH into the (firewalled,
-# ephemeral) slot — libvirt console log / OpenStack `nova console-log`.
+# ephemeral) slot — libvirt console log / OpenStack `nova console-log`. That is
+# the only channel that still reports on a slot which never came up far enough
+# for node_exporter to be scraped.
 StandardOutput=journal+console
 StandardError=journal+console
-# Each step is best-effort (`-` prefix): a missing subcommand on an odd image
-# must not fail the unit. cloud-init's own final stage is still open while this
-# runs, so its blame tail omits the last few runcmd ms — the parts we don't care
-# about; the network-online wait, socket wait and per-unit times are all present.
-ExecStart=-/bin/sh -c 'echo "===== husk-bootreport $(date -u +%%FT%%TZ) ====="'
-ExecStart=-/usr/bin/systemd-analyze time
-ExecStart=-/usr/bin/systemd-analyze critical-chain husk-runner.service
-ExecStart=-/bin/sh -c 'systemd-analyze blame | head -n 20'
-ExecStart=-/usr/bin/cloud-init analyze blame
-ExecStart=-/bin/sh -c 'echo "===== husk-bootreport end ====="'
+# `-` prefix: diagnostics must never fail the unit. The script is itself
+# best-effort throughout — see its module docstring. cloud-init's own final
+# stage is still open while this runs, so its blame tail omits the last few
+# runcmd ms; the network-online wait, socket wait and per-unit times are all
+# present, and the runcmd markers cover the part the blame tail misses.
+ExecStart=-/usr/local/bin/husk-bootreport

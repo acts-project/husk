@@ -12,6 +12,19 @@
   without a given feature renders exactly as if the feature did not exist. The
   golden files in tests/golden/ hold that to the byte.
 -#}
+{#-
+  A timing marker: append "<label> <seconds-since-boot>" to a root-owned tmpfs
+  file that husk-bootreport turns into metrics *after* the runner has started.
+
+  This is the whole cost of instrumenting the sequence — a fork and an append,
+  well under a millisecond each. No analysis, no waiting, nothing that can
+  lengthen the thing being measured. /proc/uptime rather than `date` because it
+  is monotonic: chrony steps the clock during boot, which would corrupt wall-time
+  deltas across exactly this window.
+-#}
+{% macro mark(label) %}
+  - read -r t _ < /proc/uptime; echo "{{ label }} $t" >> /run/husk/timings
+{%- endmacro %}
 #cloud-config
 # Golden image: everything slow and static is in the image already, so this is
 # intentionally minimal. See render_cloud_init.
@@ -57,16 +70,21 @@ write_files:
 
 runcmd:
   # jitconfig is written root-owned above; the runner service runs as `runner`.
-  - mkdir -p /var/lib/husk
+  # /run/husk holds the timing markers below and is deliberately NOT chowned:
+  # it must stay unwritable by the (untrusted) job, which runs as `runner`.
+  - mkdir -p /var/lib/husk /run/husk
   - chown -R runner:runner /var/lib/husk
+{{ mark('runcmd_start') }}
 {% if gpu %}
   # GPU runtime activation (every boot — the kmod load + CDI spec are
   # hardware-dependent and cannot be baked into the image).
   - modprobe nvidia
   - nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+{{ mark('gpu_activated') }}
 {% endif %}
   # Lock down egress just before the (untrusted) runner starts.
   - /usr/sbin/nft -f /etc/nftables/husk-egress.nft
+{{ mark('firewall_applied') }}
 {% if egress_allow_hosts %}
   # Open the firewall to the allowlisted hosts (CERN package mirrors and
   # the like): resolve in-guest, since these are load-balanced aliases
@@ -75,6 +93,7 @@ runcmd:
   - |
     ips=$(getent ahostsv4 {{ egress_allow_hosts | join(' ') }} | awk '{print $1}' | sort -u | paste -sd, -)
     [ -n "$ips" ] && nft add element inet husk egress_allow "{ $ips }"
+{{ mark('egress_resolved') }}
 {% endif %}
 {% if cvmfs_proxy_hosts %}
   # Open the firewall to the CVMFS proxy: resolve the squid hostnames
@@ -83,12 +102,14 @@ runcmd:
   - |
     ips=$(getent ahostsv4 {{ cvmfs_proxy_hosts | join(' ') }} | awk '{print $1}' | sort -u | paste -sd, -)
     [ -n "$ips" ] && nft add element inet husk cvmfs_proxy "{ $ips }"
+{{ mark('cvmfs_proxy_resolved') }}
 {% endif %}
 {% if cvmfs_repos %}
   # Eager-mount the configured repos so a per-repo bind makes them visible
   # inside rootless job containers (autofs triggers don't cross the userns).
   - systemctl start autofs
   - for r in {{ cvmfs_repos | join(' ') }}; do cvmfs_config probe "$r" || true; done
+{{ mark('cvmfs_mounted') }}
 {% endif %}
   # The runner unit is baked but NOT enabled for boot; cloud-init starts it each
   # cycle once the fresh JIT config is in place (Type=simple returns immediately).
@@ -98,12 +119,16 @@ runcmd:
   # the ruleset is applied — so :9100 is never briefly open to the world. Before
   # the runner, so metrics are live for the whole job.
   - systemctl start husk-node-exporter.service
+{{ mark('exporter_started') }}
 {% endif %}
   - systemctl start husk-runner.service
-  # Boot-timing report to the serial console (baked oneshot, ordered After the
-  # runner so it never delays registration). Always-on: it only reads timestamps
-  # systemd/cloud-init already record. `--no-block` so a slow analyze can't hold
-  # up the final stage. `|| true` — diagnostics must never fail the boot.
+{{ mark('runner_started') }}
+  # Boot-timing report (baked oneshot, ordered After the runner so it never
+  # delays registration). It turns the markers above into the console block and
+  # into node_exporter's textfile .prom — ALL of the expensive analysis happens
+  # there, after the runner is already registering, never here. `--no-block` so
+  # it can't hold up the final stage; `|| true` — diagnostics must never fail
+  # the boot. Started last, so the marker file is complete when it reads it.
   - systemctl start --no-block husk-bootreport.service || true
   # Belt-and-suspenders wall-clock cap (runner is unprivileged -> real net).
   - shutdown -h +360

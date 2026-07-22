@@ -14,7 +14,13 @@ Group=node_exporter
 # with the egress ruleset (observability.md, "Security model"). The data is
 # low-value host metrics, and baking a cert or a bcrypt hash would put a
 # credential on a box that executes untrusted CI jobs to protect it.
-ExecStart=/usr/local/bin/node_exporter --web.listen-address=:9100
+# The textfile collector serves husk-bootreport's .prom as static gauges for the
+# rest of this slot cycle — boot timing that the exporter itself cannot know.
+# The directory is root-owned and world-readable: the writer is a root oneshot,
+# this reader is unprivileged, and the untrusted job (running as `runner`) can
+# write to neither, so it cannot forge boot metrics.
+ExecStart=/usr/local/bin/node_exporter --web.listen-address=:9100 \
+  --collector.textfile.directory=/var/lib/node_exporter/textfile
 Restart=on-failure
 RestartSec=5
 # Read-only view of the host: the exporter only ever reads /proc, /sys and

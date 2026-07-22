@@ -18,12 +18,6 @@ def _round1(v: float | None) -> float | None:
     return round(v, 1) if v is not None else None
 
 
-def _round_pairs(
-    pairs: list[tuple[str, float]] | None,
-) -> tuple[tuple[str, float], ...]:
-    return tuple((name, round(sec, 1)) for name, sec in pairs) if pairs else ()
-
-
 @dataclass(frozen=True)
 class SlotView:
     """A flat, serializable summary of one classified slot."""
@@ -56,27 +50,6 @@ class SlotView:
     # own window instead of being stuck with "since huskd started".
     state_seconds: dict[str, float] = field(default_factory=dict)
     boot_seconds: float | None = None  # spawn: issue→ACTIVE (controller clock)
-    # systemd-analyze guest boot phases from the last husk-bootreport (seconds) —
-    # a sub-breakdown of the cloud-init window, on the *guest's* clock.
-    boot_kernel_seconds: float | None = None
-    boot_initrd_seconds: float | None = None
-    boot_userspace_seconds: float | None = None
-    boot_total_seconds: float | None = None
-    # Slowest blame entries from the report: [name, seconds], slowest first.
-    boot_units: tuple[tuple[str, float], ...] = ()
-    boot_cloudinit_stages: tuple[tuple[str, float], ...] = ()
-
-    def __post_init__(self) -> None:
-        # JSON has no tuples, so a serialize round-trip (to_dict → from_dict) turns
-        # these into lists-of-lists; coerce back so equality/round-trip is stable.
-        object.__setattr__(self, "boot_units", _as_pairs(self.boot_units))
-        object.__setattr__(
-            self, "boot_cloudinit_stages", _as_pairs(self.boot_cloudinit_stages)
-        )
-
-
-def _as_pairs(pairs) -> tuple[tuple[str, float], ...]:
-    return tuple((name, sec) for name, sec in pairs)
 
 
 def _short_image(ref: str | None) -> str | None:
@@ -185,24 +158,6 @@ class ControllerState:
                     ),
                     boot_seconds=_round1(
                         t.last_boot_seconds if t is not None else None
-                    ),
-                    boot_kernel_seconds=_round1(
-                        t.last_boot_kernel_seconds if t is not None else None
-                    ),
-                    boot_initrd_seconds=_round1(
-                        t.last_boot_initrd_seconds if t is not None else None
-                    ),
-                    boot_userspace_seconds=_round1(
-                        t.last_boot_userspace_seconds if t is not None else None
-                    ),
-                    boot_total_seconds=_round1(
-                        t.last_boot_total_seconds if t is not None else None
-                    ),
-                    boot_units=_round_pairs(
-                        t.last_boot_units if t is not None else None
-                    ),
-                    boot_cloudinit_stages=_round_pairs(
-                        t.last_boot_stages if t is not None else None
                     ),
                 )
             )
