@@ -34,6 +34,13 @@ spec:
       # `just k8s-validate` runs the identical check on your laptop.
       initContainers:
         - name: validate-config
+          # MUST be the same build as the huskd container below: it validates with
+          # the same models, which are extra="forbid", so an older validator
+          # rejects a config key the daemon understands and crash-loops on a
+          # perfectly good config. `oc set image` therefore pins BOTH containers
+          # (see k8s-live-deploy) — pinning only huskd= leaves this one on the
+          # :latest each node happens to have cached, and IfNotPresent means it
+          # never refreshes, so the failure appears on some nodes and not others.
           image: ghcr.io/acts-project/husk:latest
           imagePullPolicy: IfNotPresent
           command: ["huskctl", "validate", "--config", "/etc/husk/config.toml"]

@@ -271,7 +271,7 @@ k8s-build:
 # The image tag is unchanged between builds, so this forces a rollout restart —
 # otherwise the Deployment spec is identical and k8s keeps the old pod running.
 # Build the huskd image locally and deploy it to the colima cluster.
-k8s-local: _local-only k8s-build
+k8s-local: _local-only (k8s-validate "local") k8s-build
     #!/usr/bin/env bash
     set -euo pipefail
     kubectl apply -k k8s/overlays/local
@@ -509,8 +509,73 @@ k8s-live-check:
         exit 1
     fi
 
+# The in-cluster half of config validation, run BEFORE anything is applied — the
+# whole point is that the live pod is still serving while this runs, and a failure
+# costs nothing but the exit code.
+#
+# `just k8s-validate cern` already parses the same file on your laptop. This adds
+# the fidelity that check cannot have: the exact amd64 image CI built for THIS
+# commit, the config as a mounted ConfigMap, and the App key from the real secret.
+# So it catches the mismatch class the local check is blind to — a config using a
+# key the deployed build does not know yet, or vice versa.
+#
+# Notes on the mechanics:
+#  * The ConfigMap is temporary and named to stay clear of the hashed
+#    huskd-config-<hash> the kustomize generator produces; the trap removes it even
+#    when validate fails. Its content is the same file the generator reads, so what
+#    is validated here is byte-identical to what the deploy will apply.
+#  * --overrides REPLACES spec.containers wholesale (it is a JSON merge patch, and
+#    a merge patch cannot merge into a list), so the container is spelled out in
+#    full there. --image/--command are still required by `oc run` itself.
+#  * `oc run --attach` exits with the container's own exit code, so a validation
+#    failure aborts the recipe — and with it the deploy — before `oc apply`.
+# Validate the config in-cluster against this commit's image, changing nothing.
+k8s-live-preflight:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cfg="k8s/overlays/cern/config.toml"
+    [ -f "$cfg" ] || { echo "$cfg not found — run: just k8s-init" >&2; exit 1; }
+    ns="{{k8s_namespace}}"
+    cm="huskd-config-preflight"
+    pod="huskd-preflight"
+
+    cleanup() { oc delete configmap "$cm" -n "$ns" --ignore-not-found >/dev/null 2>&1 || true; }
+    trap cleanup EXIT
+
+    # A leftover pod from an interrupted run would make `oc run` fail on a name clash.
+    oc delete pod "$pod" -n "$ns" --ignore-not-found >/dev/null 2>&1 || true
+    oc create configmap "$cm" --from-file=config.toml="$cfg" -n "$ns" \
+        --dry-run=client -o yaml | oc apply -n "$ns" -f - >/dev/null
+
+    echo "preflight: validating $cfg against {{oc_image}}:{{oc_sha}} in $ns..."
+    overrides=$(cat <<JSON
+    {"spec": {
+      "restartPolicy": "Never",
+      "containers": [{
+        "name": "$pod",
+        "image": "{{oc_image}}:{{oc_sha}}",
+        "command": ["huskctl", "validate", "--config", "/etc/husk/config.toml"],
+        "env": [{"name": "HUSK_GITHUB__PRIVATE_KEY",
+                 "valueFrom": {"secretKeyRef": {"name": "huskd-github", "key": "private-key.pem"}}}],
+        "volumeMounts": [{"name": "config", "mountPath": "/etc/husk", "readOnly": true}],
+        "securityContext": {"runAsNonRoot": true, "allowPrivilegeEscalation": false,
+                            "capabilities": {"drop": ["ALL"]}},
+        "resources": {"requests": {"cpu": "50m", "memory": "64Mi"},
+                      "limits": {"cpu": "500m", "memory": "256Mi"}}
+      }],
+      "volumes": [{"name": "config", "configMap": {"name": "$cm"}}]
+    }}
+    JSON
+    )
+    oc run "$pod" -n "$ns" --image="{{oc_image}}:{{oc_sha}}" --restart=Never \
+        --attach --rm --quiet --pod-running-timeout=5m --overrides="$overrides" \
+        --command -- huskctl validate --config /etc/husk/config.toml
+
 # Apply the cern overlay WITHOUT changing the image (manifest-only changes).
-k8s-live-apply:
+# Validated first — this recipe is what writes the ConfigMap, so it is the last
+# point at which a bad config costs nothing. (just runs a dependency once per
+# invocation, so going through k8s-live-deploy does not re-validate.)
+k8s-live-apply: (k8s-validate "cern")
     oc apply -k k8s/overlays/cern -n {{k8s_namespace}}
 
 # Show what applying the cern overlay would change, against the live cluster.
@@ -519,9 +584,23 @@ k8s-live-diff:
 
 # Needs the CERN VPN. Pins the CI-built image for the current commit, so it fails
 # fast if that image was never built rather than rolling out something stale.
-# Deploy: verify the CI image exists, apply manifests, pin the SHA, wait for rollout.
-k8s-live-deploy: k8s-live-check k8s-live-apply
-    oc set image deployment/huskd huskd={{oc_image}}:{{oc_sha}} -n {{k8s_namespace}}
+#
+# The config is validated HERE, before anything is applied. The validate-config
+# initContainer still runs in-cluster (it is what guards a ConfigMap edited by
+# hand, or applied from another machine), but by then the ConfigMap is already
+# live and the old pod is already gone — Recreate, so a bad config means huskd is
+# DOWN until you fix and re-apply. Catching it locally keeps that from ever
+# starting.
+# BOTH containers are pinned, never just huskd. The validate-config initContainer
+# reads the same config with the same models, so an older build of it rejects a
+# setting the daemon's build understands — and since the base leaves it on
+# :latest with imagePullPolicy IfNotPresent, "older" means "whatever copy of
+# :latest this node last cached", which can be months stale and differs per node.
+# That fails as the initContainer crash-looping on a config that is actually
+# valid, and it reproduces only on the nodes with a stale copy.
+# Deploy: validate locally, check the image, validate in-cluster, apply, pin, wait.
+k8s-live-deploy: (k8s-validate "cern") k8s-live-check k8s-live-preflight k8s-live-apply
+    oc set image deployment/huskd huskd={{oc_image}}:{{oc_sha}} validate-config={{oc_image}}:{{oc_sha}} -n {{k8s_namespace}}
     oc rollout status deployment/huskd -n {{k8s_namespace}} --timeout=10m
 
 # Roll back the live deployment one revision.
@@ -567,7 +646,7 @@ k8s-live-hotdeploy:
 
     digest="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["containerimage.digest"])' "$meta")"
     echo "pushed digest: $digest"
-    oc set image deployment/huskd huskd={{oc_image}}@"$digest" -n {{k8s_namespace}}
+    oc set image deployment/huskd huskd={{oc_image}}@"$digest" validate-config={{oc_image}}@"$digest" -n {{k8s_namespace}}
     oc rollout status deployment/huskd -n {{k8s_namespace}} --timeout=10m
 
 # Both run `huskctl reap` inside the pod, which already has the App key and config
