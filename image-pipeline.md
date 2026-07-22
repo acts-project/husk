@@ -22,11 +22,10 @@ in "Phase 4"); this document un-defers that work with a concrete design.
 > digests it still needs, and a digest nobody pins is dropped 24h after its last
 > use, along with `.pull-*` debris from a huskd killed mid-download.
 >
-> The runner/podman stack is still installed at cloud-init time when a slot boots a
-> *stock* base (`prebaked = false`); pointing `image_ref` at a golden + setting
-> `[runner] prebaked = true` is the boot-speed optimization. **Open:** live-confirm
-> one qcow2 boots cleanly on a CERN Glance upload (datasource/login/ConfigDrive)
-> as it already does on libvirt.
+> Every pool boots a golden image: the stock-base path (cloud-init installing the
+> runner/podman stack at boot) has been removed, so `image_ref`/`image_name` must
+> name a husk golden. **Open:** live-confirm one qcow2 boots cleanly on a CERN
+> Glance upload (datasource/login/ConfigDrive) as it already does on libvirt.
 
 -----
 
@@ -109,7 +108,7 @@ per-slot, per-job, or meant to change without a rebuild.
   `husk-node-exporter.service` if `scrape_cidr` is set (after the ruleset, so
   `:9100` is never briefly open), then `systemctl start husk-runner.service` (the
   sole boot orchestrator, as today), then a non-blocking `husk-bootreport`.
-- **CernVM-FS** when the pool sets `[pool.cvmfs]` (requires `prebaked`): the client
+- **CernVM-FS** when the pool sets `[pool.cvmfs]`: the client
   config (`/etc/cvmfs/default.local` — proxy, repo list, quota), a
   `containers.conf.d` drop-in that binds each `/cvmfs/<repo>` into every job
   container (**per-repo**, not a whole-`/cvmfs` bind — the autofs root readdir is

@@ -1,7 +1,8 @@
 """CernVM-FS support: the per-pool [pool.cvmfs] schema and the cloud-init it
-renders. CVMFS is prebaked-only (the client + autofs are baked into the golden
-image), fail-closed (no [pool.cvmfs] → byte-identical to a non-CVMFS slot), and
-opens exactly one firewall hole for the configured HTTP proxy.
+renders. The client + autofs are baked into the golden image, so cloud-init lays
+only the dynamic layer. Fail-closed (no [pool.cvmfs] → byte-identical to a
+non-CVMFS slot), and opens exactly one firewall hole for the configured HTTP
+proxy.
 
 The container-side mechanism these tests encode was validated on the real rootless
 podman engine: a per-repo containers.conf.d bind injects /cvmfs/<repo> with no -v
@@ -19,11 +20,9 @@ PROXY = "http://ca-proxy-atlas.cern.ch:3128;http://ca-proxy.cern.ch:3128"
 
 
 def _render(**kw) -> str:
-    base = dict(
-        prebaked=True, cvmfs_repos=REPOS, cvmfs_proxy=PROXY, cvmfs_quota_mb=6000
-    )
+    base = dict(cvmfs_repos=REPOS, cvmfs_proxy=PROXY, cvmfs_quota_mb=6000)
     base.update(kw)
-    return render_cloud_init("JIT", "URL", **base).decode()
+    return render_cloud_init("JIT", **base).decode()
 
 
 # ── proxy-host parsing (feeds the in-guest firewall resolve) ──────────────────
@@ -44,7 +43,7 @@ def test_proxy_hosts_empty_for_direct_only():
     assert _proxy_hosts("DIRECT") == []
 
 
-# ── rendered cloud-init (prebaked + cvmfs) ────────────────────────────────────
+# ── rendered cloud-init ───────────────────────────────────────────────────────
 
 
 def test_client_config_written():
@@ -94,24 +93,12 @@ def test_eager_mounts_every_repo():
 # ── fail-closed: off unless explicitly + validly configured ───────────────────
 
 
-def test_cvmfs_ignored_without_prebaked():
-    # Mirrors scrape_cidr: stock images have no client, so the render drops CVMFS
-    # entirely (the config loader also rejects the combination up front).
-    stock = render_cloud_init("JIT", "URL", cvmfs_repos=REPOS, cvmfs_proxy=PROXY)
-    plain = render_cloud_init("JIT", "URL")
-    assert stock == plain
-    assert b"cvmfs" not in stock.lower()
+def test_no_repos_is_byte_identical_to_plain():
+    assert _render(cvmfs_repos=()) == render_cloud_init("JIT").decode()
 
 
-def test_no_repos_is_byte_identical_to_plain_prebaked():
-    assert (
-        _render(cvmfs_repos=())
-        == render_cloud_init("JIT", "URL", prebaked=True).decode()
-    )
-
-
-def test_plain_prebaked_has_no_cvmfs_leftovers():
-    out = render_cloud_init("JIT", "URL", prebaked=True)
+def test_plain_render_has_no_cvmfs_leftovers():
+    out = render_cloud_init("JIT")
     assert b"cvmfs" not in out.lower()
     assert b"@@CVMFS" not in out  # every placeholder resolved away
 
@@ -129,7 +116,6 @@ target = {{ org = "acts-project" }}
 [pool.runner]
 version = "2.334.0"
 arch = "x64"
-prebaked = {prebaked}
 [pool.backend]
 cloud = "cern"
 image_name = "husk-base"
@@ -139,7 +125,7 @@ network_name = "CERN_NETWORK"
 """
 
 
-def _load(tmp_path, *, prebaked="true", cvmfs=""):
+def _load(tmp_path, *, cvmfs=""):
     from husk.config import load_config
 
     pem = tmp_path / "app.pem"
@@ -147,7 +133,7 @@ def _load(tmp_path, *, prebaked="true", cvmfs=""):
         "-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----\n"
     )
     p = tmp_path / "c.toml"
-    p.write_text(_CVMFS_TOML.format(pem=pem, prebaked=prebaked, cvmfs=cvmfs))
+    p.write_text(_CVMFS_TOML.format(pem=pem, cvmfs=cvmfs))
     return load_config(str(p))
 
 
@@ -178,11 +164,6 @@ def test_cvmfs_defaults_quota(tmp_path):
         'http_proxy = "http://p:3128"\n',
     )
     assert cfg.cvmfs.quota_limit_mb == 4000
-
-
-def test_cvmfs_requires_prebaked(tmp_path):
-    with pytest.raises(Exception, match="cvmfs requires prebaked"):
-        _load(tmp_path, prebaked="false", cvmfs=_CVMFS_TABLE)
 
 
 def test_cvmfs_rejects_url_like_repo(tmp_path):

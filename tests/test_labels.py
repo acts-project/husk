@@ -98,7 +98,7 @@ def test_amd_gets_rocm_not_cuda():
 
 def test_cvmfs_label_follows_the_cvmfs_table(tmp_path):
     """The label exists because the mount does — not because someone typed it."""
-    runner = 'arch = "x64"\nprebaked = true'
+    runner = 'arch = "x64"'
     toml = _POOL.format(name="lcg", runner=runner) + (
         '[pool.cvmfs]\nrepositories = ["sft.cern.ch"]\n'
         'http_proxy = "http://squid:3128"\n'
@@ -140,11 +140,6 @@ def test_gpu_model_without_a_gpu_is_a_config_error(tmp_path):
 
 
 # ------------------------------------------------------------------ consumers
-def test_arch_drives_the_runner_tarball(tmp_path):
-    """Stated once: an arm64 pool cannot advertise arm64 while installing an x64
-    runner, because both come from the same field."""
-    cfg = load_config(_write(tmp_path, 'arch = "arm64"'))
-    assert "actions-runner-linux-arm64-2.334.0.tar.gz" in cfg.runner.url
 
 
 def test_gpu_bool_is_derived_from_the_vendor(tmp_path):

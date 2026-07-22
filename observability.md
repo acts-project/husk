@@ -725,8 +725,7 @@ Independent tracks; ship in any order.
   and no exporter started (nothing listening), so a pool whose scraper source
   isn't known yet renders exactly today's ruleset. The exporter is started *after*
   the firewall is applied and *before* the runner, so `:9100` is never briefly
-  open during boot. Requires `prebaked` (the loader rejects the combination
-  otherwise — a stock image has no baked exporter). Takes effect on a rebuild.
+  open during boot. Takes effect on a rebuild.
 - **Phase O3 ✅ — discovery + join (huskd).** A single `http_sd` endpoint
   (`GET /sd/targets`) serving both backends via per-target routing (OpenStack →
   `ip:9100`; libvirt → `host:PORT/<slot>/metrics`) + the `husk_slot_info` join
