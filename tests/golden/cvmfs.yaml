@@ -77,8 +77,16 @@ runcmd:
   - read -r t _ < /proc/uptime; echo "cvmfs_proxy_resolved $t" >> /run/husk/timings
   # Eager-mount the configured repos so a per-repo bind makes them visible
   # inside rootless job containers (autofs triggers don't cross the userns).
+  # Probe each repo in turn and stamp a marker after each: the boot report
+  # then attributes the mount cost per repo. The first repo pays the one-time
+  # client warm-up (config-repo mount, Stratum-1 geo-sort, cold catalog), the
+  # rest are incremental — the per-repo deltas tell those two apart.
   - systemctl start autofs
-  - for r in sft.cern.ch atlas.cern.ch; do cvmfs_config probe "$r" || true; done
+  - |
+    for r in sft.cern.ch atlas.cern.ch; do
+      cvmfs_config probe "$r" || true
+      read -r t _ < /proc/uptime; echo "cvmfs_probe_$r $t" >> /run/husk/timings
+    done
   - read -r t _ < /proc/uptime; echo "cvmfs_mounted $t" >> /run/husk/timings
   # The runner unit is baked but NOT enabled for boot; cloud-init starts it each
   # cycle once the fresh JIT config is in place (Type=simple returns immediately).
