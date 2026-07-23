@@ -519,9 +519,7 @@ class Controller:
             jit = await self.github.generate_jitconfig(name)
             user_data = render_cloud_init(
                 jit,
-                self.cfg.runner.url,
                 gpu=self.cfg.runner.gpu,
-                prebaked=self.cfg.runner.prebaked,
                 scrape_cidr=self.cfg.runner.scrape_cidr,
                 cvmfs_repos=self.cfg.cvmfs.repositories if self.cfg.cvmfs else (),
                 cvmfs_proxy=self.cfg.cvmfs.http_proxy if self.cfg.cvmfs else "",
@@ -601,9 +599,7 @@ class Controller:
             jit = await self.github.generate_jitconfig(name)
             user_data = render_cloud_init(
                 jit,
-                self.cfg.runner.url,
                 gpu=self.cfg.runner.gpu,
-                prebaked=self.cfg.runner.prebaked,
                 scrape_cidr=self.cfg.runner.scrape_cidr,
                 cvmfs_repos=self.cfg.cvmfs.repositories if self.cfg.cvmfs else (),
                 cvmfs_proxy=self.cfg.cvmfs.http_proxy if self.cfg.cvmfs else "",

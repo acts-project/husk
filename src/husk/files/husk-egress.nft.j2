@@ -1,0 +1,87 @@
+{#
+  Coarse egress firewall for a husk slot: allow the public internet, deny the
+  CERN-internal ranges. Applied in cloud-init just before the (untrusted) runner
+  starts, so the job — and nothing else — runs under it.
+
+  Idempotent by construction: it drops and recreates husk's OWN table, because
+  cloud-init's runcmd re-runs on every rebuild and reapplying must not disturb
+  any other table on the guest.
+
+  `inet` covers v4 and v6. Every conditional below resolves to nothing when its
+  feature is off, so a plain slot gets exactly the ruleset as authored — that is
+  what makes each feature fail-closed rather than merely inert.
+-#}
+#!/usr/sbin/nft -f
+table inet husk {}
+delete table inet husk
+
+table inet husk {
+{% if cvmfs %}
+  set cvmfs_proxy { type ipv4_addr; }
+{% endif %}
+{% if egress_allow %}
+  set egress_allow { type ipv4_addr; }
+{% endif %}
+  chain output {
+    type filter hook output priority 0; policy accept;
+
+    oif "lo" accept
+    ct state established,related accept
+
+    # Keep name resolution + time sync working: CERN's own resolvers/NTP
+    # live inside the blocked ranges, so allow 53/123 to anywhere first.
+    udp dport { 53, 123 } accept
+    tcp dport 53 accept
+
+{% if cvmfs %}
+    # Allow the CVMFS HTTP proxy. Its CERN squids live in the
+    # CERN-internal ranges dropped below, so this accept must
+    # precede them; the set is populated in runcmd after an
+    # in-guest resolve of the proxy hostnames.
+    ip daddr @cvmfs_proxy accept
+
+{% endif %}
+{% if egress_allow %}
+    # Allow the operator-listed hosts. They live in the
+    # CERN-internal ranges dropped below, so this accept must
+    # precede them; the set is populated in runcmd after an
+    # in-guest resolve.
+    ip daddr @egress_allow accept
+
+{% endif %}
+    # Deny all other egress to CERN-internal networks. Public internet
+    # falls through to `policy accept`. Extend these sets as needed.
+    ip daddr { 128.141.0.0/16, 128.142.0.0/16, 137.138.0.0/16, 188.184.0.0/15 } drop
+    ip6 daddr { 2001:1458::/32, 2001:1459::/32 } drop
+  }
+{#
+  Metrics ingress (observability.md). node_exporter is baked into the golden
+  image with NO TLS and NO auth, so this source allowlist IS its access control.
+
+  `policy accept` deliberately leaves the rest of ingress exactly as it was: this
+  chain narrows :9100 and nothing else. Replies to an admitted scrape leave via
+  the output chain's `ct state established,related accept`, so they are NOT
+  caught by the CERN-internal egress drops even when the scraper is itself
+  CERN-internal.
+
+  `saddr` is `ip saddr`/`ip6 saddr` per the CIDR's family: inside an `inet` table
+  `ip saddr` matches v4 only, so a v6 source under `ip saddr` would never match
+  and the drop below would silently close the port.
+
+  The `iif "lo" ... drop` hides the exporter from the guest's OWN (untrusted)
+  job: a connection to any local address — 127.0.0.1 or the guest's own fixed IP
+  — is delivered via the loopback interface, so this drops all in-guest access
+  while the external scraper (arriving on the real NIC) is unaffected. It sits
+  BEFORE the accept, so it holds even with a wide scrape_cidr, and needs no
+  knowledge of the guest's IP. The runner has no business reading host metrics.
+-#}
+{% if scrape_cidr %}
+  chain input {
+    type filter hook input priority 0; policy accept;
+
+    iif "lo" tcp dport 9100 drop
+    tcp dport 9100 {{ saddr }} { {{ scrape_cidr }} } accept
+    tcp dport 9100 drop
+  }
+{% endif %}
+}

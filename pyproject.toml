@@ -27,6 +27,9 @@ dependencies = [
     # Quart shares one event loop with the runner poller and the reconcile tasks.
     # hypercorn is the ASGI server Quart's run_task drives.
     "quart>=0.19",
+    # Cloud-init/nftables templating (husk/files/*.j2). Already in the tree via
+    # Quart, but declared because this module imports it directly.
+    "jinja2>=3.1",
     "hypercorn>=0.16",
 ]
 

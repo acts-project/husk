@@ -189,7 +189,6 @@ target = { org = "acts-project", group = "husk" }
 version = "2.334.0"
 arch = "x64"
 gpu = "nvidia"
-prebaked = true
 [pool.backend]
 type = "libvirt"
 image_ref = "ghcr.io/acts-project/husk-gpu:v1"
@@ -219,7 +218,7 @@ def test_load_configs_two_pools_share_github_and_controller(tmp_path, monkeypatc
     # Per-pool knobs differ.
     cpu, gpu = cfgs
     assert cpu.backend.type == "openstack" and cpu.backend.min_ready == 2
-    assert gpu.backend.type == "libvirt" and gpu.runner.gpu and gpu.runner.prebaked
+    assert gpu.backend.type == "libvirt" and gpu.runner.gpu
     assert gpu.backend.hosts[0].gpu_pci_addresses == ("0000:01:00.0",)
 
 
@@ -410,7 +409,7 @@ def test_scrape_cidr_must_be_a_cidr(tmp_path, monkeypatch):
         load_configs(
             _pool_toml(
                 tmp_path,
-                runner='prebaked = true\nscrape_cidr = "137.138.0.0/notanetwork"',
+                runner='scrape_cidr = "137.138.0.0/notanetwork"',
             )
         )
 
@@ -420,7 +419,7 @@ def test_a_valid_ipv6_scrape_cidr_is_accepted(tmp_path, monkeypatch):
     cfg = load_config(
         _pool_toml(
             tmp_path,
-            runner='prebaked = true\nscrape_cidr = "2001:1458:d00:b::/64"',
+            runner='scrape_cidr = "2001:1458:d00:b::/64"',
         )
     )
     assert cfg.runner.scrape_cidr == "2001:1458:d00:b::/64"

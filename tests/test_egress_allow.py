@@ -6,8 +6,8 @@ security property, but it also blackholes CERN's own package mirrors, so a job
 running `dnf install` inside a CERN-built container image fails with a network
 timeout far from the cause. This is the explicit, per-pool escape hatch.
 
-Unlike the CVMFS knobs it is NOT prebaked-gated: it depends on nothing baked into
-the golden image, only on DNS still being reachable after lockdown."""
+It depends on nothing baked into the golden image, only on DNS still being
+reachable after the lockdown."""
 
 from __future__ import annotations
 
@@ -25,38 +25,31 @@ _PEM = "-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----"
 
 
 def _render(**kw) -> str:
-    base = dict(prebaked=True, egress_allow_hosts=HOSTS)
+    base = dict(egress_allow_hosts=HOSTS)
     base.update(kw)
-    return render_cloud_init("JIT", "URL", **base).decode()
+    return render_cloud_init("JIT", **base).decode()
 
 
 # ── fail-closed: absent config changes nothing ───────────────────────────────
 
 
-@pytest.mark.parametrize("prebaked", [True, False])
-def test_no_allowlist_renders_identically(prebaked):
+def test_no_allowlist_renders_identically():
     """An empty list is not merely inert, it is invisible: the rendered user-data
     must be byte-identical to a slot that never had the feature, or every existing
     pool silently gets a new boot path."""
-    assert render_cloud_init(
-        "JIT", "URL", prebaked=prebaked, egress_allow_hosts=()
-    ) == render_cloud_init("JIT", "URL", prebaked=prebaked)
+    assert render_cloud_init("JIT", egress_allow_hosts=()) == render_cloud_init("JIT")
 
 
-@pytest.mark.parametrize("prebaked", [True, False])
-def test_no_allowlist_leaves_no_set_or_rule(prebaked):
-    out = render_cloud_init("JIT", "URL", prebaked=prebaked).decode()
+def test_no_allowlist_leaves_no_set_or_rule():
+    out = render_cloud_init("JIT").decode()
     assert "egress_allow" not in out
 
 
 # ── the rendered ruleset ─────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("prebaked", [True, False])
-def test_applies_on_stock_images_too(prebaked):
-    """The CVMFS holes are prebaked-only because the client is baked. This has no
-    such dependency, so gating it on prebaked would be a limitation with no cause."""
-    out = _render(prebaked=prebaked)
+def test_renders_the_set_and_the_accept():
+    out = _render()
     assert "set egress_allow { type ipv4_addr; }" in out
     assert "ip daddr @egress_allow accept" in out
 
@@ -183,16 +176,12 @@ image_name = "img"
 ENV = ("HUSK_APT_MIRROR=http://ch.archive.ubuntu.com/ubuntu",)
 
 
-@pytest.mark.parametrize("prebaked", [True, False])
-def test_no_container_env_renders_identically(prebaked):
-    assert render_cloud_init(
-        "JIT", "URL", prebaked=prebaked, container_env=()
-    ) == render_cloud_init("JIT", "URL", prebaked=prebaked)
+def test_no_container_env_renders_identically():
+    assert render_cloud_init("JIT", container_env=()) == render_cloud_init("JIT")
 
 
-@pytest.mark.parametrize("prebaked", [True, False])
-def test_container_env_drop_in_written(prebaked):
-    out = render_cloud_init("JIT", "URL", prebaked=prebaked, container_env=ENV).decode()
+def test_container_env_drop_in_written():
+    out = render_cloud_init("JIT", container_env=ENV).decode()
     assert "/etc/containers/containers.conf.d/20-env.conf" in out
     assert "HUSK_APT_MIRROR=http://ch.archive.ubuntu.com/ubuntu" in out
 
@@ -200,7 +189,7 @@ def test_container_env_drop_in_written(prebaked):
 def test_container_env_carries_podman_default_forward():
     """A containers.conf.d drop-in REPLACES a list key rather than appending, so
     omitting the shipped default would silently unset TERM in every job."""
-    out = render_cloud_init("JIT", "URL", prebaked=True, container_env=ENV).decode()
+    out = render_cloud_init("JIT", container_env=ENV).decode()
     assert 'env = ["TERM=xterm", "HUSK_APT_MIRROR=' in out
 
 
@@ -209,8 +198,6 @@ def test_container_env_is_valid_yaml_and_leaves_no_placeholder():
 
     out = render_cloud_init(
         "JIT",
-        "URL",
-        prebaked=True,
         container_env=ENV,
         cvmfs_repos=("sft.cern.ch",),
         cvmfs_proxy="http://ca-proxy.cern.ch:3128",

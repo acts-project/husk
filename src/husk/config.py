@@ -113,15 +113,16 @@ class GithubConfig:
 
 @dataclass(frozen=True)
 class RunnerConfig:
+    # The runner version this pool's golden image is expected to carry. Nothing
+    # downloads a runner any more (it is baked), so this is an assertion about the
+    # image rather than an instruction — see the note in config.example.toml.
     version: str
     # DERIVED, never written by hand: `husk.labels.derive_labels` computes this
     # from the pool's facts at load time (see that module for the scheme). The
     # TOML knob is `extra_labels`, which contributes the tail of this list.
     labels: list[str]
-    # Guest CPU architecture — "x64" or "arm64", in GitHub's spelling because it
-    # is both a label and the runner tarball's name (see `url`). One statement of
-    # the fact drives both, so a pool cannot advertise an arch it did not install
-    # the runner for.
+    # Guest CPU architecture — "x64" or "arm64", in GitHub's spelling because that
+    # is the spelling the label carries.
     arch: str = "x64"
     # Size class ("standard"/"large"), or None for accelerator pools, which carry
     # no size label at all — husk.labels explains why.
@@ -142,7 +143,6 @@ class RunnerConfig:
     # rather than silently ignored. The loader flattens it to here, next to the
     # other knobs the GitHub client consumes.
     runner_group: str = "Default"
-    prebaked: bool = False  # golden-image pools: skip the install steps (baked in)
     # Source allowed to scrape the slot's node_exporter on :9100 — the sole access
     # control for it (no TLS/auth). Per-pool because the client differs by backend:
     # OpenStack = central Prometheus, which scrapes the guest directly; libvirt =
@@ -159,19 +159,12 @@ class RunnerConfig:
         it, so there is no way to configure a pool that has a vendor but no GPU."""
         return bool(self.gpu_vendor)
 
-    @property
-    def url(self) -> str:
-        return (
-            f"https://github.com/actions/runner/releases/download/v{self.version}/"
-            f"actions-runner-linux-{self.arch}-{self.version}.tar.gz"
-        )
-
 
 @dataclass(frozen=True)
 class CvmfsConfig:
     """CernVM-FS access for a pool's slots (opt-in; None when [pool.cvmfs] is
-    omitted). The client is baked into the golden image, so this REQUIRES
-    prebaked = true; cloud-init supplies only the dynamic per-cycle bits.
+    omitted). The client is baked into the golden image; cloud-init supplies only
+    the dynamic per-cycle bits.
 
     `repositories` are eager-mounted on the host before the runner starts and
     bound one-by-one into every job container. A whole-`/cvmfs` bind trips an
@@ -431,7 +424,6 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         size: Literal["standard", "large"] | None = None
         gpu: Literal["nvidia", "amd"] | None = None
         gpu_model: str = ""
-        prebaked: bool = False
         scrape_cidr: str = ""
         # Capability labels husk has no vocabulary for. Appended verbatim; the
         # husk-* namespace is reserved (see husk.labels.check_extra_label).
@@ -622,7 +614,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         runner: _Runner
         backend: _Backend = Field(default_factory=_Backend)
         timeouts: _Timeouts = Field(default_factory=_Timeouts)
-        cvmfs: _Cvmfs | None = None  # opt-in CernVM-FS (requires prebaked)
+        cvmfs: _Cvmfs | None = None  # opt-in CernVM-FS
         egress: _Egress | None = None  # opt-in egress firewall holes
         container: _Container | None = None  # opt-in job-container env
 
@@ -686,22 +678,6 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
                         "no image source: set [pool.backend].image_ref (OCI) or "
                         "image_name (a Glance image name)"
                     )
-            # node_exporter only exists in the golden image, so scrape_cidr on a
-            # stock-image pool would open :9100 to a port with nothing behind it.
-            # Fail loudly rather than silently not collecting the metrics someone
-            # just asked for.
-            if r.scrape_cidr and not r.prebaked:
-                raise ValueError(
-                    "scrape_cidr requires prebaked = true (node_exporter is baked "
-                    "into the golden image; a stock image has none)"
-                )
-            # Same reasoning for CernVM-FS: the client + autofs are baked into the
-            # golden image, so a stock-image pool has nothing to mount /cvmfs with.
-            if self.cvmfs and not r.prebaked:
-                raise ValueError(
-                    "cvmfs requires prebaked = true (the CernVM-FS client is baked "
-                    "into the golden image; a stock image has none)"
-                )
             return self
 
     class _Controller(_Strict):
@@ -896,7 +872,6 @@ def _pool_config(p, github: GithubConfig, controller: ControllerConfig) -> Confi
             runner_group=p.target.group,
             gpu_vendor=p.runner.gpu or "",
             gpu_model=p.runner.gpu_model,
-            prebaked=p.runner.prebaked,
             scrape_cidr=p.runner.scrape_cidr,
         ),
         backend=backend,

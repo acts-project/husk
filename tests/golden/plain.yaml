@@ -1,0 +1,53 @@
+#cloud-config
+# Golden image: everything slow and static is in the image already, so this is
+# intentionally minimal. See render_cloud_init.
+
+write_files:
+  - path: /var/lib/husk/jitconfig
+    permissions: '0600'
+    content: "JITBLOB"
+
+  # Coarse egress firewall ruleset — the tunable security policy, kept in
+  # cloud-init (NOT baked) so a pool can change it without rebuilding the image.
+  - path: /etc/nftables/husk-egress.nft
+    content: |
+      #!/usr/sbin/nft -f
+      table inet husk {}
+      delete table inet husk
+
+      table inet husk {
+        chain output {
+          type filter hook output priority 0; policy accept;
+
+          oif "lo" accept
+          ct state established,related accept
+
+          # Keep name resolution + time sync working: CERN's own resolvers/NTP
+          # live inside the blocked ranges, so allow 53/123 to anywhere first.
+          udp dport { 53, 123 } accept
+          tcp dport 53 accept
+
+          # Deny all other egress to CERN-internal networks. Public internet
+          # falls through to `policy accept`. Extend these sets as needed.
+          ip daddr { 128.141.0.0/16, 128.142.0.0/16, 137.138.0.0/16, 188.184.0.0/15 } drop
+          ip6 daddr { 2001:1458::/32, 2001:1459::/32 } drop
+        }
+      }
+
+runcmd:
+  # jitconfig is written root-owned above; the runner service runs as `runner`.
+  - mkdir -p /var/lib/husk
+  - chown -R runner:runner /var/lib/husk
+  # Lock down egress just before the (untrusted) runner starts.
+  - /usr/sbin/nft -f /etc/nftables/husk-egress.nft
+  # The runner unit is baked but NOT enabled for boot; cloud-init starts it each
+  # cycle once the fresh JIT config is in place (Type=simple returns immediately).
+  - systemctl daemon-reload
+  - systemctl start husk-runner.service
+  # Boot-timing report to the serial console (baked oneshot, ordered After the
+  # runner so it never delays registration). Always-on: it only reads timestamps
+  # systemd/cloud-init already record. `--no-block` so a slow analyze can't hold
+  # up the final stage. `|| true` — diagnostics must never fail the boot.
+  - systemctl start --no-block husk-bootreport.service || true
+  # Belt-and-suspenders wall-clock cap (runner is unprivileged -> real net).
+  - shutdown -h +360

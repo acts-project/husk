@@ -422,6 +422,7 @@ source = { editable = "." }
 dependencies = [
     { name = "httpx" },
     { name = "hypercorn" },
+    { name = "jinja2" },
     { name = "openstacksdk" },
     { name = "oras" },
     { name = "prometheus-client" },
@@ -450,6 +451,7 @@ dev = [
 requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "hypercorn", specifier = ">=0.16" },
+    { name = "jinja2", specifier = ">=3.1" },
     { name = "libvirt-python", marker = "extra == 'libvirt'", specifier = ">=12.5.0" },
     { name = "openstacksdk" },
     { name = "oras", specifier = ">=0.2" },

@@ -35,7 +35,6 @@ target = { org = "acts-project", group = "husk" }
 version = "2.334.0"
 arch = "x64"
 size = "standard"
-prebaked = true
 scrape_cidr = "0.0.0.0/0"
 
 [pool.backend]

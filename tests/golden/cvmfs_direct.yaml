@@ -1,0 +1,81 @@
+#cloud-config
+# Golden image: everything slow and static is in the image already, so this is
+# intentionally minimal. See render_cloud_init.
+
+write_files:
+  - path: /var/lib/husk/jitconfig
+    permissions: '0600'
+    content: "JITBLOB"
+  # CernVM-FS client config (client + autofs are baked; this is the
+  # per-pool dynamic layer: proxy, repo list, cache quota).
+  - path: /etc/cvmfs/default.local
+    content: |
+      CVMFS_HTTP_PROXY="DIRECT"
+      CVMFS_REPOSITORIES=sft.cern.ch
+      CVMFS_QUOTA_LIMIT=4000
+
+  # Default per-repo bind mounts for every job container. podman applies
+  # containers.conf.d to BOTH the CLI shim and the API socket, so this
+  # covers `container:` jobs and step-level `docker run` alike. Per-repo, not a
+  # whole-/cvmfs bind — the autofs root readdir is denied under the rootless
+  # userns, but a bind of an already-mounted repo tree is not.
+  - path: /etc/containers/containers.conf.d/10-cvmfs.conf
+    content: |
+      [containers]
+      volumes = ["/cvmfs/sft.cern.ch:/cvmfs/sft.cern.ch"]
+
+  # Coarse egress firewall ruleset — the tunable security policy, kept in
+  # cloud-init (NOT baked) so a pool can change it without rebuilding the image.
+  - path: /etc/nftables/husk-egress.nft
+    content: |
+      #!/usr/sbin/nft -f
+      table inet husk {}
+      delete table inet husk
+
+      table inet husk {
+        set cvmfs_proxy { type ipv4_addr; }
+        chain output {
+          type filter hook output priority 0; policy accept;
+
+          oif "lo" accept
+          ct state established,related accept
+
+          # Keep name resolution + time sync working: CERN's own resolvers/NTP
+          # live inside the blocked ranges, so allow 53/123 to anywhere first.
+          udp dport { 53, 123 } accept
+          tcp dport 53 accept
+
+          # Allow the CVMFS HTTP proxy. Its CERN squids live in the
+          # CERN-internal ranges dropped below, so this accept must
+          # precede them; the set is populated in runcmd after an
+          # in-guest resolve of the proxy hostnames.
+          ip daddr @cvmfs_proxy accept
+
+          # Deny all other egress to CERN-internal networks. Public internet
+          # falls through to `policy accept`. Extend these sets as needed.
+          ip daddr { 128.141.0.0/16, 128.142.0.0/16, 137.138.0.0/16, 188.184.0.0/15 } drop
+          ip6 daddr { 2001:1458::/32, 2001:1459::/32 } drop
+        }
+      }
+
+runcmd:
+  # jitconfig is written root-owned above; the runner service runs as `runner`.
+  - mkdir -p /var/lib/husk
+  - chown -R runner:runner /var/lib/husk
+  # Lock down egress just before the (untrusted) runner starts.
+  - /usr/sbin/nft -f /etc/nftables/husk-egress.nft
+  # Eager-mount the configured repos so a per-repo bind makes them visible
+  # inside rootless job containers (autofs triggers don't cross the userns).
+  - systemctl start autofs
+  - for r in sft.cern.ch; do cvmfs_config probe "$r" || true; done
+  # The runner unit is baked but NOT enabled for boot; cloud-init starts it each
+  # cycle once the fresh JIT config is in place (Type=simple returns immediately).
+  - systemctl daemon-reload
+  - systemctl start husk-runner.service
+  # Boot-timing report to the serial console (baked oneshot, ordered After the
+  # runner so it never delays registration). Always-on: it only reads timestamps
+  # systemd/cloud-init already record. `--no-block` so a slow analyze can't hold
+  # up the final stage. `|| true` — diagnostics must never fail the boot.
+  - systemctl start --no-block husk-bootreport.service || true
+  # Belt-and-suspenders wall-clock cap (runner is unprivileged -> real net).
+  - shutdown -h +360

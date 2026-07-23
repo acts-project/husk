@@ -31,13 +31,11 @@ target = { org = "acts-project", group = "husk" }
 version = "2.334.0"
 labels = ["self-hosted", "linux", "x64", "gpu"]   # jobs target the GPU pool via `gpu`
 # gpu = true       # activate the NVIDIA driver (modprobe + CDI) each boot
-# prebaked = true  # set when image_ref points at a golden image: cloud-init skips
-#                  # the install steps (podman, runner, driver — all baked). In
-#                  # prebaked mode the baked runner version is authoritative, so
-#                  # `version` above must match the image's husk.runner.version.
+# The baked runner version is authoritative, so `version` above must match the
+# image's husk.runner.version — nothing downloads a runner at boot.
 # In-guest metrics (observability.md). Opens :9100 (node_exporter, baked into the
 # golden) to this source ONLY — it has no TLS/auth, so the allowlist IS the access
-# control. Requires prebaked; unset = fail-closed (no rule, no exporter running).
+# control. Unset = fail-closed (no rule, no exporter running).
 # On libvirt the guest sits on a private net only its hypervisor can reach, so
 # huskd bridges the scrape over the SSH channel it already has to the host. The
 # connection is issued FROM the host, so the libvirt bridge — not Prometheus — is

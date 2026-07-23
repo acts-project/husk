@@ -84,11 +84,9 @@ size = "standard"
 # Capability labels husk has no vocabulary for. The husk-* namespace is reserved
 # for derived labels and is rejected here.
 # extra_labels = ["acts"]
-# prebaked = true  # set ONLY when image_ref points at a husk golden: cloud-init then
-#                  # skips the runner/podman install and `version` must match the image.
 # In-guest metrics (observability.md). Opens :9100 (node_exporter, baked into the
 # golden) to this source ONLY — it has no TLS/auth, so this allowlist IS the access
-# control. Requires prebaked. Unset (default) = fail-closed: no rule, no exporter.
+# control. Unset (default) = fail-closed: no rule, no exporter.
 # On OpenStack the scraper is central Prometheus, which hits the guest directly —
 # so this is Prometheus's own source range. If it runs in k8s, that is the WORKER
 # NODE subnet, not the pod CIDR: pods egressing out of the cluster are SNAT'd to
@@ -104,14 +102,13 @@ keypair = "acts-gha"
 rebuild_microversion = "2.79"
 min_ready = 1
 max_total = 2
-# Image source — pick ONE:
-#  (a) image_name: an existing Glance image (stock ALMA10 + cloud-init installs the stack).
-image_name = "ALMA10 - x86_64"
-#  (b) image_ref: an OCI golden built by build-images.yml on ghcr — the SAME artifact the
+# Image source — a husk golden image, either way. Pick ONE:
+#  (a) image_ref: an OCI golden built by build-images.yml on ghcr — the SAME artifact the
 #      libvirt hosts use. huskd oras-pulls it and uploads it to Glance as
-#      husk-golden-<digest> (idempotent); drains onto a new ref after a restart. Pair
-#      with [pool.runner] prebaked = true.
-# image_ref = "ghcr.io/acts-project/husk-base:v1"
+#      husk-golden-<digest> (idempotent); drains onto a new ref after a restart.
+image_ref = "ghcr.io/acts-project/husk-base:v1"
+#  (b) image_name: a golden already present in Glance, uploaded out of band.
+# image_name = "husk-base"
 
 [pool.timeouts]
 poll_interval_sec = 30
@@ -120,9 +117,8 @@ startup_grace_sec = 300               # post-rebuild grace for the runner to reg
 max_job_duration_sec = 21600          # 6h — stop (not destroy) busy slots beyond this
 
 # CernVM-FS (/cvmfs) for this pool's slots. Opt-in; omit the table for no CVMFS.
-# The client + autofs are BAKED into the golden image, so this REQUIRES
-# [pool.runner] prebaked = true (a stock image has no client — the loader rejects
-# the combination). Each cycle cloud-init writes the client config, eager-mounts
+# The client + autofs are BAKED into the golden image, so cloud-init supplies only
+# the dynamic layer. Each cycle it writes the client config, eager-mounts
 # every listed repo, binds each /cvmfs/<repo> into every job container (per-repo,
 # not a whole-/cvmfs bind — the autofs root readdir is denied under the rootless
 # user namespace), and opens ONE firewall hole for the proxy: it resolves the
@@ -138,8 +134,7 @@ max_job_duration_sec = 21600          # 6h — stop (not destroy) busy slots bey
 # package mirrors, so a job running `dnf install` inside a CERN-built image fails
 # with a timeout far from the cause. List hostnames, not addresses: they are
 # resolved in-guest on every recycle, because the hosts worth listing are
-# load-balanced aliases whose A-records rotate. Unlike [pool.cvmfs] this works on
-# stock images too (nothing about it is baked). Each entry grants the slot's JOBS
+# load-balanced aliases whose A-records rotate. Each entry grants the slot's JOBS
 # full outbound access to that host, so keep the list short.
 # [pool.egress]
 # allow_hosts = ["linuxsoft.cern.ch"]  # CERN package mirror (dnf/yum in job containers)
@@ -177,7 +172,6 @@ arch = "x64"
 # starves the jobs that need the hardware.
 gpu = "nvidia"
 gpu_model = "a100"                     # optional → the `gpu-a100` label
-prebaked = true                        # husk-gpu golden: skip install (version must match the image)
 # In-guest metrics (observability.md). On libvirt the guest is on a private net
 # that only its hypervisor can reach, so huskd bridges the scrape: it SSHes to the
 # host (the channel it already holds) and curls the guest. The connection therefore

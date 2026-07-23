@@ -6,20 +6,14 @@ exactly the ruleset it does today."""
 
 from __future__ import annotations
 
-import pytest
-
 from husk.cloudinit import render_cloud_init
-
-FAKE_PEM = (
-    "-----BEGIN RSA PRIVATE KEY-----\\nnotreal\\n-----END RSA PRIVATE KEY-----\\n"
-)
 
 _START = "systemctl start husk-node-exporter.service"
 _NFT_APPLY = "/usr/sbin/nft -f /etc/nftables/husk-egress.nft"
 
 
 def _render(**kw) -> str:
-    return render_cloud_init("JIT", "URL", prebaked=True, **kw).decode()
+    return render_cloud_init("JIT", **kw).decode()
 
 
 def test_no_scrape_cidr_is_fail_closed():
@@ -76,53 +70,8 @@ def test_ipv6_source_uses_ip6_saddr():
     assert "ip saddr { 2001" not in out
 
 
-def test_stock_image_ignores_scrape_cidr():
-    # node_exporter lives only in the golden image; the loader rejects this combo,
-    # but the renderer must not emit a rule for a port with nothing behind it.
-    out = render_cloud_init("JIT", "URL", prebaked=False, scrape_cidr="10.0.0.0/8")
-    assert b"9100" not in out
-    assert b"node-exporter" not in out
-
-
 def test_metrics_compose_with_gpu():
     out = _render(gpu=True, scrape_cidr="192.168.122.1/32")
     assert "tcp dport 9100 ip saddr { 192.168.122.1/32 } accept" in out
     assert _START in out
     assert "modprobe nvidia" in out
-
-
-def test_loader_rejects_scrape_cidr_without_prebaked(tmp_path, monkeypatch):
-    from husk.config import load_configs
-
-    monkeypatch.setenv(
-        "HUSK_GITHUB__PRIVATE_KEY",
-        FAKE_PEM,
-    )
-
-    cfg = tmp_path / "c.toml"
-    cfg.write_text(
-        """
-[github]
-app_id = 123456
-
-
-[[pool]]
-name = "p1"
-target = { org = "acts-project", group = "husk" }
-[pool.runner]
-version = "2.334.0"
-arch = "x64"
-prebaked = false
-scrape_cidr = "10.0.0.0/8"
-[pool.backend]
-type = "openstack"
-cloud = "cern"
-image_name = "ALMA10 - x86_64"
-flavor_name = "m2.small"
-network_name = "CERN_NETWORK"
-min_ready = 1
-max_total = 2
-"""
-    )
-    with pytest.raises(Exception, match="scrape_cidr requires prebaked"):
-        load_configs(str(cfg))
