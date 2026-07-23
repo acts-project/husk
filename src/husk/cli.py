@@ -598,6 +598,9 @@ async def _serve(
                     image_sync, [c.backend for c in facade.controllers]
                 ),
                 metrics=metrics,
+                # On-demand serial console, for a slot that failed before
+                # node_exporter could publish anything about itself.
+                console_provider=facade.console_output,
             ),
             host,
             port,

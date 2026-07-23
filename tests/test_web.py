@@ -63,40 +63,6 @@ def test_render_prometheus():
     assert "husk_last_reconcile_timestamp_seconds" in text
 
 
-def test_render_prometheus_boot_seconds():
-    from husk.timing import SlotTiming
-
-    t = SlotTiming(first_seen=0.0)
-    t.on_bootreport(kernel=2.1, initrd=None, userspace=8.9, total=15.6)
-    classified = [
-        (
-            make_slot(id="vm-1", name="husk-a-1", status="ACTIVE"),
-            make_runner(name="husk-a-1-c0", status="online"),
-            SlotState.IDLE,
-        )
-    ]
-    state = ControllerState.from_classified(
-        generation=1,
-        backend="pool-a",
-        min_ready=1,
-        max_total=4,
-        desired_total=1,
-        classified=classified,
-        timing={"vm-1": t},
-    )
-    # NB label names come out alphabetically ordered — the exposition format does
-    # not treat label order as meaningful, and prometheus_client normalizes it.
-    text = render_metrics([state])
-    assert (
-        'husk_slot_boot_seconds{backend="pool-a",phase="total",slot="husk-a-1"} 15.6'
-        in text
-    )
-    assert 'phase="kernel",slot="husk-a-1"} 2.1' in text
-    # initrd was None -> the series is omitted, not emitted as 0.
-    assert 'phase="initrd"' not in text
-
-
-# --------------------------------------------------------------- Quart routes
 def _client_get(app, path):
     async def go():
         r = await app.test_client().get(path)
@@ -289,6 +255,57 @@ def test_slot_metrics_503_when_lease_missing():
     snap = _libvirt_snap(ip=None)
     app = make_app(lambda: [snap], scraper=_FakeScraper(), advertise_addr="h:9100")
     assert _client_get(app, "/slot/pool-gpu/husk-g-1/metrics")[0] == 503
+
+
+# ── on-demand serial console ──────────────────────────────────────────────────
+# Boot timing comes from the guest itself now (node_exporter textfile), and
+# nothing polls the console. It survives for the case metrics structurally
+# cannot cover: a slot that died before the exporter ever started.
+
+
+def test_slot_console_returns_the_text():
+    calls = []
+
+    def provider(backend, slot_id):
+        calls.append((backend, slot_id))
+        return "===== husk-bootreport =====\nrunner_started 18.6\n"
+
+    app = make_app(lambda: [_libvirt_snap()], console_provider=provider)
+    code, body = _client_get(app, "/slot/pool-gpu/husk-g-1/console")
+    assert code == 200
+    assert b"runner_started 18.6" in body
+    # Resolved to the slot's ID from the snapshot, not the name in the URL.
+    assert calls == [("pool-gpu", "vm-1")]
+
+
+def test_slot_console_is_not_an_open_relay():
+    calls = []
+    app = make_app(
+        lambda: [_libvirt_snap()],
+        console_provider=lambda b, s: calls.append((b, s)) or "x",
+    )
+    assert _client_get(app, "/slot/pool-gpu/not-a-slot/console")[0] == 404
+    assert _client_get(app, "/slot/other-pool/husk-g-1/console")[0] == 404
+    assert calls == []
+
+
+def test_slot_console_503_without_a_provider():
+    app = make_app(lambda: [_libvirt_snap()])
+    assert _client_get(app, "/slot/pool-gpu/husk-g-1/console")[0] == 503
+
+
+def test_slot_console_503_when_the_backend_has_none():
+    # libvirt has no captured serial log yet, so its console_output returns None.
+    app = make_app(lambda: [_libvirt_snap()], console_provider=lambda b, s: None)
+    assert _client_get(app, "/slot/pool-gpu/husk-g-1/console")[0] == 503
+
+
+def test_slot_console_reports_a_raising_provider_as_502():
+    def boom(backend, slot_id):
+        raise RuntimeError("cloud said no")
+
+    app = make_app(lambda: [_libvirt_snap()], console_provider=boom)
+    assert _client_get(app, "/slot/pool-gpu/husk-g-1/console")[0] == 502
 
 
 def test_metrics_concats_pools():

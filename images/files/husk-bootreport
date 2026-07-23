@@ -1,0 +1,322 @@
+#!/usr/bin/python3
+"""Boot-timing report for a husk slot: console block + node_exporter textfile.
+
+Runs from husk-bootreport.service, which is ordered `After=husk-runner.service`
+and started `--no-block` — so everything expensive here happens while the runner
+is already registering with GitHub, never on the path to it. That ordering is
+load-bearing: an earlier attempt to defer this work with `systemd-run … systemctl
+is-system-running --wait` inflated libvirt recycle from ~60s to ~110s, because
+`--wait` blocks on boot-transaction stragglers. Deferring via a baked unit that is
+simply ordered after the runner does not have that problem. Do not reintroduce a
+wait here.
+
+Two outputs, deliberately:
+
+* **stdout** → journal *and* serial console (see the unit). Human-readable, and
+  the only channel that survives a slot which never got far enough to be scraped.
+* **a .prom textfile** → node_exporter's textfile collector, which serves it as
+  static gauges for the remaining lifetime of this slot cycle. Written last, and
+  atomically (tmp + rename), because the collector will happily read a
+  half-written file.
+
+Everything is best-effort: this is diagnostics, and it runs on a machine that is
+already doing the job it exists for. A missing subcommand, an unparseable line or
+an unwritable directory must never fail the unit.
+
+Stdlib only — there is no husk package on the guest. The parsing is unit-tested
+from the husk repo (tests/test_husk_bootreport.py) by loading this file by path.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+# Markers written by cloud-init's runcmd, one per line: "<label> <uptime_seconds>".
+# /run so the (untrusted) job cannot forge them: /var/lib/husk is chowned to the
+# runner, /run/husk is not, and being a tmpfs it is empty again every boot.
+MARKERS = "/run/husk/timings"
+TEXTFILE = "/var/lib/node_exporter/textfile/husk_boot.prom"
+
+# How many entries to keep from each blame section. The vocabularies are fixed
+# (the units and cloud-init stages of one image), so this bounds series count
+# without the churn a per-cycle-varying label set would cause.
+TOP_N = 10
+
+# A duration token as systemd/cloud-init print them: "1min 5.402s", "8.9s",
+# "526ms", "02.26400s".
+_DUR_RE = re.compile(r"^(?:(\d+)min\s+)?([\d.]+)(m?s)$")
+
+_UNIT_SUFFIX = (
+    r"(?:service|socket|device|mount|automount|swap|target|path|timer|slice|scope)"
+)
+# systemd-analyze blame: "2.923s cloud-init-local.service"
+_SYSTEMD_BLAME_RE = re.compile(
+    rf"^((?:\d+min\s+)?[\d.]+m?s)\s+(\S+\.{_UNIT_SUFFIX})$"
+)
+# cloud-init analyze blame: "     02.26400s (init-local/search-OpenStackLocal)"
+_CLOUDINIT_BLAME_RE = re.compile(r"^((?:\d+min\s+)?[\d.]+m?s)\s+\(([^)]+)\)$")
+
+_PHASE_RE = {
+    phase: re.compile(rf"((?:\d+min\s+)?[\d.]+m?s)\s*\({phase}\)")
+    for phase in ("kernel", "initrd", "userspace")
+}
+_TOTAL_RE = re.compile(r"=\s*((?:\d+min\s+)?[\d.]+m?s)\s*$")
+
+
+def parse_duration(tok: str) -> float | None:
+    """A systemd/cloud-init duration token as seconds, or None if it isn't one."""
+    m = _DUR_RE.match(tok.strip())
+    if m is None:
+        return None
+    minutes = int(m.group(1)) if m.group(1) else 0
+    value = float(m.group(2))
+    seconds = value / 1000.0 if m.group(3) == "ms" else value
+    return minutes * 60.0 + seconds
+
+
+def parse_markers(text: str) -> list[tuple[str, float]]:
+    """`"<label> <uptime>"` lines, in file order. Malformed lines are dropped —
+    a corrupt marker must not cost us the rest of the report."""
+    out: list[tuple[str, float]] = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            out.append((parts[0], float(parts[1])))
+        except ValueError:
+            continue
+    return out
+
+
+def parse_systemd_time(text: str) -> dict[str, float]:
+    """kernel/initrd/userspace/total from `systemd-analyze time`.
+
+    Often empty: the command prints nothing until startup has *finished*, and this
+    report runs while cloud-init's final stage is still open. That is a deliberate
+    trade — see the module docstring on why we no longer wait for it."""
+    phases: dict[str, float] = {}
+    for line in text.splitlines():
+        if not line.startswith("Startup finished in "):
+            continue
+        for phase, rx in _PHASE_RE.items():
+            m = rx.search(line)
+            if m is not None:
+                val = parse_duration(m.group(1))
+                if val is not None:
+                    phases[phase] = val
+        mt = _TOTAL_RE.search(line)
+        if mt is not None:
+            val = parse_duration(mt.group(1))
+            if val is not None:
+                phases["total"] = val
+    return phases
+
+
+def parse_blame(text: str, pattern: re.Pattern[str]) -> list[tuple[str, float]]:
+    """`(name, seconds)` from a blame section, slowest first."""
+    out: list[tuple[str, float]] = []
+    for line in text.splitlines():
+        m = pattern.match(line.strip())
+        if m is None:
+            continue
+        val = parse_duration(m.group(1))
+        if val is not None:
+            out.append((m.group(2), val))
+    out.sort(key=lambda x: x[1], reverse=True)
+    return out
+
+
+def _escape(value: str) -> str:
+    """Escape a Prometheus label value (backslash, quote, newline)."""
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+class Metrics:
+    """Accumulates samples and renders them in Prometheus exposition format.
+
+    Samples are buffered per metric family rather than appended in call order,
+    because the format requires every sample of a family to appear as one
+    contiguous group under a single HELP/TYPE. Emitting them interleaved — which
+    is the natural thing to do when you loop over markers adding two metrics per
+    iteration — produces a file node_exporter's parser rejects outright, and the
+    only symptom is a silently missing metric."""
+
+    def __init__(self) -> None:
+        # name -> (help_text, [sample lines]); dicts keep insertion order, so the
+        # output is stable across runs and diffable.
+        self._families: dict[str, tuple[str, list[str]]] = {}
+
+    def add(
+        self,
+        name: str,
+        value: float,
+        help_text: str,
+        labels: dict[str, str] | None = None,
+    ) -> None:
+        _, samples = self._families.setdefault(name, (help_text, []))
+        if labels:
+            rendered = ",".join(f'{k}="{_escape(v)}"' for k, v in labels.items())
+            samples.append(f"{name}{{{rendered}}} {value:.3f}")
+        else:
+            samples.append(f"{name} {value:.3f}")
+
+    def text(self) -> str:
+        lines: list[str] = []
+        for name, (help_text, samples) in self._families.items():
+            lines.append(f"# HELP {name} {help_text}")
+            lines.append(f"# TYPE {name} gauge")
+            lines.extend(samples)
+        return "\n".join(lines) + "\n"
+
+
+def build_metrics(
+    markers: list[tuple[str, float]],
+    phases: dict[str, float],
+    units: list[tuple[str, float]],
+    stages: list[tuple[str, float]],
+) -> str:
+    """The exposition text for one slot cycle.
+
+    Every series here is *static* for the life of the cycle: the slot boots once,
+    these numbers are what that boot cost, and node_exporter re-serves them
+    unchanged until the slot is recycled. Identity comes from the existing
+    husk_slot_info join, so nothing here carries a slot label of its own."""
+    m = Metrics()
+    for i, (label, uptime) in enumerate(markers):
+        m.add(
+            "husk_cloudinit_marker_uptime_seconds",
+            uptime,
+            "Seconds since boot at which a cloud-init runcmd marker was reached",
+            {"marker": label},
+        )
+        # Step duration: how long it took to get from the previous marker to this
+        # one. The first marker has no predecessor within runcmd.
+        if i > 0:
+            m.add(
+                "husk_cloudinit_step_seconds",
+                uptime - markers[i - 1][1],
+                "Duration of one cloud-init runcmd step",
+                {"step": label},
+            )
+    if len(markers) > 1:
+        m.add(
+            "husk_cloudinit_runcmd_seconds",
+            markers[-1][1] - markers[0][1],
+            "Total wall time spent in the cloud-init runcmd sequence",
+        )
+    for phase, value in sorted(phases.items()):
+        m.add(
+            "husk_boot_phase_seconds",
+            value,
+            "systemd-analyze boot phase duration",
+            {"phase": phase},
+        )
+    for unit, value in units[:TOP_N]:
+        m.add(
+            "husk_boot_unit_seconds",
+            value,
+            "systemd-analyze blame: unit initialisation time",
+            {"unit": unit},
+        )
+    for stage, value in stages[:TOP_N]:
+        m.add(
+            "husk_cloudinit_stage_seconds",
+            value,
+            "cloud-init analyze blame: stage duration",
+            {"stage": stage},
+        )
+    m.add(
+        "husk_bootreport_written_timestamp_seconds",
+        time.time(),
+        "Unix time at which this boot report was generated",
+    )
+    return m.text()
+
+
+def run(*cmd: str) -> str:
+    """Command stdout, or "" if it fails or isn't there. Diagnostics must never
+    fail the unit, and an odd image missing a subcommand is not our problem."""
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=60, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout
+
+
+def write_textfile(path: str, content: str) -> bool:
+    """Write atomically: the textfile collector reads whatever is there on its own
+    schedule, so a partially-written file would be parsed as truncated metrics.
+    tmp + rename in the same directory makes the swap atomic."""
+    directory = os.path.dirname(path)
+    try:
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".husk_boot.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write(content)
+            os.chmod(tmp, 0o644)  # node_exporter reads as its own unprivileged user
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        print(f"husk-bootreport: could not write {path}: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
+def main() -> int:
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    print(f"===== husk-bootreport {stamp} =====")
+
+    try:
+        with open(MARKERS, encoding="utf-8") as fh:
+            markers = parse_markers(fh.read())
+    except OSError:
+        markers = []
+
+    time_out = run("/usr/bin/systemd-analyze", "time")
+    unit_blame = run("/usr/bin/systemd-analyze", "blame")
+    ci_blame = run("/usr/bin/cloud-init", "analyze", "blame")
+
+    phases = parse_systemd_time(time_out)
+    units = parse_blame(unit_blame, _SYSTEMD_BLAME_RE)
+    stages = parse_blame(ci_blame, _CLOUDINIT_BLAME_RE)
+
+    # Console half: for a human reading a serial log, including on a slot that
+    # never came up far enough for anything to scrape it.
+    if markers:
+        print("-- cloud-init runcmd markers (seconds since boot) --")
+        for i, (label, uptime) in enumerate(markers):
+            step = f"  (+{uptime - markers[i - 1][1]:.3f}s)" if i > 0 else ""
+            print(f"  {uptime:8.3f}  {label}{step}")
+    if time_out.strip():
+        print(time_out.strip())
+    for title, entries in (
+        ("-- slowest units --", units),
+        ("-- slowest cloud-init stages --", stages),
+    ):
+        if entries:
+            print(title)
+            for name, value in entries[:TOP_N]:
+                print(f"  {value:8.3f}s  {name}")
+
+    if write_textfile(TEXTFILE, build_metrics(markers, phases, units, stages)):
+        print(f"husk-bootreport: wrote {TEXTFILE}")
+    print("===== husk-bootreport end =====")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

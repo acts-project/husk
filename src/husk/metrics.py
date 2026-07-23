@@ -69,7 +69,6 @@ log = logging.getLogger("husk.metrics")
 # `husk.metrics_store` detects that by comparing bounds and drops the stale
 # series rather than silently mixing two bucket layouts.
 BRINGUP_BUCKETS = (15, 30, 45, 60, 75, 90, 120, 150, 180, 240, 300, 600)
-BOOT_BUCKETS = (1, 2, 5, 10, 15, 20, 30, 45, 60, 120)
 TICK_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60)
 
 Labels = tuple[str, ...]
@@ -294,12 +293,6 @@ class Metrics:
             ["backend"],
             BRINGUP_BUCKETS,
         )
-        self.boot_duration = Histogram(
-            "husk_boot_phase_seconds",
-            "Guest systemd-analyze boot phase durations (husk-bootreport)",
-            ["backend", "phase"],
-            BOOT_BUCKETS,
-        )
         self.github_polls = Counter(
             "husk_github_polls", "Runner-listing polls attempted", ["target"]
         )
@@ -323,7 +316,6 @@ class Metrics:
             self.slot_recycles,
             self.recycle_duration,
             self.cloudinit_duration,
-            self.boot_duration,
             self.github_polls,
             self.github_poll_failures,
             self.guest_scrape_failures,
@@ -416,11 +408,6 @@ class SnapshotCollector:
             "Last issue->runner-online duration",
             labels=labels,
         )
-        boot = GaugeMetricFamily(
-            "husk_slot_boot_seconds",
-            "systemd-analyze boot phase durations (husk-bootreport)",
-            labels=[*labels, "phase"],
-        )
         # `cycle` used to be a *label* on husk_slot_info. It increments on every
         # recycle, so each recycle minted a brand-new series that then went stale
         # — unbounded churn proportional to recycles-over-time, and the exact
@@ -461,19 +448,11 @@ class SnapshotCollector:
                     cloudinit.add_metric(key, v.cloudinit_seconds)
                 if v.recycle_seconds is not None:
                     recycle.add_metric(key, v.recycle_seconds)
-                for phase, val in (
-                    ("kernel", v.boot_kernel_seconds),
-                    ("initrd", v.boot_initrd_seconds),
-                    ("userspace", v.boot_userspace_seconds),
-                    ("total", v.boot_total_seconds),
-                ):
-                    if val is not None:
-                        boot.add_metric([*key, phase], val)
                 cycle.add_metric(key, v.cycle)
                 for state, secs in v.state_seconds.items():
                     state_seconds.add_metric([*key, state], secs)
                 info.add_metric([*key, v.ip or "", v.host or "", v.runner or ""], 1)
-        yield from (cloudinit, recycle, boot, cycle, state_seconds, info)
+        yield from (cloudinit, recycle, cycle, state_seconds, info)
 
     # ---------------------------------------------------------------- storage
     def _storage_families(self) -> Iterator:
