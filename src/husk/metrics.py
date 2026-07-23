@@ -384,6 +384,20 @@ class SnapshotCollector:
             "Monotonic reconcile counter",
             labels=["backend"],
         )
+        # The pool's CONFIGURED target image, carried as a label on an always-1
+        # gauge (the Prometheus info-metric idiom). It is what makes "did p95
+        # recycle move when we bumped the image" answerable: bumping the ref and
+        # restarting retires this series and starts a new one, so the image change
+        # is a visible time boundary to correlate the recycle histogram against —
+        # which the histogram's own doc cites as the reason it is a histogram.
+        # One series per pool, so no cardinality concern. `image_ref` is the full
+        # ref; the per-slot ACTIVE image (which may lag during a rollout) is a
+        # separate label on husk_slot_info.
+        pool_info = GaugeMetricFamily(
+            "husk_pool_info",
+            "Pool identity: its configured target image (always 1)",
+            labels=["backend", "image_ref"],
+        )
         for s in snaps:
             b = s.backend
             for state, n in s.counts.items():
@@ -393,7 +407,8 @@ class SnapshotCollector:
             max_total.add_metric([b], s.max_total)
             last.add_metric([b], s.last_reconcile_epoch)
             generation.add_metric([b], s.generation)
-        yield from (slots, desired, min_ready, max_total, last, generation)
+            pool_info.add_metric([b, s.image_ref or ""], 1)
+        yield from (slots, desired, min_ready, max_total, last, generation, pool_info)
 
     # ------------------------------------------------------------------ slots
     def _slot_families(self, snaps: list[ControllerState]) -> Iterator:
@@ -433,10 +448,16 @@ class SnapshotCollector:
             "Cumulative seconds the slot has spent in each classified state",
             labels=[*labels, "state"],
         )
+        # `image` is the slot's ACTIVE image (short digest, or the tag when the
+        # slot is on the pool's current target), and `image_stale` flags a slot
+        # still running a prior image. Together they turn a rollout into something
+        # observable per slot: `count by (image) (husk_slot_info)` is the drain
+        # curve, and `husk_slot_info{image_stale="true"}` is exactly the slots not
+        # yet cycled. The pool's *configured* target is husk_pool_info.
         info = GaugeMetricFamily(
             "husk_slot_info",
             "Slot identity for joining in-guest metrics (always 1)",
-            labels=[*labels, "ip", "host", "runner"],
+            labels=[*labels, "ip", "host", "runner", "image", "image_stale"],
         )
         for s in snaps:
             b = s.backend
@@ -451,7 +472,17 @@ class SnapshotCollector:
                 cycle.add_metric(key, v.cycle)
                 for state, secs in v.state_seconds.items():
                     state_seconds.add_metric([*key, state], secs)
-                info.add_metric([*key, v.ip or "", v.host or "", v.runner or ""], 1)
+                info.add_metric(
+                    [
+                        *key,
+                        v.ip or "",
+                        v.host or "",
+                        v.runner or "",
+                        v.image or "",
+                        "true" if v.image_stale else "false",
+                    ],
+                    1,
+                )
         yield from (cloudinit, recycle, cycle, state_seconds, info)
 
     # ---------------------------------------------------------------- storage

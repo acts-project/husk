@@ -18,7 +18,7 @@ from husk.snapshot import ControllerState
 from husk.timing import SlotTiming
 
 
-def _snap(*classified, backend="pool-a", timing=None, generation=1):
+def _snap(*classified, backend="pool-a", timing=None, generation=1, image_ref=""):
     return ControllerState.from_classified(
         generation=generation,
         backend=backend,
@@ -27,6 +27,7 @@ def _snap(*classified, backend="pool-a", timing=None, generation=1):
         desired_total=1,
         classified=list(classified),
         timing=timing,
+        image_ref=image_ref,
     )
 
 
@@ -131,6 +132,8 @@ def test_hostile_label_values_do_not_break_the_scrape():
             (
                 ("backend", "pool-a"),
                 ("host", ""),
+                ("image", ""),
+                ("image_stale", "false"),
                 ("ip", ""),
                 ("runner", "back\\slash\nnewline"),
                 ("slot", 'slot"quote'),
@@ -174,6 +177,53 @@ def test_no_event_time_instrument_carries_a_per_slot_label():
     forbidden = {"slot", "runner", "vm", "id", "ip"}
     for name, instrument in Metrics().instruments.items():
         assert not forbidden & set(instrument.labels), name
+
+
+def test_pool_info_carries_the_configured_image_ref():
+    """The pool's target image is exposed as a label on an always-1 gauge, so a
+    ref bump is a visible time boundary to correlate recycle timings against."""
+    snap = _snap(_one(), image_ref="ghcr.io/acts-project/husk-base:v7")
+    info = _samples(render_metrics([snap]), "husk_pool_info")
+    # The FULL ref, verbatim — the pool-level metric names the configured target,
+    # not the abbreviated per-slot form.
+    assert info == {
+        (
+            ("backend", "pool-a"),
+            ("image_ref", "ghcr.io/acts-project/husk-base:v7"),
+        ): 1.0
+    }
+
+
+def test_slot_info_exposes_active_image_and_staleness():
+    """A rollout is observable per slot: the current slot names the pool's tag and
+    is not stale; a slot on a prior image is flagged and falls back to its digest.
+    `count by (image)` over these is the drain curve."""
+    current = (
+        make_slot(id="vm-1", name="husk-a-1", cycle=3),
+        make_runner(name="r1", status="online"),
+        SlotState.IDLE,
+    )
+    lagging = (
+        make_slot(
+            id="vm-2",
+            name="husk-a-2",
+            cycle=2,
+            image_stale=True,
+            active_image="sha256:deadbeefcafe0000",
+        ),
+        make_runner(name="r2", status="online"),
+        SlotState.IDLE,
+    )
+    snap = _snap(current, lagging, image_ref="ghcr.io/acts-project/husk-base:v7")
+    info = _samples(render_metrics([snap]), "husk_slot_info")
+
+    current_labels = next(k for k in info if dict(k)["slot"] == "husk-a-1")
+    assert dict(current_labels)["image"] == "v7"
+    assert dict(current_labels)["image_stale"] == "false"
+
+    stale_labels = next(k for k in info if dict(k)["slot"] == "husk-a-2")
+    assert dict(stale_labels)["image"] == "deadbeefcafe"  # short digest, no tag
+    assert dict(stale_labels)["image_stale"] == "true"
 
 
 def test_a_destroyed_slot_stops_being_reported():
