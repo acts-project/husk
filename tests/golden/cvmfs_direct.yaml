@@ -8,11 +8,19 @@ write_files:
     content: "JITBLOB"
   # CernVM-FS client config (client + autofs are baked; this is the
   # per-pool dynamic layer: proxy, repo list, cache quota).
+  #
+  # CVMFS_USE_GEOAPI=no overrides the CERN domain config's default of yes. Geo
+  # sorts the 7-server CVMFS_SERVER_URL list by distance via a per-mount round
+  # trip — worthless here (every slot in a pool is co-located behind a local
+  # Squid fronting the CERN Stratum-1, which is already first in that list) and
+  # observed to stall cold mounts ~20s each when the geo query times out (it is
+  # not counted as an I/O error). The failover list is kept, just not re-sorted.
   - path: /etc/cvmfs/default.local
     content: |
       CVMFS_HTTP_PROXY="DIRECT"
       CVMFS_REPOSITORIES=sft.cern.ch
       CVMFS_QUOTA_LIMIT=4000
+      CVMFS_USE_GEOAPI=no
 
   # Default per-repo bind mounts for every job container. podman applies
   # containers.conf.d to BOTH the CLI shim and the API socket, so this
@@ -70,16 +78,19 @@ runcmd:
   - read -r t _ < /proc/uptime; echo "firewall_applied $t" >> /run/husk/timings
   # Eager-mount the configured repos so a per-repo bind makes them visible
   # inside rootless job containers (autofs triggers don't cross the userns).
-  # Probe each repo in turn and stamp a marker after each: the boot report
-  # then attributes the mount cost per repo. The first repo pays the one-time
-  # client warm-up (config-repo mount, Stratum-1 geo-sort, cold catalog), the
-  # rest are incremental — the per-repo deltas tell those two apart.
+  # Probe every repo CONCURRENTLY and wait: each probe is an independent
+  # network mount (~20s cold), so serial would sum them onto the critical path
+  # before the runner starts. Each subshell stamps its own completion marker —
+  # a short line via O_APPEND, atomic under PIPE_BUF, so the parallel writes
+  # don't interleave. Because they all start together, a repo's cost is its
+  # marker minus cvmfs_proxy_resolved; cvmfs_mounted (after wait) is the total.
   - systemctl start autofs
   - |
     for r in sft.cern.ch; do
-      cvmfs_config probe "$r" || true
-      read -r t _ < /proc/uptime; echo "cvmfs_probe_$r $t" >> /run/husk/timings
+      ( cvmfs_config probe "$r" || true
+        read -r t _ < /proc/uptime; echo "cvmfs_probe_$r $t" >> /run/husk/timings ) &
     done
+    wait
   - read -r t _ < /proc/uptime; echo "cvmfs_mounted $t" >> /run/husk/timings
   # The runner unit is baked but NOT enabled for boot; cloud-init starts it each
   # cycle once the fresh JIT config is in place (Type=simple returns immediately).
