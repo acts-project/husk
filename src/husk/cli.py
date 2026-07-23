@@ -392,111 +392,121 @@ def run(
     cfgs = _load_all(config, secrets_dir)
     # One lock / HTTP port for the whole daemon (shared [controller]).
     shared = cfgs[0].controller
-    lock = SingleControllerLock(shared.lock_path)
-    try:
-        lock.acquire()
-    except LockHeld as e:
-        typer.echo(str(e), err=True)
-        raise typer.Exit(code=1)
-    try:
-        # One Controller per pool. The facade owns the loop + HTTP, so the
-        # sub-controllers get a blanked http_addr. A pool that
-        # can't be built (bad backend config, unreachable cloud) is skipped with a
-        # loud error rather than taking the whole daemon down — the other pools run.
-        # One process-wide image coordinator: the registry pull is single-flighted
-        # per content digest and the controller cache is shared across all pools.
-        from husk.discovery import TargetDiscovery
+
+    if once:
+        # A one-shot tick is exclusive too, but it does NOT wait: a busy lock means
+        # a daemon is already reconciling, so fail fast rather than block a CLI call.
         from husk.image_sync import ImageSync
         from husk.metrics import Metrics
-        from husk.poller import RunnerPoller, SnapshotRegistry
 
-        image_sync = ImageSync(shared.image_cache_dir or None)
-        # One instrument set for the daemon: every pool's Controller and the
-        # poller record into it, and `/metrics` renders it. Restored from disk
-        # below (in _serve) so counters survive a restart.
-        metrics = Metrics()
-        # One registry for the whole daemon: the centralized poller writes each
-        # target's runner listing here and every pool's reconcile task reads it.
-        registry = SnapshotRegistry()
-        tokens = _tokens(cfgs[0])  # shared App credential (one App, many targets)
-        poller = RunnerPoller(
-            registry,
-            {},
-            # Cadence follows the most eager pool, so no pool ever reads a snapshot
-            # older than its own tick interval.
-            interval=min(c.timeouts.poll_interval_sec for c in cfgs),
-            metrics=metrics,
-        )
-        # One Controller per [[pool]] — each names the one target it serves. A pool
-        # that can't be built (bad backend config, unreachable cloud) is skipped
-        # with a loud error rather than taking the whole daemon down.
-        controllers = []
-        for cfg in cfgs:
-            label = f"{cfg.target}/{cfg.backend.name}"
-            try:
-                backend, github = _build(cfg, image_sync=image_sync, tokens=tokens)
-            except Exception as e:
-                typer.echo(f"pool {label!r} failed to start, skipping: {e}", err=True)
-                logging.getLogger("husk").error(
-                    "pool %s failed to build; skipping", label, exc_info=True
-                )
-                continue
-            sub = dataclasses.replace(
-                cfg, controller=dataclasses.replace(cfg.controller, http_addr="")
-            )
-            controllers.append(
-                Controller(
-                    backend,
-                    github,
-                    sub,
-                    target=cfg.target,
-                    registry=registry,
-                    metrics=metrics,
-                )
-            )
-        if not controllers:
-            typer.echo("no pools could be started", err=True)
+        lock = SingleControllerLock(shared.lock_path)
+        try:
+            lock.acquire()
+        except LockHeld as e:
+            typer.echo(str(e), err=True)
             raise typer.Exit(code=1)
-
-        discovery = TargetDiscovery(tokens, [c.target for c in controllers])
-        facade = MultiPoolController(
-            controllers,
-            discover=discovery.discover,
-            # One listing per distinct target, not per pool: the runner API is
-            # target-wide, so pools sharing a target share the poll.
-            attach=lambda c: poller.add_target(c.target, c.github.list_runners),
-            detach=lambda t: (poller.remove_target(t), registry.forget(t)),
-        )
-        if once:
-            asyncio.run(_once(facade, poller, discovery, tokens))
-        else:
-            if not shared.http_addr:
-                typer.echo("controller.http_addr must be set", err=True)
-                raise typer.Exit(code=1)
-            # libvirt guests are private to their hypervisor, so huskd bridges the
-            # last hop of a metrics scrape over the SSH channel it already holds to
-            # each host. (pool, host) → ssh_target; "" means the host is local.
-            ssh_targets = {
-                (cfg.backend.name, h.name): h.ssh_target
-                for cfg in cfgs
-                for h in cfg.backend.hosts
-            }
-            asyncio.run(
-                _serve(
-                    facade,
-                    poller,
-                    discovery,
-                    tokens,
-                    shared.http_addr,
-                    ssh_targets=ssh_targets,
-                    advertise_addr=shared.advertise_addr or shared.http_addr,
-                    image_sync=image_sync,
-                    metrics=metrics,
-                    metrics_state_path=shared.metrics_state_path,
-                )
+        try:
+            facade, poller, discovery, tokens = _build_daemon(
+                cfgs,
+                image_sync=ImageSync(shared.image_cache_dir or None),
+                metrics=Metrics(),
             )
-    finally:
-        lock.release()
+            asyncio.run(_once(facade, poller, discovery, tokens))
+        finally:
+            lock.release()
+        return
+
+    if not shared.http_addr:
+        typer.echo("controller.http_addr must be set", err=True)
+        raise typer.Exit(code=1)
+    # libvirt guests are private to their hypervisor, so huskd bridges the
+    # last hop of a metrics scrape over the SSH channel it already holds to
+    # each host. (pool, host) → ssh_target; "" means the host is local.
+    ssh_targets = {
+        (cfg.backend.name, h.name): h.ssh_target
+        for cfg in cfgs
+        for h in cfg.backend.hosts
+    }
+    # The daemon binds and serves the dashboard FIRST, then waits for the controller
+    # lock in the background before it reconciles anything — see _serve. Under a
+    # rolling update that keeps the outgoing pod's dashboard visible until the new
+    # pod is up, with reconcile (not serving) pausing across the handoff.
+    asyncio.run(
+        _serve(
+            cfgs,
+            lock_path=shared.lock_path,
+            http_addr=shared.http_addr,
+            ssh_targets=ssh_targets,
+            advertise_addr=shared.advertise_addr or shared.http_addr,
+            image_cache_dir=shared.image_cache_dir,
+            metrics_state_path=shared.metrics_state_path,
+        )
+    )
+
+
+def _build_daemon(cfgs: list[Config], *, image_sync, metrics):
+    """Assemble the reconcile machinery shared by `--once` and the daemon: the
+    centralized poller, one Controller per servable [[pool]], target discovery, and
+    the MultiPoolController facade over them. Returns (facade, poller, discovery,
+    tokens).
+
+    Does the blocking backend construction (openstack.connect, flavor/network
+    lookups per pool), so the daemon calls it via `asyncio.to_thread` to keep the
+    event loop — and thus the already-bound dashboard — responsive while cloud APIs
+    answer. A pool that can't be built is skipped with a loud error rather than
+    taking the whole daemon down; only an empty result is fatal."""
+    from husk.discovery import TargetDiscovery
+    from husk.poller import RunnerPoller, SnapshotRegistry
+
+    tokens = _tokens(cfgs[0])  # shared App credential (one App, many targets)
+    # One registry for the whole daemon: the centralized poller writes each
+    # target's runner listing here and every pool's reconcile task reads it.
+    registry = SnapshotRegistry()
+    poller = RunnerPoller(
+        registry,
+        {},
+        # Cadence follows the most eager pool, so no pool ever reads a snapshot
+        # older than its own tick interval.
+        interval=min(c.timeouts.poll_interval_sec for c in cfgs),
+        metrics=metrics,
+    )
+    controllers = []
+    for cfg in cfgs:
+        label = f"{cfg.target}/{cfg.backend.name}"
+        try:
+            backend, github = _build(cfg, image_sync=image_sync, tokens=tokens)
+        except Exception as e:
+            typer.echo(f"pool {label!r} failed to start, skipping: {e}", err=True)
+            logging.getLogger("husk").error(
+                "pool %s failed to build; skipping", label, exc_info=True
+            )
+            continue
+        sub = dataclasses.replace(
+            cfg, controller=dataclasses.replace(cfg.controller, http_addr="")
+        )
+        controllers.append(
+            Controller(
+                backend,
+                github,
+                sub,
+                target=cfg.target,
+                registry=registry,
+                metrics=metrics,
+            )
+        )
+    if not controllers:
+        raise RuntimeError("no pools could be started")
+
+    discovery = TargetDiscovery(tokens, [c.target for c in controllers])
+    facade = MultiPoolController(
+        controllers,
+        discover=discovery.discover,
+        # One listing per distinct target, not per pool: the runner API is
+        # target-wide, so pools sharing a target share the poll.
+        attach=lambda c: poller.add_target(c.target, c.github.list_runners),
+        detach=lambda t: (poller.remove_target(t), registry.forget(t)),
+    )
+    return facade, poller, discovery, tokens
 
 
 async def _shutdown(facade: MultiPoolController, discovery, tokens) -> None:
@@ -526,28 +536,65 @@ async def _once(facade: MultiPoolController, poller, discovery, tokens) -> None:
         await _shutdown(facade, discovery, tokens)
 
 
+class _Serving:
+    """Mutable seam between the always-on serving plane and the reconcile plane
+    that only exists once this pod holds the controller lock.
+
+    The dashboard/`/metrics`/SSE handlers are built and bound at process start,
+    before any backend exists, and read live state through this holder. While a
+    standby waits for the lock `facade` is None, so every provider returns an empty
+    view and `active` is False — the dashboard renders a "standby" banner instead
+    of a misleading empty fleet. When the lock is won, `_activate` swaps the real
+    facade in and flips `active`."""
+
+    def __init__(self) -> None:
+        self.facade: MultiPoolController | None = None
+        self.image_sync = None
+        self.active = False
+
+    def snapshots(self) -> list[ControllerState]:
+        return self.facade.snapshots() if self.facade is not None else []
+
+    def console_output(self, backend: str, slot_id: str):
+        if self.facade is None:
+            return None
+        return self.facade.console_output(backend, slot_id)
+
+    def storage(self):
+        from husk.storage import collect as collect_storage
+
+        if self.facade is None or self.image_sync is None:
+            return []
+        # Daemon-wide qcow2 usage: the shared controller cache plus each backend's
+        # last per-tick host scan. Read fresh per scrape (both sides in-memory or
+        # memoized), deduped across pools that share a host, so nothing here blocks.
+        return collect_storage(
+            self.image_sync, [c.backend for c in self.facade.controllers]
+        )
+
+
 async def _serve(
-    facade: MultiPoolController,
-    poller,
-    discovery,
-    tokens,
-    http_addr: str,
+    cfgs: list[Config],
     *,
+    lock_path: str,
+    http_addr: str,
     ssh_targets: dict[tuple[str, str], str] | None = None,
     advertise_addr: str = "",
-    image_sync=None,
-    metrics=None,
+    image_cache_dir: str = "",
     metrics_state_path: str = "",
 ) -> None:
-    """Run the whole daemon on this one event loop: the centralized runner poller,
-    every pool's reconcile task, and Quart serving each endpoint. SIGINT/SIGTERM
-    trip the shutdown event, which stops hypercorn (via `shutdown_trigger`) and
-    then drains the poller and reconcile tasks.
+    """Bind and serve the HTTP surface immediately, then become the active
+    reconciler in the background once the controller lock is free.
 
-    Blocking backend work never runs here — `Controller.tick()` pushes it through
-    `asyncio.to_thread` — so a wedged hypervisor stalls only its own pool."""
+    Serving does NOT wait for the lock, the cloud, or GitHub: the dashboard,
+    `/metrics` and `/livez` answer as soon as the event loop is up, so k8s marks
+    the pod Ready within seconds of the container starting and the route stops
+    503ing. `_activate` then acquires the lock (waiting out the previous pod under
+    a rolling update), builds the backends off-loop, and starts the poller and
+    every pool's reconcile task. SIGINT/SIGTERM trip `stop`, which stops hypercorn
+    and drains the reconcile plane before the lock is released last."""
     from husk.guest_scrape import GuestScraper
-    from husk.storage import collect as collect_storage
+    from husk.metrics import Metrics
     from husk.web import make_app, parse_addr, serve_app
 
     stop = asyncio.Event()
@@ -555,63 +602,138 @@ async def _serve(
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
 
-    # Restore accumulated counters BEFORE anything can record into them — the
-    # store folds saved totals in additively, so a poll or tick that landed first
-    # would survive, but only by luck of ordering. Loading here makes it explicit.
-    store = None
-    if metrics is not None and metrics_state_path:
-        from husk.metrics_store import MetricsStore
-
-        store = MetricsStore(metrics_state_path, metrics)
-        store.load()
-
+    # The instrument set exists before any backend does, so `/metrics` is live from
+    # the first scrape (it reports an empty fleet until this pod reconciles). The
+    # scraper and advertise address come from config, not the cloud, so they too
+    # are ready up front.
+    metrics = Metrics()
     scraper = GuestScraper(ssh_targets) if ssh_targets else None
-    # Discover the target set, then warm its registry entries, both before the
-    # first ticks: otherwise the opening tick of every pool would fail-safe purely
-    # because nothing had been polled yet. Units created here are registered but
-    # not yet spawned (no `stop` event); `facade.run` starts them below.
-    await facade.discover_once()
-    await poller.poll_once()
-    tasks = [
-        asyncio.create_task(poller.run(stop), name="husk-poller"),
-        asyncio.create_task(facade.run(stop), name="husk-reconcile"),
-    ]
-    if store is not None:
-        tasks.append(
-            asyncio.create_task(_save_metrics(store, stop), name="husk-metrics")
-        )
+    state = _Serving()
+
+    app = make_app(
+        state.snapshots,
+        shutdown=stop,
+        scraper=scraper,
+        advertise_addr=advertise_addr,
+        storage_provider=state.storage,
+        metrics=metrics,
+        console_provider=state.console_output,
+        # The dashboard reads this to show whether THIS pod is the active reconciler
+        # or a standby waiting for the lock (see _Serving).
+        is_active=lambda: state.active,
+    )
+    host, port = parse_addr(http_addr)
+    display_host = "127.0.0.1" if host == "0.0.0.0" else host
+    log.info(
+        "dashboard: http://%s:%d/ (waiting for the controller lock)", display_host, port
+    )
+
+    server = asyncio.create_task(
+        serve_app(app, host, port, shutdown_trigger=stop.wait), name="husk-http"
+    )
+    activate = asyncio.create_task(
+        _activate(
+            cfgs,
+            lock_path=lock_path,
+            image_cache_dir=image_cache_dir,
+            metrics_state_path=metrics_state_path,
+            stop=stop,
+            state=state,
+            metrics=metrics,
+        ),
+        name="husk-activate",
+    )
     try:
-        host, port = parse_addr(http_addr)
-        display_host = "127.0.0.1" if host == "0.0.0.0" else host
-        log.info("dashboard: http://%s:%d/", display_host, port)
-        await serve_app(
-            make_app(
-                facade.snapshots,
-                shutdown=stop,
-                scraper=scraper,
-                advertise_addr=advertise_addr,
-                # Daemon-wide qcow2 usage: the shared controller cache plus each
-                # backend's last per-tick host scan. Read fresh per scrape (both
-                # sides are in-memory or memoized), and deduped across pools that
-                # share a host, so nothing here can block or double-count.
-                storage_provider=lambda: collect_storage(
-                    image_sync, [c.backend for c in facade.controllers]
-                ),
-                metrics=metrics,
-                # On-demand serial console, for a slot that failed before
-                # node_exporter could publish anything about itself.
-                console_provider=facade.console_output,
-            ),
-            host,
-            port,
-            shutdown_trigger=stop.wait,
-        )
+        # Either finishing ends the daemon: the server returns when `stop` fires,
+        # and `_activate` returns when `stop` drains the reconcile plane (or raises
+        # if no pool could be built at all — a fatal config/cloud state).
+        await asyncio.gather(server, activate)
+    except BaseException:
+        stop.set()  # a crash in one plane tears the other down cleanly
+        server.cancel()
+        activate.cancel()
+        await asyncio.gather(server, activate, return_exceptions=True)
+        raise
     finally:
-        stop.set()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        await _shutdown(facade, discovery, tokens)
         if scraper is not None:
             scraper.close()  # drop the multiplexed SSH control sockets
+
+
+async def _activate(
+    cfgs: list[Config],
+    *,
+    lock_path: str,
+    image_cache_dir: str,
+    metrics_state_path: str,
+    stop: asyncio.Event,
+    state: _Serving,
+    metrics,
+) -> None:
+    """Acquire the controller lock, then run the reconcile plane until `stop`.
+
+    Blocks on the lock rather than failing on contention: under a rolling update
+    the outgoing pod still holds it, so the new pod serves its standby dashboard
+    here until the handoff completes. Nothing in this coroutine mutates shared
+    state (backends, image cache, metrics-state file) before the lock is held, so
+    two pods never reconcile — or write the shared PVCs — at once."""
+    from husk.image_sync import ImageSync
+
+    lock = SingleControllerLock(lock_path)
+    if not await lock.wait_acquire(stop):
+        return  # shutting down before we ever won the lock
+    facade = discovery = tokens = None
+    try:
+        image_sync = ImageSync(image_cache_dir or None)
+        # The blocking backend construction (openstack.connect, flavor/network
+        # lookups) runs off the event loop so the already-bound dashboard stays
+        # responsive while the cloud APIs answer.
+        facade, poller, discovery, tokens = await asyncio.to_thread(
+            _build_daemon, cfgs, image_sync=image_sync, metrics=metrics
+        )
+        # Publish to the serving plane: from here the dashboard shows live slots.
+        state.image_sync = image_sync
+        state.facade = facade
+
+        # Restore accumulated counters BEFORE anything records into them — the store
+        # folds saved totals in additively, so loading here (not after the first
+        # tick) makes the ordering explicit. Only the lock holder touches this file,
+        # so two overlapping pods never write it.
+        store = None
+        if metrics_state_path:
+            from husk.metrics_store import MetricsStore
+
+            store = MetricsStore(metrics_state_path, metrics)
+            store.load()
+
+        # Discover the target set, then warm its registry entries, both before the
+        # first ticks: otherwise the opening tick of every pool would fail-safe
+        # purely because nothing had been polled yet.
+        await facade.discover_once()
+        await poller.poll_once()
+        state.active = True
+        log.info("active reconciler: %d pool(s)", len(facade.controllers))
+
+        tasks = [
+            asyncio.create_task(poller.run(stop), name="husk-poller"),
+            asyncio.create_task(facade.run(stop), name="husk-reconcile"),
+        ]
+        if store is not None:
+            tasks.append(
+                asyncio.create_task(_save_metrics(store, stop), name="husk-metrics")
+            )
+        # Runs until `stop`; `_save_metrics` does its final flush on the way out,
+        # BEFORE the lock is released below, so a successor never reads a stale file.
+        await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        state.active = False
+        state.facade = None
+        if facade is not None:
+            try:
+                await _shutdown(facade, discovery, tokens)
+            except Exception:
+                log.debug("client shutdown failed", exc_info=True)
+        lock.release()
+        log.info("controller lock released")
 
 
 async def _save_metrics(store, stop: asyncio.Event) -> None:

@@ -3,12 +3,18 @@ kind: Deployment
 metadata:
   name: huskd
 spec:
-  # huskd is a SINGLETON: it takes an exclusive flock on controller.lock_path
-  # (src/husk/lock.py) so two daemons can't fight over the same slot set. Recreate
-  # (not RollingUpdate) so the old pod is gone before the new one starts — a rolling
-  # update would leave the new pod crash-looping on LockHeld only if they shared the
-  # lock volume, but more importantly two huskds would both reconcile the same
-  # backend for the overlap window.
+  # huskd serves its HTTP surface as soon as the process is up, but only ONE pod
+  # reconciles at a time: it blocks on an flock at controller.lock_path
+  # (src/husk/lock.py, wait_acquire) before touching any backend. Contention is a
+  # handoff, not an error — a second pod serves a read-only "standby" dashboard
+  # until the lock frees, then takes over reconciling.
+  #
+  # The base default is Recreate because the `run` lock volume here is a per-pod
+  # emptyDir: two overlapping pods would each see their OWN empty lock and both
+  # reconcile. An overlay that puts the lock on a SHARED volume (see overlays/cern,
+  # RWX on CephFS) can safely switch to RollingUpdate(maxUnavailable:0) — the new
+  # pod serves immediately and waits out the old pod's lock, so the dashboard never
+  # goes dark across a deploy; only reconcile pauses for the handoff.
   replicas: 1
   strategy:
     type: Recreate
@@ -24,6 +30,12 @@ spec:
         prometheus.io/port: "9100"
         prometheus.io/path: /metrics
     spec:
+      # On SIGTERM the daemon stops accepting, drains its in-flight reconcile tick,
+      # flushes metrics-state, then releases the controller lock — in that order
+      # (see cli._activate). Give it room to finish: under a shared-lock rolling
+      # update the successor can't reconcile until this release lands, and a SIGKILL
+      # here leaves the lock to be reclaimed only after the CephFS session times out.
+      terminationGracePeriodSeconds: 45
       # Fail a bad ConfigMap BEFORE the daemon starts. `huskctl validate` parses
       # the config and touches nothing external — no cloud, no libvirt, no GitHub —
       # so this is fast and side-effect free, and the pod never reaches the point
@@ -107,8 +119,12 @@ spec:
             # storage in any long-lived cluster (see overlays/cern).
             - name: image-cache
               mountPath: /app/.cache/husk/images
-            # controller.lock_path lives here. Deliberately NOT shared storage:
-            # the lock must be per-pod, and the kernel drops it on crash.
+            # controller.lock_path lives here. In the base this is a per-pod
+            # emptyDir (kernel drops the lock on crash), which is why the base is
+            # Recreate. An overlay that wants a zero-downtime RollingUpdate swaps
+            # this for a SHARED RWX claim so both pods contend on one flock — the
+            # single-reconciler guarantee then comes from the lock, not from the
+            # rollout strategy (see overlays/cern).
             - name: run
               mountPath: /run/husk
             # controller.metrics_state_path. huskd's accumulated counters and

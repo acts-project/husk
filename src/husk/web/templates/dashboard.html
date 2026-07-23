@@ -1,6 +1,12 @@
 {% extends "base.html" %}
 {% block headerextra %}<span class="dim">live via SSE</span>{% endblock %}
-{% block body %}<div id="pools"></div>{% endblock %}
+{% block body %}<div id="standby" class="standby"{% if active %} hidden{% endif %}>standby — another huskd holds the controller lock; this pod is serving read-only and will take over reconciling when that pod steps down</div>
+<div id="pools"></div>{% endblock %}
+{% block headextra %}<style>
+.standby { margin:12px 16px; padding:8px 12px; border:1px solid #9e6a03; background:#2b2000;
+  color:#e3b341; border-radius:6px; font-size:13px; }
+.standby[hidden] { display:none; }
+</style>{% endblock %}
 {% block scripts %}
 <script>
 const STATES = ["idle","busy","starting","needs_recycle","unhealthy","error"];
@@ -107,9 +113,18 @@ function render(pools) {
 }
 
 const conn = document.getElementById("conn");
+const standby = document.getElementById("standby");
 const es = new EventSource("/events");
 es.onmessage = e => {
-  try { render(JSON.parse(e.data)); conn.innerHTML = '<span class="ok">●</span> live'; }
+  try {
+    // Frame is {active, pools}: active tracks whether this pod holds the
+    // controller lock, so the standby banner follows a live handoff (a standby
+    // that wins the lock hides it) without needing a page reload.
+    const msg = JSON.parse(e.data);
+    standby.hidden = msg.active !== false;
+    render(msg.pools || []);
+    conn.innerHTML = '<span class="ok">●</span> live';
+  }
   catch (err) { /* ignore a malformed frame; next push corrects it */ }
 };
 es.onerror = () => { conn.innerHTML = '<span class="bad">●</span> reconnecting…'; };

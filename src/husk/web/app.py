@@ -94,6 +94,7 @@ def make_app(
     storage_provider: Callable[[], list[DiskUsage]] | None = None,
     metrics: Metrics | None = None,
     console_provider: Callable[[str, str], str | None] | None = None,
+    is_active: Callable[[], bool] | None = None,
 ) -> Quart:
     """Build the app over a per-pool snapshot provider (the same one every
     endpoint reads). Templates resolve relative to this package.
@@ -123,7 +124,13 @@ def make_app(
     It backs `/slot/<backend>/<slot>/console`, which exists for the one case the
     metrics path structurally cannot cover: a slot that never got far enough for
     node_exporter to be scraped publishes nothing, and its console is the only
-    remaining evidence. On demand only — nothing polls it."""
+    remaining evidence. On demand only — nothing polls it.
+
+    `is_active`, if given, reports whether THIS pod is the active reconciler (it
+    holds the controller lock) or a standby waiting for it under a rolling update.
+    The dashboard shows a "standby" banner in the latter case so an empty fleet
+    reads as "not my job yet", not "everything is gone". Omitted → always active
+    (the single-process / test case)."""
     app = Quart(__name__)
     registry = build_registry(
         snapshot_provider, storage_provider=storage_provider, metrics=metrics
@@ -132,12 +139,26 @@ def make_app(
     def _snaps() -> list[ControllerState]:
         return snapshot_provider() or []
 
+    def _active() -> bool:
+        return is_active() if is_active is not None else True
+
     def _payload() -> str:
         return json.dumps([s.to_dict() for s in _snaps()])
 
+    def _event_payload() -> str:
+        # The dashboard's private SSE channel carries the reconciler role alongside
+        # the pools so the standby banner tracks a live handoff without a reload.
+        # `/status` (huskctl's contract) stays a bare array — only this frame is
+        # wrapped.
+        return json.dumps(
+            {"active": _active(), "pools": [s.to_dict() for s in _snaps()]}
+        )
+
     @app.get("/")
     async def index():
-        return await render_template("dashboard.html", push_interval=_PUSH_INTERVAL_S)
+        return await render_template(
+            "dashboard.html", push_interval=_PUSH_INTERVAL_S, active=_active()
+        )
 
     @app.get("/status")
     async def status():
@@ -292,7 +313,7 @@ def make_app(
             # instead of holding the connection open through graceful shutdown.
             try:
                 while shutdown is None or not shutdown.is_set():
-                    yield f"data: {_payload()}\n\n".encode()
+                    yield f"data: {_event_payload()}\n\n".encode()
                     if shutdown is None:
                         await asyncio.sleep(_PUSH_INTERVAL_S)
                     else:

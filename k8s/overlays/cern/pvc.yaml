@@ -4,7 +4,12 @@ metadata:
   name: huskd-image-cache
 spec:
   accessModes:
-    - ReadWriteOnce
+    # RWX, not RWO: a RollingUpdate briefly runs the outgoing and incoming pods at
+    # once (so the dashboard never goes dark — see deployment strategy), and both
+    # mount this volume. CephFS is a shared filesystem, so RWX is free here — no
+    # migration, no new backing store. Only the pod holding the controller lock
+    # WRITES; the standby mounts read-only in practice until it takes over.
+    - ReadWriteMany
   storageClassName: cephfs-ssd-no-backup
   resources:
     requests:
@@ -32,7 +37,12 @@ metadata:
   name: huskd-metrics-state
 spec:
   accessModes:
-    - ReadWriteOnce
+    # RWX, not RWO: a RollingUpdate briefly runs the outgoing and incoming pods at
+    # once (so the dashboard never goes dark — see deployment strategy), and both
+    # mount this volume. CephFS is a shared filesystem, so RWX is free here — no
+    # migration, no new backing store. Only the pod holding the controller lock
+    # WRITES; the standby mounts read-only in practice until it takes over.
+    - ReadWriteMany
   storageClassName: cephfs-ssd-no-backup
   resources:
     requests:
@@ -56,4 +66,23 @@ spec:
       #
       # Losing this volume is not an incident: huskd logs it and starts every
       # counter from zero, which Prometheus reads as an ordinary counter reset.
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: huskd-lock
+spec:
+  accessModes:
+    # The one volume that MUST be shared across pods: it holds controller.lock_path
+    # (/run/husk/huskd.lock), the flock that elects the single reconciler. In the
+    # base this is a per-pod emptyDir (each pod its own lock — fine under Recreate);
+    # here both rolling-update pods contend on the SAME file, which is exactly how
+    # the handoff is serialized. Hence RWX, and hence NOT an emptyDir.
+    - ReadWriteMany
+  storageClassName: cephfs-ssd-no-backup
+  resources:
+    requests:
+      # A single zero-byte lock file. This is the smallest the class will grant;
+      # nothing is stored here but the flock target and the holder's pid.
       storage: 1Gi

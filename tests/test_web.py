@@ -86,6 +86,23 @@ def test_status_returns_pool_list():
     assert data[0]["slots"][0]["name"] == "husk-a-1"
 
 
+def test_standby_banner_hidden_when_active():
+    # Default (no is_active) is active: the initial page hides the standby banner.
+    _, body = _client_get(make_app(lambda: [_snap()]), "/")
+    assert 'id="standby" class="standby" hidden' in body.decode()
+
+
+def test_standby_banner_shown_when_not_active():
+    # A pod that hasn't won the controller lock yet renders the banner un-hidden,
+    # and — the whole point — keeps serving: /status and /livez still answer.
+    app = make_app(lambda: [], is_active=lambda: False)
+    _, body = _client_get(app, "/")
+    tag = body.decode().split('id="standby"')[1].split(">")[0]
+    assert "hidden" not in tag  # banner visible while standby
+    assert _client_get(app, "/livez")[0] == 200
+    assert _client_get(app, "/status")[0] == 200
+
+
 def test_metrics_endpoint():
     code, body = _client_get(make_app(lambda: [_snap()]), "/metrics")
     assert code == 200

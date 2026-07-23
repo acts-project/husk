@@ -44,12 +44,35 @@ patches:
       kind: Deployment
       name: huskd
     patch: |-
+      # Zero-downtime dashboard across a deploy. The base is Recreate (its lock is a
+      # per-pod emptyDir; overlapping pods would each hold their own and both
+      # reconcile). Here the lock is a SHARED PVC (below), so it is safe to keep the
+      # outgoing pod up — still serving AND reconciling — until the new pod is Ready,
+      # then let it drain and release the lock. maxUnavailable:0 guarantees the
+      # overlap; the new pod serves a standby dashboard while it waits for the lock.
+      - op: replace
+        path: /spec/strategy
+        value:
+          type: RollingUpdate
+          rollingUpdate:
+            maxSurge: 1
+            maxUnavailable: 0
       - op: replace
         path: /spec/template/spec/volumes/2
         value:
           name: image-cache
           persistentVolumeClaim:
             claimName: huskd-image-cache
+      # The controller lock moves off the base's per-pod emptyDir onto a shared RWX
+      # claim so both rolling-update pods contend on the same flock — that mutual
+      # exclusion is what keeps exactly one reconciler despite the overlap. Index 3
+      # is the `run` volume (config, openstack, image-cache, run, metrics-state).
+      - op: replace
+        path: /spec/template/spec/volumes/3
+        value:
+          name: run
+          persistentVolumeClaim:
+            claimName: huskd-lock
       # Without this, huskd's counters reset on every pod restart — and since
       # there is no config hot-reload, every config change IS a restart.
       - op: replace
