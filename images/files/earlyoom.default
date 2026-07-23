@@ -1,0 +1,21 @@
+# EnvironmentFile for earlyoom.service (installed to /etc/default/earlyoom),
+# overwriting the EPEL package's stock config. earlyoom is husk's default OOM
+# handler on every slot: it watches free RAM and, before the kernel's blunt OOM
+# killer fires, signals the process with the largest oom_score.
+#
+# On a husk slot that process is the job: the runner agent carries
+# OOMScoreAdjust=-900 (a husk-runner.service drop-in laid down by cloud-init), so
+# earlyoom steers the kill to the job's rootless-podman container, not the agent
+# supervising it. earlyoom honours oom_score_adj, so the two compose.
+#
+# -m 5,2  SIGTERM the fattest process at 5% free RAM, SIGKILL at 2%. A slot runs
+#         ONE job and is meant to use most of its RAM, so we intervene late — near
+#         real exhaustion — to avoid killing a legitimately heavy job. There is no
+#         swap on a slot, so the RAM percentage alone governs (earlyoom's swap
+#         condition is trivially met at 0 swap); kill later than the desktop
+#         default of 10,5, but still ahead of the kernel's 0%.
+# -r 3600 A heartbeat memory report to the journal hourly. Kills are logged
+#         unconditionally regardless of this; the interval is just a liveness line.
+#
+# Percentages, so one setting fits every OpenStack flavor and libvirt host RAM.
+EARLYOOM_ARGS="-m 5,2 -r 3600"

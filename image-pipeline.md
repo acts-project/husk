@@ -84,6 +84,15 @@ per-slot, per-job, or meant to change without a rebuild.
   `:9100` nftables allowlist, which is *policy* and therefore cloud-init's). Static
   capability, so it's baked; **not** enabled for boot — cloud-init starts it only
   when the pool sets `scrape_cidr`, and only after the ruleset lands.
+- `earlyoom` (EPEL) + `/etc/default/earlyoom` (`images/files/earlyoom.default`) —
+  the default OOM handler. Slots have no swap and run one job that is meant to use
+  most of the RAM, so a runaway job would otherwise hit the kernel's blunt OOM
+  killer with no soft landing. earlyoom SIGTERMs the largest-`oom_score` process
+  just before real exhaustion (`-m 5,2`) and logs it. The victim is steered to the
+  job, not the runner agent, by the agent's `OOMScoreAdjust=-900` (a cloud-init
+  drop-in, below) — earlyoom honours `oom_score_adj`, so the two compose. Percent
+  thresholds, so one config fits every flavor/host RAM. Enabled for boot (unlike
+  the runner units) — it must be up before any job runs.
 - **GPU variant only:** NVIDIA driver + `nvidia-container-toolkit`, plus the
   CDI-on-first-boot oneshot (`husk-cdi.service`). CDI generation stays first-boot
   — it needs the driver loaded against a present GPU, which an offline build

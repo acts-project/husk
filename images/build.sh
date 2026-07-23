@@ -88,6 +88,16 @@ ARGS=(
   # Container stack + runner native deps + firewall ENGINE (ruleset is runtime).
   --install "podman,podman-docker,fuse-overlayfs,slirp4netns,netavark,aardvark-dns,libicu,sudo,curl,jq,git,nftables,tar"
 
+  # OOM handling: earlyoom watches free RAM and, before the kernel's blunt OOM
+  # killer fires, SIGTERMs the largest-oom_score process — steered to the JOB (not
+  # the agent) by the -900 OOMScoreAdjust cloud-init drops on husk-runner.service.
+  # Percent-based, so one config fits every flavor/host RAM. Lives in EPEL; its
+  # only deps (glibc, systemd) are already present. The stock /etc/default/earlyoom
+  # is overwritten by images/files/earlyoom.default (copied in below).
+  --run-command 'dnf -y install epel-release'
+  --run-command 'dnf -y install earlyoom'
+  --run-command 'systemctl enable earlyoom.service'
+
   # CernVM-FS client + autofs wiring (baked; cloud-init supplies the per-pool repo
   # list, the HTTP proxy, and the per-cycle eager-mounts). cvmfs-config-default
   # pulls the CERN config-repo so any *.cern.ch repo resolves; `cvmfs_config setup`
@@ -123,6 +133,10 @@ ARGS=(
   --copy-in "$FILES/husk-bootreport:/usr/local/bin/"
   --run-command 'chmod 0755 /usr/local/bin/husk-bootreport'
   --copy-in "$FILES/90-husk-datasource.cfg:/etc/cloud/cloud.cfg.d/"
+  # earlyoom tuning (overwrites the EPEL package's stock config). --copy-in keeps
+  # the source basename, so land it then rename to the EnvironmentFile path.
+  --copy-in "$FILES/earlyoom.default:/etc/default/"
+  --run-command 'mv -f /etc/default/earlyoom.default /etc/default/earlyoom'
 
   # Bake the runner binary + its native deps so recycle doesn't reinstall them.
   --run-command "cd /opt/actions-runner && curl -fL '$RUNNER_URL' | tar xz"
