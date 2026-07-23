@@ -99,6 +99,7 @@ def render_cloud_init(
     cvmfs_quota_mb: int = 4000,
     egress_allow_hosts: tuple[str, ...] = (),
     container_env: tuple[str, ...] = (),
+    container_memory_max: str = "",
 ) -> bytes:
     """Render the cloud-init user-data for one slot.
 
@@ -129,7 +130,15 @@ def render_cloud_init(
     `container_env` exports variables into every job container. It exists because
     job images are shared with GitHub-hosted runners and so cannot carry anything
     that is only true on a husk slot — the environment can. Empty renders
-    byte-identically to a slot without it."""
+    byte-identically to a slot without it.
+
+    `container_memory_max` caps the job's memory via a `MemoryMax=` drop-in on
+    user-1000.slice — the cgroup every rootless-podman job container nests under.
+    A job that overshoots hits a memcg OOM confined to its own cgroup (a clean
+    OOMKilled) rather than the kernel choosing a victim across the VM. Empty
+    renders byte-identically to a slot without it. Note the agent-protection
+    drop-in (OOMScoreAdjust on husk-runner.service) is UNCONDITIONAL — it is
+    always safe and appears in every render."""
     ruleset = _ENV.get_template("husk-egress.nft.j2").render(
         scrape_cidr=scrape_cidr,
         # Inside an `inet` table `ip saddr` matches v4 only; picking the wrong one
@@ -160,6 +169,7 @@ def render_cloud_init(
             container_env=(
                 (*_PODMAN_DEFAULT_ENV, *container_env) if container_env else ()
             ),
+            container_memory_max=container_memory_max,
         )
         .encode()
     )

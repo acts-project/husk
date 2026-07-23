@@ -21,6 +21,7 @@ CASES: dict[str, dict] = {
     "cvmfs_direct": {"cvmfs_repos": ("sft.cern.ch",), "cvmfs_proxy": "DIRECT"},
     "allow": {"egress_allow_hosts": ("linuxsoft.cern.ch", "cvmfs-stratum-one.cern.ch")},
     "env": {"container_env": ("APT_MIRROR=http://mirror.cern.ch", "FOO=bar")},
+    "memory": {"container_memory_max": "6G"},
     "everything": {
         "gpu": True,
         "scrape_cidr": "192.168.122.1/32",
@@ -29,5 +30,6 @@ CASES: dict[str, dict] = {
         "cvmfs_quota_mb": 8000,
         "egress_allow_hosts": ("linuxsoft.cern.ch",),
         "container_env": ("APT_MIRROR=http://mirror.cern.ch",),
+        "container_memory_max": "6G",
     },
 }

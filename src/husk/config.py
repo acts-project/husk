@@ -217,9 +217,19 @@ class ContainerConfig:
 
     husk assigns no meaning to any of these: it states the fact and the workflow
     decides whether to act on it. That is what keeps the knowledge one-directional
-    — a repo need not know it is at CERN, and husk need not know what apt is."""
+    — a repo need not know it is at CERN, and husk need not know what apt is.
 
-    env: tuple[str, ...]  # "NAME=value" entries, verbatim
+    `memory_max` is the one non-environment knob: a hard cgroup memory ceiling for
+    the job, because almost every job runs in a rootless-podman container under
+    user-1000.slice — a cgroup distinct from the runner agent's — so a cap on that
+    slice makes a memory-hungry job hit a memcg OOM confined to itself (podman
+    reports OOMKilled, the step fails cleanly) instead of the kernel picking a
+    victim across the whole VM and possibly killing the agent that supervises it."""
+
+    env: tuple[str, ...] = ()  # "NAME=value" entries, verbatim
+    # systemd size (e.g. "6G"); "" leaves the job uncapped. Leave headroom below the
+    # slot's total RAM for the agent + OS (e.g. 6G on an 8G slot).
+    memory_max: str = ""
 
 
 @dataclass(frozen=True)
@@ -506,7 +516,27 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
             return v
 
     class _Container(_Strict):
-        env: list[str] = Field(min_length=1)
+        env: list[str] = []
+        memory_max: str = ""
+
+        @model_validator(mode="after")
+        def _not_empty(self) -> "_Container":
+            if not self.env and not self.memory_max:
+                raise ValueError("[pool.container] must set env and/or memory_max")
+            return self
+
+        @field_validator("memory_max")
+        @classmethod
+        def _is_systemd_size(cls, v: str) -> str:
+            # Rendered verbatim into a systemd drop-in's MemoryMax=. systemd
+            # silently IGNORES a malformed value, leaving the job uncapped — the
+            # exact failure this setting exists to prevent — so reject it here.
+            if v and not re.fullmatch(r"\d+(\.\d+)?[KMGTP]?", v):
+                raise ValueError(
+                    f"container memory_max {v!r} must be a systemd size like "
+                    "'6G', '512M', or a bare byte count"
+                )
+            return v
 
         @field_validator("env")
         @classmethod
@@ -846,7 +876,11 @@ def _pool_config(p, github: GithubConfig, controller: ControllerConfig) -> Confi
         else None
     )
     egress = EgressConfig(allow_hosts=tuple(p.egress.allow_hosts)) if p.egress else None
-    container = ContainerConfig(env=tuple(p.container.env)) if p.container else None
+    container = (
+        ContainerConfig(env=tuple(p.container.env), memory_max=p.container.memory_max)
+        if p.container
+        else None
+    )
     return Config(
         github=github,
         target=p.target.resolved(),

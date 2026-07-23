@@ -17,6 +17,18 @@ write_files:
     content: |
       [Service]
       OOMScoreAdjust=-900
+  # Hard memory ceiling for the job. Every job container is a rootless-podman
+  # scope nested under user-1000.slice, so a cap on that slice bounds the whole
+  # job: an overshoot triggers a memcg OOM confined to the job's own cgroup
+  # (podman reports OOMKilled, the step fails cleanly) rather than the kernel
+  # choosing a victim across the VM. user-1000.slice is already up via linger and
+  # job scopes are created later, so the daemon-reload below applies the cap in
+  # time. Caps the AGGREGATE of the slice — right for one-job-per-slot; a job's
+  # own service containers share the ceiling.
+  - path: /etc/systemd/system/user-1000.slice.d/10-memmax.conf
+    content: |
+      [Slice]
+      MemoryMax=6G
 
   # Coarse egress firewall ruleset — the tunable security policy, kept in
   # cloud-init (NOT baked) so a pool can change it without rebuilding the image.
@@ -52,11 +64,6 @@ runcmd:
   - mkdir -p /var/lib/husk /run/husk
   - chown -R runner:runner /var/lib/husk
   - read -r t _ < /proc/uptime; echo "runcmd_start $t" >> /run/husk/timings
-  # GPU runtime activation (every boot — the kmod load + CDI spec are
-  # hardware-dependent and cannot be baked into the image).
-  - modprobe nvidia
-  - nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
-  - read -r t _ < /proc/uptime; echo "gpu_activated $t" >> /run/husk/timings
   # Lock down egress just before the (untrusted) runner starts.
   - /usr/sbin/nft -f /etc/nftables/husk-egress.nft
   - read -r t _ < /proc/uptime; echo "firewall_applied $t" >> /run/husk/timings

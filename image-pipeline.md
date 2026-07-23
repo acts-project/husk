@@ -117,6 +117,13 @@ per-slot, per-job, or meant to change without a rebuild.
   **in-guest** resolve of the proxy hostnames, since CERN squids sit inside the
   dropped CERN-internal ranges), and an eager-mount of each repo — all after the
   `nft` apply and before the runner, so the binds land on already-mounted trees.
+- **OOM policy drop-ins:** always an `OOMScoreAdjust=-900` drop-in on
+  `husk-runner.service` (protects the runner agent so the baked earlyoom kills the
+  job instead); and, when the pool sets `[pool.container] memory_max`, a
+  `MemoryMax=` drop-in on `user-1000.slice` — the cgroup every rootless-podman job
+  container nests under — for a hard, memcg-confined cap on top of earlyoom's
+  soft, percentage-based backstop. Both are picked up by the `daemon-reload`
+  before the runner starts.
 - Wall-clock backstop (`shutdown -h +N`).
 
 > **Side effect of baking the packages:** the reason the firewall is applied at

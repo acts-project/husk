@@ -6,6 +6,17 @@ write_files:
   - path: /var/lib/husk/jitconfig
     permissions: '0600'
     content: "JITBLOB"
+  # Bias the kernel OOM killer away from the runner agent and toward a runaway
+  # job. Job containers run under rootless podman in user-1000.slice — a cgroup
+  # distinct from this service — so protecting the agent here makes a memory-hungry
+  # job the victim, not the process supervising it. -900 is strong protection
+  # short of -1000's outright exemption (which would also shield an agent that
+  # itself leaked). Unconditional: always safe. The daemon-reload below (before the
+  # runner starts) picks it up; the unit is started fresh each cycle regardless.
+  - path: /etc/systemd/system/husk-runner.service.d/10-oom.conf
+    content: |
+      [Service]
+      OOMScoreAdjust=-900
   # Environment for every job container (see [pool.container] env). The
   # image is shared with GitHub-hosted runners, so fleet-specific facts
   # arrive as environment, not as image content.
@@ -13,6 +24,18 @@ write_files:
     content: |
       [containers]
       env = ["TERM=xterm", "APT_MIRROR=http://mirror.cern.ch"]
+  # Hard memory ceiling for the job. Every job container is a rootless-podman
+  # scope nested under user-1000.slice, so a cap on that slice bounds the whole
+  # job: an overshoot triggers a memcg OOM confined to the job's own cgroup
+  # (podman reports OOMKilled, the step fails cleanly) rather than the kernel
+  # choosing a victim across the VM. user-1000.slice is already up via linger and
+  # job scopes are created later, so the daemon-reload below applies the cap in
+  # time. Caps the AGGREGATE of the slice — right for one-job-per-slot; a job's
+  # own service containers share the ceiling.
+  - path: /etc/systemd/system/user-1000.slice.d/10-memmax.conf
+    content: |
+      [Slice]
+      MemoryMax=6G
   # CernVM-FS client config (client + autofs are baked; this is the
   # per-pool dynamic layer: proxy, repo list, cache quota).
   #

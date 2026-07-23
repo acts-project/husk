@@ -145,8 +145,16 @@ max_job_duration_sec = 21600          # 6h — stop (not destroy) busy slots bey
 # not of a GitHub-hosted runner: job images are shared between the two, so such a
 # fact cannot live in the image. huskd assigns no meaning to any of these — it
 # states the fact, the workflow decides whether it cares.
+#
+# memory_max caps the job's memory. Almost every job runs in a rootless-podman
+# container under user-1000.slice, a cgroup separate from the runner agent, so
+# this MemoryMax on that slice makes a memory-hungry job hit a memcg OOM confined
+# to itself (a clean OOMKilled) instead of the kernel killing something across the
+# VM — possibly the agent. Set it below the slot's total RAM to leave headroom for
+# the agent + OS (e.g. 6G on an 8G flavor). Omit to leave jobs uncapped.
 # [pool.container]
 # env = ["HUSK_APT_MIRROR=http://ch.archive.ubuntu.com/ubuntu"]
+# memory_max = "6G"
 
 # ───────────────────────────── pool 2: libvirt GPU ──────────────────────────
 [[pool]]

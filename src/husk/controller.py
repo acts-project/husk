@@ -519,6 +519,9 @@ class Controller:
                     self.cfg.egress.allow_hosts if self.cfg.egress else ()
                 ),
                 container_env=(self.cfg.container.env if self.cfg.container else ()),
+                container_memory_max=(
+                    self.cfg.container.memory_max if self.cfg.container else ""
+                ),
             )
             await asyncio.to_thread(
                 self.backend.rebuild_slot, slot, user_data=user_data, cycle=cycle
@@ -594,6 +597,9 @@ class Controller:
                     self.cfg.egress.allow_hosts if self.cfg.egress else ()
                 ),
                 container_env=(self.cfg.container.env if self.cfg.container else ()),
+                container_memory_max=(
+                    self.cfg.container.memory_max if self.cfg.container else ""
+                ),
             )
             slot = await asyncio.to_thread(
                 self.backend.create_slot, user_data=user_data, name=vm, cycle=0
