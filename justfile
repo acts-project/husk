@@ -706,6 +706,21 @@ k8s-reap confirm="":
     echo "context: $(kubectl config current-context)"
     kubectl exec -n {{k8s_namespace}} deployment/huskd -- huskctl reap --config /etc/husk/config.toml
 
+# Runs `huskctl recycle` inside the pod, which already has the App key, config and
+# backend creds mounted — no credentials on your laptop. A recycle stops slots so
+# huskd rebuilds them on its next tick with freshly rendered cloud-init: the way to
+# roll a new image or firewall onto already-running slots. huskd must be running
+# for the rebuild to follow. Idle/ACTIVE slots only unless --force; --dry-run
+# changes nothing. Everything after the recipe name passes straight to huskctl:
+#   just k8s-recycle --all --dry-run              # whole fleet, show only
+#   just k8s-recycle --all --pool cern            # every idle slot in one pool
+#   just k8s-recycle husk-cern-3 --pool cern      # one slot
+#   just k8s-recycle husk-cern-3 --pool cern -f   # also if it is busy (kills its job)
+# Recycle slots on the cluster (args → huskctl recycle; try --dry-run first).
+k8s-recycle *args:
+    @echo "context: $(kubectl config current-context)"
+    kubectl exec -n {{k8s_namespace}} deployment/huskd -- huskctl recycle --config /etc/husk/config.toml {{args}}
+
 # huskd evicts unpinned goldens itself — see the sizing note in k8s/overlays/cern/pvc.yaml.
 #
 # `df` is NOT redundant with du. GC bounds what husk puts on the volume; it says
