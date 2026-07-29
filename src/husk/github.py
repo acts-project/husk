@@ -94,7 +94,18 @@ class GitHubClient:
         spreads: huskd serves orgs it does not administer, so a group named in
         *huskd's* config simply may not exist over there. A group is an isolation
         nicety, not a correctness requirement — refusing to mint runners because
-        of one would be the wrong trade."""
+        of one would be the wrong trade.
+
+        The cache holds only ANSWERS, never failures. "This org has no group by
+        that name" is a stable fact and memoizing it is free; "I could not ask"
+        is a transient condition, and memoizing *that* is how a single unlucky
+        503 in the seconds after a restart silently pins every later mint to
+        Default for the process lifetime. That is not hypothetical — GitHub's
+        runner-admin service flapped during a rollout and parked a whole pool of
+        online runners in Default, which (unlike the configured group) may
+        disallow public repositories, so they took no jobs and reported no
+        error. Falling back for one mint is a dip; caching the fallback is an
+        outage that only ends when someone restarts huskd."""
         if self.target.kind != "org":
             return None
         if self._group_id is not None:
@@ -103,13 +114,15 @@ class GitHubClient:
             r = await self._request("GET", "/actions/runner-groups?per_page=100")
             r.raise_for_status()
         except httpx.HTTPError as e:
+            # Deliberately NOT cached: the next mint retries the lookup.
             log.warning(
-                "could not list runner groups for %s (%s); using Default",
+                "could not list runner groups for %s (%s); using Default (%d) for "
+                "this mint only, and retrying the lookup on the next one",
                 self.target,
                 e,
+                DEFAULT_RUNNER_GROUP_ID,
             )
-            self._group_id = DEFAULT_RUNNER_GROUP_ID
-            return self._group_id
+            return DEFAULT_RUNNER_GROUP_ID
         groups = r.json().get("runner_groups", [])
         match = next((g for g in groups if g.get("name") == self.runner_group), None)
         if match is None:

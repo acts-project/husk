@@ -137,6 +137,60 @@ def test_group_listing_failure_falls_back_to_default() -> None:
     assert _run(client.group_id()) == 1
 
 
+def test_group_listing_failure_is_not_cached() -> None:
+    # A flapping runner-admin API must not pin the pool to Default. One 503 gets
+    # Default for that mint; the next lookup retries and finds the real group.
+    # Caching the failure is how seven online runners ended up in Default —
+    # invisible, because a wrong-group runner reports healthy and just never
+    # receives a job.
+    groups = {
+        "runner_groups": [{"id": 1, "name": "Default"}, {"id": 7, "name": "husk"}]
+    }
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if len(calls) == 1:
+            return httpx.Response(503, text="runner-admin unavailable")
+        return httpx.Response(200, json=groups)
+
+    client = _client(handler, target=ORG, runner_group="husk")
+    assert _run(client.group_id()) == 1  # degraded, but not remembered
+    assert _run(client.group_id()) == 7  # retried, resolved
+    assert len(calls) == 2
+
+
+def test_resolved_group_is_cached() -> None:
+    # The flip side of not caching failures: a real answer is still resolved once.
+    groups = {"runner_groups": [{"id": 7, "name": "husk"}]}
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(200, json=groups)
+
+    client = _client(handler, target=ORG, runner_group="husk")
+    assert _run(client.group_id()) == 7
+    assert _run(client.group_id()) == 7
+    assert len(calls) == 1
+
+
+def test_absent_group_is_cached() -> None:
+    # "No such group here" is a stable answer, not a failure — worth memoizing,
+    # and the case the Default fallback was written for (orgs huskd does not run).
+    groups = {"runner_groups": [{"id": 1, "name": "Default"}]}
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(200, json=groups)
+
+    client = _client(handler, target=ORG, runner_group="husk")
+    assert _run(client.group_id()) == 1
+    assert _run(client.group_id()) == 1
+    assert len(calls) == 1
+
+
 def test_org_mint_sends_resolved_group_repo_mint_does_not() -> None:
     bodies: list[dict] = []
 
