@@ -22,7 +22,20 @@ configMapGenerator:
       - config.toml
 
 images:
+  # Pull through CERN's Harbor proxy cache rather than ghcr.io directly. `name` is
+  # the match key (what base/deployment.yaml says); `newName` is what the kubelet
+  # actually resolves. The prefix is the whole mapping — registry.cern.ch mirrors
+  # upstream path-for-path, and the proxy serves anonymously, so no imagePullSecret.
+  #
+  # This matters most during recovery: a cold pull happens exactly when a node has
+  # just died, and that is the worst moment to have a hard dependency on ghcr being
+  # up and not rate-limiting.
+  #
+  # NB the build still PUSHES to ghcr.io (a proxy cache is pull-only) — see
+  # oc_image vs oc_pull_image in the justfile. Both must agree with this, or
+  # `oc set image` in k8s-live-deploy silently stamps ghcr.io back over it.
   - name: ghcr.io/acts-project/husk
+    newName: registry.cern.ch/ghcr.io/acts-project/husk
     newTag: latest  # `just k8s-live-deploy` overwrites this with the sha- tag
 
 patches:

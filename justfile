@@ -101,6 +101,14 @@ _local-only:
 # default format is sha-<7 chars>. --short=7 pins that width so the tag we look
 # for is the tag CI wrote.
 oc_image      := "ghcr.io/acts-project/husk"
+# What the CLUSTER pulls: the same image through CERN's Harbor pull-through cache
+# (registry.cern.ch mirrors upstream path-for-path, anonymous pull, so no
+# imagePullSecret). Kept SEPARATE from oc_image because the two directions differ —
+# a proxy cache is pull-only, so k8s-live-push must still push to ghcr.io, while
+# every deploy should resolve through the cache. Must match the `newName` in
+# k8s/overlays/cern/kustomization.yaml: `oc set image` runs after k8s-live-apply,
+# so if this said ghcr.io it would silently undo the overlay on every deploy.
+oc_pull_image := "registry.cern.ch/" + oc_image
 oc_sha        := "sha-" + `git rev-parse --short=7 HEAD`
 
 # NB `just --list` shows only the LAST comment line of a block as the summary,
@@ -508,6 +516,20 @@ k8s-live-check:
         echo "  gh run list --workflow build-app-image.yml -L5" >&2
         exit 1
     fi
+    # The cluster pulls through the proxy, not from ghcr, so ghcr having the tag is
+    # necessary but not sufficient. Resolving it here both PROVES the path the
+    # kubelet will take and WARMS the cache, so the rollout pull is a cache hit
+    # rather than a cold upstream fetch. Without this a proxy problem surfaces as a
+    # 10-minute `oc rollout status` timeout instead of a preflight failure.
+    echo "resolving {{oc_pull_image}}:{{oc_sha}} through the CERN proxy cache..."
+    if docker manifest inspect {{oc_pull_image}}:{{oc_sha}} >/dev/null 2>&1; then
+        echo "OK: proxy serves {{oc_sha}}"
+    else
+        echo "NOT FOUND via proxy: {{oc_pull_image}}:{{oc_sha}}" >&2
+        echo "ghcr has this tag, so the proxy cache is the problem — it may be down," >&2
+        echo "or not configured to mirror ghcr.io. Check https://registry.cern.ch" >&2
+        exit 1
+    fi
 
 # The in-cluster half of config validation, run BEFORE anything is applied — the
 # whole point is that the live pod is still serving while this runs, and a failure
@@ -600,7 +622,7 @@ k8s-live-diff:
 # valid, and it reproduces only on the nodes with a stale copy.
 # Deploy: validate locally, check the image, validate in-cluster, apply, pin, wait.
 k8s-live-deploy: (k8s-validate "cern") k8s-live-check k8s-live-preflight k8s-live-apply
-    oc set image deployment/huskd huskd={{oc_image}}:{{oc_sha}} validate-config={{oc_image}}:{{oc_sha}} -n {{k8s_namespace}}
+    oc set image deployment/huskd huskd={{oc_pull_image}}:{{oc_sha}} validate-config={{oc_pull_image}}:{{oc_sha}} -n {{k8s_namespace}}
     oc rollout status deployment/huskd -n {{k8s_namespace}} --timeout=10m
 
 # Roll back the live deployment one revision.
@@ -662,7 +684,7 @@ k8s-live-push:
     echo "deploy it with (validates the config, applies the overlay, pins the tag):"
     echo "    just k8s-live-deploy"
     echo "then re-pin by digest, so IfNotPresent cannot serve a cached copy of this tag:"
-    echo "    oc set image deployment/huskd huskd={{oc_image}}@$digest validate-config={{oc_image}}@$digest -n {{k8s_namespace}}"
+    echo "    oc set image deployment/huskd huskd={{oc_pull_image}}@$digest validate-config={{oc_pull_image}}@$digest -n {{k8s_namespace}}"
     echo "    oc rollout status deployment/huskd -n {{k8s_namespace}} --timeout=10m"
 
 # Both run `huskctl reap` inside the pod, which already has the App key and config
