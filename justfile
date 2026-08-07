@@ -149,6 +149,8 @@ k8s-init:
     echo "Next: edit those, then drop your credentials into secrets/ :"
     echo "  secrets/private-key.pem   GitHub App private key"
     echo "  secrets/clouds.yaml       openstacksdk profile (or: just k8s-secrets clouds=~/.config/openstack/clouds.yaml)"
+    echo "  secrets/id_ed25519        libvirt-host SSH key   (OPTIONAL: libvirt pools only)"
+    echo "  secrets/known_hosts       ssh-keyscan -t ed25519 HOST >> secrets/known_hosts"
     echo "Then: just k8s-secrets"
 
 # Reads from the gitignored secrets/ dir. Re-run to rotate: the create|apply pipe
@@ -233,6 +235,51 @@ k8s-secrets env="local" pem="secrets/private-key.pem" clouds="":
         --from-file=clouds.yaml="$clouds" \
         -n {{k8s_namespace}} --dry-run=client -o yaml | kubectl apply -f -
     echo "secrets huskd-github + huskd-openstack are in namespace {{k8s_namespace}}"
+    # huskd-ssh is OPTIONAL and only needed by libvirt pools: the Deployment's
+    # volume is `optional: true`, so its absence is a normal OpenStack-only setup,
+    # not an error. Both files or neither — a key with no known_hosts entry fails
+    # at first connect (BatchMode, no StrictHostKeyChecking override) rather than
+    # here, which is a much worse place to find out.
+    ssh_key="secrets/id_ed25519"
+    ssh_known="secrets/known_hosts"
+    if [ -f "$ssh_key" ] || [ -f "$ssh_known" ]; then
+        if [ ! -f "$ssh_key" ]; then
+            echo "$ssh_known exists but $ssh_key does not — refusing a half key pair" >&2
+            exit 1
+        fi
+        if [ ! -f "$ssh_known" ]; then
+            echo "$ssh_key exists but $ssh_known does not." >&2
+            echo "Seed it (BatchMode ssh cannot accept a host key interactively):" >&2
+            echo "  ssh-keyscan -t ed25519 HOST >> $ssh_known" >&2
+            exit 1
+        fi
+        # A public key here would be accepted silently and then fail as an auth
+        # error inside the pod — same class of check as the PEM one above.
+        grep -q "PRIVATE KEY" "$ssh_key" || { echo "$ssh_key does not look like a private key" >&2; exit 1; }
+        # A passphrased key can never be used: every caller passes BatchMode=yes,
+        # so there is nothing to type a passphrase into. Catch it now.
+        if grep -q "ENCRYPTED" "$ssh_key"; then
+            echo "$ssh_key is passphrase-protected; BatchMode ssh cannot unlock it" >&2
+            exit 1
+        fi
+        # Secret KEYS are fixed: id_ed25519 is a DEFAULT ssh identity filename, so
+        # nothing in the pod needs an IdentityFile directive for it to be found.
+        kubectl create secret generic huskd-ssh \
+            --from-file=id_ed25519="$ssh_key" \
+            --from-file=known_hosts="$ssh_known" \
+            -n {{k8s_namespace}} --dry-run=client -o yaml | kubectl apply -f -
+        # Count real entries, not lines: a known_hosts of nothing but comments is
+        # exactly the placeholder state, and reporting "2 entries" for it would
+        # hide the one thing this line exists to show.
+        n_hosts="$(grep -cvE '^[[:space:]]*(#|$)' "$ssh_known" || true)"
+        echo "secret huskd-ssh is in namespace {{k8s_namespace}} ($n_hosts known_hosts entries)"
+        if [ "$n_hosts" -eq 0 ]; then
+            echo "warning: $ssh_known has no host keys — every ssh from the pod will fail." >&2
+            echo "         ssh-keyscan -t ed25519 HOST >> $ssh_known && just k8s-secrets {{env}}" >&2
+        fi
+    else
+        echo "no secrets/id_ed25519 — skipping huskd-ssh (libvirt pools will have no SSH credential)"
+    fi
 
 # Good first check before any apply: `just k8s-render cern | less`.
 # Render an overlay to stdout without applying (env = local | cern).

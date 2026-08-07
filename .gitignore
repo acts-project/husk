@@ -26,6 +26,7 @@ config.multi.toml
 # committed. `just k8s-secrets` reads from here and loads them into the cluster.
 #   secrets/private-key.pem   GitHub App private key (App settings -> Private keys)
 #   secrets/clouds.yaml       openstacksdk profile with the CERN app credential
+#   secrets/id_ed25519        SSH key for libvirt VM-hosts (+ secrets/known_hosts)
 secrets/
 
 # Belt and braces: no PEM anywhere in the tree, whatever it's called. A GitHub App

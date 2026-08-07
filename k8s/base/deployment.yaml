@@ -134,6 +134,23 @@ spec:
             # always means a restart) doesn't silently truncate a 30d query window.
             - name: metrics-state
               mountPath: /var/lib/husk
+            # SSH credential for libvirt pools. THREE consumers share it: libvirt's
+            # own qemu+ssh:// transport (spawned by libvirt-python), the backend's
+            # host-side qemu-img/genisoimage (libvirt_backend._ssh), and the guest
+            # metrics scrape (guest_scrape, which curls the guest FROM the host).
+            # All three are plain `ssh`, so all three read $HOME/.ssh — and the image
+            # pins HOME=/app, so this one mount serves all of them.
+            #
+            # The key is named id_ed25519 deliberately: that is a default identity
+            # filename, so nothing needs an IdentityFile directive. known_hosts must
+            # be in the same Secret and PRE-SEEDED (ssh-keyscan -t ed25519 HOST) —
+            # every caller passes BatchMode=yes and none overrides
+            # StrictHostKeyChecking, so an unknown host key is a hard failure with no
+            # prompt, surfacing as an opaque backend error rather than "unknown host".
+            # The mount is read-only anyway, so ssh could not learn the key here.
+            - name: ssh
+              mountPath: /app/.ssh
+              readOnly: true
           # All three probes point at /livez, never /healthz. /healthz reports
           # reconcile *freshness*, which is 503 until the first reconcile lands —
           # and a first reconcile that has to upload a golden image to Glance can
@@ -190,3 +207,22 @@ spec:
         # silently repoints an existing patch at the wrong volume.
         - name: metrics-state
           emptyDir: {}
+        - name: ssh
+          secret:
+            secretName: huskd-ssh
+            # optional: an OpenStack-only deployment has no libvirt host to reach,
+            # and without this the pod would refuse to start until the Secret exists
+            # — i.e. adding this volume would break every current deployment. With
+            # it, the mount is simply empty until `just k8s-secrets` supplies a key.
+            optional: true
+            # 0440, not 0400. The file is owned by ROOT with its group set from the
+            # pod's fsGroup (explicit 999 in overlays/local; injected from the
+            # project's range by OpenShift's restricted SCC at CERN), so the process
+            # reads it via the group bit — 0400 root-owned would be unreadable by
+            # any non-root uid, which is every uid we run as.
+            #
+            # This does NOT trip ssh's "permissions are too open" refusal: that check
+            # (sshkey_perm_ok) only fires when the key file is owned by the CALLING
+            # uid, and here it is owned by root. Were the pod ever to run as root,
+            # 0440 would start failing — runAsNonRoot: true is what keeps that true.
+            defaultMode: 0440

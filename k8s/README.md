@@ -41,7 +41,7 @@ convention already used for the repo-root configs:
 | | committed | local (gitignored) |
 |---|---|---|
 | config | `k8s/overlays/*/config.example.toml` | `k8s/overlays/*/config.toml` |
-| credentials | — | `secrets/private-key.pem`, `secrets/clouds.yaml` |
+| credentials | — | `secrets/private-key.pem`, `secrets/clouds.yaml`, `secrets/id_ed25519` + `secrets/known_hosts` |
 
 ```sh
 just k8s-init      # copies each example -> config.toml, creates secrets/
@@ -65,6 +65,47 @@ How they reach the pod: the App PEM arrives as `HUSK_GITHUB__PRIVATE_KEY`
 and `clouds.yaml` mounts at `/app/.config/openstack/` because the image pins
 `HOME=/app`. `k8s-secrets` uses `create --dry-run | apply`, so re-running it
 rotates the values in place.
+
+### SSH to libvirt hosts
+
+Only libvirt pools need this; an OpenStack-only deployment can ignore the whole
+section. The `ssh` volume is `optional: true`, so a missing `huskd-ssh` Secret
+leaves the mount empty instead of wedging the pod in `ContainerCreating`.
+
+```sh
+ssh-keygen -t ed25519 -N '' -f secrets/id_ed25519 -C huskd
+# Install secrets/id_ed25519.pub into the host's husk account: scripts/host-setup.md
+# step 1b. NOT ssh-copy-id — that account has no password by design, so there is
+# nothing for ssh-copy-id to authenticate with; an admin places the key as root.
+ssh-keyscan -t ed25519 HOST > secrets/known_hosts
+just k8s-secrets                                    # picks key + known_hosts up
+```
+
+Three unrelated things in the pod shell out to `ssh` — libvirt's own `qemu+ssh://`
+transport, the backend's host-side `qemu-img`/`genisoimage`
+(`libvirt_backend._ssh`), and the guest metrics scrape (`guest_scrape`, which curls
+the guest *from* the hypervisor). All read `$HOME/.ssh`, so the single mount at
+`/app/.ssh` serves all three, and the Secret key is named `id_ed25519` because that
+is a default identity filename — no `IdentityFile` directive anywhere.
+
+Two things that are easy to get wrong:
+
+- **`known_hosts` is mandatory.** Every caller passes `BatchMode=yes` and none
+  overrides `StrictHostKeyChecking`, so an unknown host key fails hard with no
+  prompt — and it surfaces as a generic backend error, not as "unknown host key."
+  `k8s-secrets` refuses a key without a `known_hosts` to go with it (and refuses a
+  passphrased key, which `BatchMode` could never unlock).
+- **The key mounts `0440`, not `0600`.** Secret files are owned by **root** with
+  their group taken from the pod's `fsGroup`, and we never run as root — so `0400`
+  would be unreadable by the very process that needs it. `0440` is readable via the
+  group bit, and it does *not* trip ssh's "permissions are too open" refusal:
+  `sshkey_perm_ok` only applies that check when the key is owned by the calling
+  uid, which root-owned never is.
+
+The source address the host sees is the **worker node**, not the pod: egress is
+SNAT'd on the way out. That is what a host firewall rule or an `authorized_keys`
+`from=` restriction has to name — the same trap `config.example.toml` documents for
+`scrape_cidr`.
 
 ## Local test drive (colima)
 
@@ -222,8 +263,8 @@ kill loses at most a minute.
 
 ## Not covered yet
 
-- **libvirt pools.** The cern overlay runs the OpenStack pool only. libvirt needs
-  SSH from the pod to the VM hosts (`qemu+ssh://`), so a key Secret at `/app/.ssh`,
-  a `known_hosts` entry, and cluster egress to those hosts. Add once proven.
+- **libvirt pools.** The cern overlay runs the OpenStack pool only. The **pod side
+  is now wired** (see [SSH to libvirt hosts](#ssh-to-libvirt-hosts)); what is still
+  unproven is **cluster egress** to the VM hosts and the `[[pool]]` entry itself.
 - **`advertise_addr`.** Set it to the Route hostname once assigned, or
   `/sd/targets` hands central Prometheus the pod-internal bind address.
