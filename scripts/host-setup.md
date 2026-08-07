@@ -10,6 +10,11 @@ project memory `deferred-ansible-host-provisioning`); do it by hand for now.
 > The VFIO/IOMMU groundwork (GPU isolated in its own IOMMU group, bound to
 > `vfio-pci`) was validated separately in `gpu-passthrough-poc-findings.md`.
 
+**Steps 1–6 below are Fedora/EL-specific.** For an Ubuntu or Debian host, work
+through the same numbered steps but apply the deltas in
+[Ubuntu / Debian hosts](#ubuntu--debian-hosts-untested) — that path has **not**
+been validated on real hardware.
+
 ## Host facts this assumes
 
 - **Modular libvirt daemons** (Fedora ≥ 35 / RHEL 9+): the active daemon is
@@ -188,6 +193,154 @@ virsh -c qemu+ssh://HOST/system net-info default          # active, autostart
 ssh HOST 'touch /var/lib/libvirt/images/husk/.w && rm /var/lib/libvirt/images/husk/.w && echo writable'
 ```
 
+## Ubuntu / Debian hosts (untested)
+
+> **Status: not validated.** Every host husk has run on is Fedora. This section is
+> derived from the Fedora runbook plus known Debian-family differences; treat each
+> step as a hypothesis to confirm, and fold corrections back in once a real Ubuntu
+> host is stood up. The **verification checklist above is the actual acceptance
+> test** and is distro-independent — if all four commands pass, the host is good
+> regardless of how you got there.
+
+Nothing in huskd itself is distro-aware. The backend only needs `qemu-img`,
+`genisoimage` **or** `mkisofs`, and `rm` to be on `PATH` for the SSH user
+(`libvirt_backend.py:293`), plus a RW libvirt connection. The deltas are all in
+*how the distro gates those*.
+
+### Step 0 (Ubuntu only): which libvirt daemon model?
+
+The Fedora runbook assumes **modular** daemons (`virtqemud`). Debian-family
+releases have been slower to switch, so detect rather than assume — it decides
+which unit you enable in step 1 and which config file the step-2 fallback edits:
+
+```bash
+systemctl list-unit-files 'virtqemud*' 'libvirtd*'   # whichever exists is your model
+virsh --version
+```
+
+Monolithic ⇒ `libvirtd.socket` + `/etc/libvirt/libvirtd.conf`.
+Modular ⇒ `virtqemud.socket` + `/etc/libvirt/virtqemud.conf`, i.e. exactly the
+Fedora text.
+
+### Step 1 — packages
+
+```bash
+sudo apt install -y qemu-system-x86 libvirt-daemon-system libvirt-clients \
+                    virtinst guestfs-tools genisoimage
+```
+
+`libvirt-daemon-system` installs *and enables* the socket units and pulls
+`dnsmasq-base` for the `default` network, so the explicit `systemctl enable --now`
+of step 1 is usually redundant (harmless to run against whichever unit step 0
+found). `genisoimage` is the Debian name for the tool Fedora calls `mkisofs`; the
+backend accepts either.
+
+### Step 2 — read-write access: **group, not polkit**
+
+This is the single biggest divergence. On Fedora the socket is world-writable and
+polkit is the lever; on Debian-family the socket is `0770 root:libvirt`
+(`unix_sock_group = "libvirt"`), so **group membership is the lever** and the
+Fedora "no polkit agent available" symptom typically never appears:
+
+```bash
+sudo usermod -aG libvirt pagessin
+```
+
+A **new** SSH session picks the group up — no reboot, but existing connections
+(and any `ControlMaster` mux socket) must be dropped. Confirm from the control
+machine:
+
+```bash
+ssh HOST id -nG          # must list: libvirt
+```
+
+The polkit rule from step 2 is still valid and harmless to add as a belt-and-braces
+measure, but do not treat its absence as the fault when RW fails here — check group
+membership and the socket's mode/ownership first (`ls -l /run/libvirt/*-sock`).
+
+### Steps 3–4 — pool and network
+
+The `virsh` commands are identical. Two Debian-family notes:
+
+- qemu runs as **`libvirt-qemu:kvm`**, not `qemu:qemu`. The recommended
+  `chown SSHUSER + chmod 0755` on the pool dir still works (world-traversable), but
+  if you tighten it to `0750`, the group must be one `libvirt-qemu` is in.
+- If a **system `dnsmasq`** is installed and bound to `0.0.0.0:53`, libvirt's
+  `default` network fails to start with a bind error. Either don't install it, or
+  bind it to specific interfaces. `dnsmasq-base` alone (what libvirt pulls) does not
+  cause this.
+
+### Step 5 — VFIO/IOMMU: GRUB + initramfs-tools, not dracut
+
+Same end state as `gpu-passthrough-poc-findings.md` (GPU alone in its IOMMU group,
+`Kernel driver in use: vfio-pci`), different plumbing:
+
+```bash
+# 1. kernel cmdline — append to GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub:
+#    intel_iommu=on iommu=pt vfio-pci.ids=10de:28ba
+sudo update-grub                     # not grub2-mkconfig
+
+# 2. make vfio-pci win the race for the device
+sudo tee /etc/modprobe.d/husk-vfio.conf >/dev/null <<'EOF'
+options vfio-pci ids=10de:28ba
+blacklist nouveau
+blacklist nova-core
+EOF
+printf 'vfio\nvfio_iommu_type1\nvfio_pci\n' | sudo tee -a /etc/initramfs-tools/modules
+
+# 3. rebuild the initramfs (dracut's job on Fedora) and reboot
+sudo update-initramfs -u -k all
+sudo reboot
+```
+
+Verify exactly as in step 5: `lspci -nnk -d 10de:` must report `vfio-pci`.
+
+The host needs **no NVIDIA driver at all** — it never touches the GPU. The Secure
+Boot / MOK signing pain recorded in the findings doc is a *guest* concern (DKMS
+modules inside the runner image); `vfio-pci` ships signed with the distro kernel.
+
+### AppArmor replaces SELinux
+
+Ubuntu confines qemu with AppArmor (`security_driver` in `/etc/libvirt/qemu.conf`).
+`virt-aa-helper` generates a per-domain profile and adds each disk path from the
+domain XML, so overlays and seed ISOs under a non-default pool dir are expected to
+work unmodified. If a domain fails to start with a permission error, check
+`dmesg | grep DENIED` / `journalctl -b -u apparmor` before suspecting libvirt, and
+add the pool dir to `/etc/apparmor.d/local/abstractions/libvirt-qemu`.
+
+The deferred file-backed serial console (`console_log_path`) is blocked here too,
+just by AppArmor rather than SELinux relabeling — same workaround shape, different
+mechanism.
+
+### Step 6 — building the golden image on an Ubuntu host
+
+Prefer **not** to. `images/build.sh` documents (and `c73b728` fixed) the fallout of
+building an EL guest on a non-SELinux Ubuntu host: `virt-customize --selinux-relabel`
+can only defer via `/.autorelabel`, and a first boot under *enforcing* then wedges
+with every unit at status=127. That is why the CI-built image boots permissive.
+Pulling the CI-built image (see `image-pipeline.md`) sidesteps this entirely.
+
+If you do build locally on Ubuntu, you hit the same two libguestfs gotchas as the
+`ubuntu-22.04` CI runner (`.github/workflows/build-images.yml:56`):
+
+```bash
+sudo chmod 0644 /boot/vmlinuz-*      # Debian ships the kernel 0600; libguestfs can't read it
+export LIBGUESTFS_BACKEND=direct
+ls -l /dev/kvm                       # absent ⇒ TCG emulation, very slow
+```
+
+### Summary of deltas
+
+| Step | Fedora | Ubuntu / Debian |
+|---|---|---|
+| 1 packages | `dnf`, `virtqemud.socket` | `apt`, `libvirt-daemon-system` (auto-enables), `genisoimage` |
+| 2 RW access | **polkit rule** (socket world-writable) | **`libvirt` group** (socket `0770 root:libvirt`) |
+| 3 pool | qemu runs as `qemu:qemu` | qemu runs as `libvirt-qemu:kvm` |
+| 4 network | `default` NAT | same; watch for a system `dnsmasq` on `:53` |
+| 5 vfio | kernel cmdline + `dracut` | `/etc/default/grub` + `update-grub` + `update-initramfs` |
+| — MAC | SELinux (relabel, `.autorelabel`) | AppArmor (`virt-aa-helper`, `DENIED` in dmesg) |
+| 6 image | builds cleanly | SELinux relabel unreliable; 0600 kernel — prefer the CI image |
+
 ## Automation notes (for the future Ansible role / Puppet module)
 
 Map of steps → tasks, with the root/idempotency notes that matter for automation:
@@ -205,3 +358,8 @@ Map of steps → tasks, with the root/idempotency notes that matter for automati
 ¹ runs as the SSH user but needs `guestfs-tools` installed (step 1).
 
 The SSH user, pool path, and `gpu_pci_addresses` are the obvious role variables.
+
+If the role ever has to cover both families, steps 1, 2 and 5 are the ones that
+need `ansible_os_family` branches (package names + unit, group-vs-polkit,
+`update-initramfs`-vs-`dracut`); 3, 4 and 7 are already portable. See
+[Ubuntu / Debian hosts](#ubuntu--debian-hosts-untested).
