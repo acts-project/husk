@@ -23,9 +23,11 @@ been validated on real hardware.
 - The system socket `/run/libvirt/virtqemud-sock` is **world-writable**
   (`srw-rw-rw-`) by default; access is gated by **polkit**, not by socket group
   ownership. (A `libvirt` group may exist but is *not* the access lever here.)
-- huskd runs on a **control machine** (e.g. a Mac) and reaches the host over
-  `qemu+ssh://USER@HOST/system`. The **guest VMs are never SSHed** — only the host
-  is, for the libvirt API plus `qemu-img`/`mkisofs` disk+seed prep.
+- huskd runs on a **control machine** (a laptop, or the k8s pod) and reaches the
+  host over `qemu+ssh://husk@HOST/system`. The **guest VMs are never SSHed** — only
+  the host is, for the libvirt API plus `qemu-img`/`mkisofs` disk+seed prep.
+- It logs in as a **dedicated `husk` service account** (step 1b), not a human's
+  login. Every command below that needs a username uses `husk`.
 
 ## 1. Packages (root)
 
@@ -39,7 +41,35 @@ sudo systemctl enable --now virtqemud.socket virtnetworkd.socket virtstoraged.so
 `build-golden-image.sh`). The backend's seed-ISO step auto-selects whichever of
 `genisoimage`/`mkisofs` is present.
 
-## 2. Read-write libvirt access for the SSH user via polkit (root) — **key step**
+## 1b. The `husk` service account (root)
+
+huskd logs in as its own unprivileged account — never a human's login. That keeps
+the credential rotatable without touching anyone's shell access, and keeps the
+audit trail on the host readable.
+
+```bash
+sudo useradd -m -s /bin/bash husk
+sudo mkdir -p /home/husk/.ssh && sudo chmod 0700 /home/husk/.ssh
+sudo tee /home/husk/.ssh/authorized_keys >/dev/null < /path/to/id_ed25519.pub
+sudo chmod 0600 /home/husk/.ssh/authorized_keys
+sudo chown -R husk:husk /home/husk/.ssh
+```
+
+**No password is set, deliberately** — `useradd` without `-p` leaves `!` in
+`/etc/shadow`, which disables password authentication while leaving public-key auth
+working. Don't "fix" this by assigning one. Equally deliberately, `husk` gets **no
+sudo**: nothing huskd runs on the host needs root. It needs exactly three things,
+all granted below — libvirt RW (step 2), write access to the pool dir (step 3), and
+`qemu-img`/`genisoimage`/`curl` on `PATH` (step 1).
+
+A real shell is required (not `/usr/sbin/nologin`): the backend runs commands over
+SSH, so the account must be able to execute them.
+
+> The matching **private** key is the one huskd holds — `secrets/id_ed25519` on the
+> control machine, or the `huskd-ssh` Secret in k8s (`k8s/README.md`). Generate it
+> there, copy only the `.pub` here.
+
+## 2. Read-write libvirt access for the `husk` user via polkit (root) — **key step**
 
 Read-only libvirt access works for any local user, but **read-write**
 (`org.libvirt.unix.manage`) is denied: Fedora's stock polkit rule only auto-grants
@@ -51,15 +81,15 @@ error: authentication unavailable: no polkit agent available to authenticate
        action 'org.libvirt.unix.manage'
 ```
 
-Fix: a polkit JS rule granting the husk SSH user. polkitd auto-reloads
+Fix: a polkit JS rule granting the `husk` account from step 1b. polkitd auto-reloads
 `rules.d`, so **no restart or re-login is needed** (a `systemctl restart polkit`
-forces it if in doubt). Replace `pagessin` with the actual SSH user:
+forces it if in doubt):
 
 ```bash
 sudo tee /etc/polkit-1/rules.d/50-husk-libvirt.rules >/dev/null <<'RULE'
 polkit.addRule(function(action, subject) {
     if (action.id == "org.libvirt.unix.manage" &&
-        subject.user == "pagessin") {
+        subject.user == "husk") {
         return polkit.Result.YES;
     }
 });
@@ -79,7 +109,7 @@ no polkit error.
 The backend drops per-slot overlay qcow2s + NoCloud seed ISOs here, and the golden
 image lives here too. It can be created over `qemu+ssh` from the control machine
 (libvirtd runs as root, so it builds the dir), **but the target dir must then be
-made writable by the SSH user** — the backend runs `qemu-img`/`mkisofs` as that
+made writable by the `husk` user** — the backend runs `qemu-img`/`mkisofs` as that
 user over SSH, and `pool-build` creates the dir `root:root 0711` (not writable).
 
 Define + build + autostart the pool (host or remote):
@@ -91,14 +121,14 @@ virsh -c qemu:///system pool-start husk
 virsh -c qemu:///system pool-autostart husk
 ```
 
-Then make the dir writable by the SSH user (root, on the host):
+Then make the dir writable by the `husk` user (root, on the host):
 
 ```bash
-sudo chown pagessin:pagessin /var/lib/libvirt/images/husk
+sudo chown husk:husk /var/lib/libvirt/images/husk
 sudo chmod 0755 /var/lib/libvirt/images/husk
 ```
 
-`0755` lets the SSH user create overlays/seeds while qemu (running as user `qemu`)
+`0755` lets the `husk` user create overlays/seeds while qemu (running as user `qemu`)
 can still traverse and read; libvirt's dynamic DAC ownership chowns each disk to
 `qemu` at domain start and back on stop.
 
@@ -152,12 +182,12 @@ The guest is never SSHed, so to watch a slot's boot + cloud-init, attach to its
 serial console from the control machine (Ctrl-] to detach):
 
 ```bash
-virsh -c qemu+ssh://USER@HOST/system console <domain-name>
+virsh -c qemu+ssh://husk@HOST/system console <domain-name>
 ```
 
 > A file-backed serial log (`domain_xml` supports `console_log_path`) is **not**
 > enabled by default: under SELinux the `qemu` user must own/relabel the log file
-> in the pool dir, which fails while the pool dir is owned by the SSH user. Enabling
+> in the pool dir, which fails while the pool dir is owned by the `husk` user. Enabling
 > it is deferred to host setup (root-owned pool dir + a `qemu`-writable console dir,
 > or a relabel rule) — a natural Ansible concern.
 
@@ -175,22 +205,22 @@ uv sync --extra libvirt --extra dev          # build/import libvirt-python
 ```
 
 Add the host to `~/.ssh/config` (key-based, `BatchMode`-friendly) so the
-`qemu+ssh://HOST/system` URI and the disk/seed SSH-exec share one alias. Confirm
+`qemu+ssh://husk@HOST/system` URI and the disk/seed SSH-exec share one alias. Confirm
 both channels:
 
 ```bash
-ssh HOST true                                              # key works
-virsh -c qemu+ssh://HOST/system list                      # libvirt RW over ssh
+ssh husk@HOST true                                              # key works
+virsh -c qemu+ssh://husk@HOST/system list                      # libvirt RW over ssh
 ```
 
 ## Verification checklist (Stage 0 "done")
 
 ```bash
 # from the control machine:
-virsh -c qemu+ssh://HOST/system list --all                # RW, no polkit error
-virsh -c qemu+ssh://HOST/system pool-info husk            # active, autostart
-virsh -c qemu+ssh://HOST/system net-info default          # active, autostart
-ssh HOST 'touch /var/lib/libvirt/images/husk/.w && rm /var/lib/libvirt/images/husk/.w && echo writable'
+virsh -c qemu+ssh://husk@HOST/system list --all                # RW, no polkit error
+virsh -c qemu+ssh://husk@HOST/system pool-info husk            # active, autostart
+virsh -c qemu+ssh://husk@HOST/system net-info default          # active, autostart
+ssh husk@HOST 'touch /var/lib/libvirt/images/husk/.w && rm /var/lib/libvirt/images/husk/.w && echo writable'
 ```
 
 ## Ubuntu / Debian hosts (untested)
@@ -203,37 +233,58 @@ ssh HOST 'touch /var/lib/libvirt/images/husk/.w && rm /var/lib/libvirt/images/hu
 > regardless of how you got there.
 
 Nothing in huskd itself is distro-aware. The backend only needs `qemu-img`,
-`genisoimage` **or** `mkisofs`, and `rm` to be on `PATH` for the SSH user
+`genisoimage` **or** `mkisofs`, and `rm` to be on `PATH` for the `husk` user
 (`libvirt_backend.py:293`), plus a RW libvirt connection. The deltas are all in
 *how the distro gates those*.
 
-### Step 0 (Ubuntu only): which libvirt daemon model?
+### Step 0 (Ubuntu only): can the host terminate `qemu+ssh://`?
 
-The Fedora runbook assumes **modular** daemons (`virtqemud`). Debian-family
-releases have been slower to switch, so detect rather than assume — it decides
-which unit you enable in step 1 and which config file the step-2 fallback edits:
+The one check that can hard-fail your first remote connect. libvirt's ssh
+transport runs a helper **on the host** to reach the local socket: `virt-ssh-helper`
+since **libvirt 6.9**, and plain `nc -U` before that. On an older release with
+neither installed, `virsh -c qemu+ssh://…` fails in a way that reads like an
+authentication problem, which sends you debugging step 2 for no reason.
 
 ```bash
-systemctl list-unit-files 'virtqemud*' 'libvirtd*'   # whichever exists is your model
-virsh --version
+libvirtd --version
+command -v virt-ssh-helper nc     # need at least one; below 6.9 it must be nc
 ```
 
-Monolithic ⇒ `libvirtd.socket` + `/etc/libvirt/libvirtd.conf`.
-Modular ⇒ `virtqemud.socket` + `/etc/libvirt/virtqemud.conf`, i.e. exactly the
-Fedora text.
+< 6.9 and no `nc` ⇒ add `netcat-openbsd` to step 1.
+
+Nothing else about the host's age matters. huskd names no daemon, socket path or
+version (there is no `getLibVersion` check in the backend), and the domain XML it
+generates is deliberately plain — BIOS boot with no `<loader>`/`<nvram>` (so OVMF
+is never needed), `q35`, virtio disk/net/balloon, a SATA cdrom for the seed. Its
+newest requirement is `<cpu check='none'>`, libvirt **3.2** (2017).
+
+> **Data point (unvalidated):** the first Ubuntu host husk targets reports libvirt
+> **8.0.0** with the **monolithic** `libvirtd`. That clears both bars — helper
+> present, XML features trivially satisfied — so no version-driven deviation is
+> needed there.
 
 ### Step 1 — packages
 
 ```bash
 sudo apt install -y qemu-system-x86 libvirt-daemon-system libvirt-clients \
                     virtinst guestfs-tools genisoimage
+#                   + netcat-openbsd   # ONLY if step 0 found libvirt < 6.9
 ```
 
 `libvirt-daemon-system` installs *and enables* the socket units and pulls
-`dnsmasq-base` for the `default` network, so the explicit `systemctl enable --now`
-of step 1 is usually redundant (harmless to run against whichever unit step 0
-found). `genisoimage` is the Debian name for the tool Fedora calls `mkisofs`; the
-backend accepts either.
+`dnsmasq-base` for the `default` network, so the Fedora step's explicit
+`systemctl enable --now` is redundant here — which is also why the monolithic-vs-
+modular question mostly does not arise on Ubuntu. It surfaces only when you name a
+unit or a config file by hand: monolithic ⇒ `libvirtd.socket` +
+`/etc/libvirt/libvirtd.conf`, modular ⇒ `virtqemud.socket` +
+`/etc/libvirt/virtqemud.conf` (the Fedora text). `systemctl list-unit-files
+'virtqemud*' 'libvirtd*'` settles it if you need to know.
+
+`genisoimage` is the Debian name for the tool Fedora calls `mkisofs`; the backend
+accepts either. The emulator path is **hardcoded** to `/usr/bin/qemu-system-x86_64`
+(`libvirt_xml.py:31`, not config-overridable) — which is exactly where
+`qemu-system-x86` puts it, so there is nothing to do, but a host that keeps qemu
+elsewhere would need a code change rather than a config one.
 
 ### Step 2 — read-write access: **group, not polkit**
 
@@ -243,7 +294,7 @@ polkit is the lever; on Debian-family the socket is `0770 root:libvirt`
 Fedora "no polkit agent available" symptom typically never appears:
 
 ```bash
-sudo usermod -aG libvirt pagessin
+sudo usermod -aG libvirt husk
 ```
 
 A **new** SSH session picks the group up — no reboot, but existing connections
@@ -251,7 +302,7 @@ A **new** SSH session picks the group up — no reboot, but existing connections
 machine:
 
 ```bash
-ssh HOST id -nG          # must list: libvirt
+ssh husk@HOST id -nG          # must list: libvirt
 ```
 
 The polkit rule from step 2 is still valid and harmless to add as a belt-and-braces
@@ -333,6 +384,7 @@ ls -l /dev/kvm                       # absent ⇒ TCG emulation, very slow
 
 | Step | Fedora | Ubuntu / Debian |
 |---|---|---|
+| 0 transport | n/a (`virt-ssh-helper` present) | check libvirt ≥ 6.9, else `netcat-openbsd` |
 | 1 packages | `dnf`, `virtqemud.socket` | `apt`, `libvirt-daemon-system` (auto-enables), `genisoimage` |
 | 2 RW access | **polkit rule** (socket world-writable) | **`libvirt` group** (socket `0770 root:libvirt`) |
 | 3 pool | qemu runs as `qemu:qemu` | qemu runs as `libvirt-qemu:kvm` |
@@ -349,15 +401,15 @@ Map of steps → tasks, with the root/idempotency notes that matter for automati
 |---|---|---|---|---|
 | 1 packages | `dnf`, `systemd` | yes | yes | enable the **modular** `.socket` units, not `libvirtd` |
 | 2 polkit rule | `copy`/`template` of `50-husk-libvirt.rules` | yes | yes | this — not group membership — is the RW lever for headless SSH |
-| 3 pool | `community.libvirt.virt_pool` + `file` (owner) | yes | yes | **chown the target dir to the SSH user** after build |
+| 3 pool | `community.libvirt.virt_pool` + `file` (owner) | yes | yes | **chown the target dir to the `husk` user** after build |
 | 4 network | `community.libvirt.virt_net` | yes | yes | start + autostart the built-in `default` |
 | 5 vfio | kernel cmdline + `modprobe.d` + dracut | yes | needs reboot | out of scope of the libvirt role; pairs with host provisioning |
 | 6 golden image | `command: build-golden-image.sh creates=…` | no¹ | via `creates=` | long-running; driver/kernel is the risk (see findings) |
 | 7 control machine | not host-side | n/a | — | `PKG_CONFIG_PATH` for `libvirt-python` on macOS |
 
-¹ runs as the SSH user but needs `guestfs-tools` installed (step 1).
+¹ runs as the `husk` user but needs `guestfs-tools` installed (step 1).
 
-The SSH user, pool path, and `gpu_pci_addresses` are the obvious role variables.
+The SSH user (`husk` here), pool path, and `gpu_pci_addresses` are the obvious role variables.
 
 If the role ever has to cover both families, steps 1, 2 and 5 are the ones that
 need `ansible_os_family` branches (package names + unit, group-vs-polkit,
