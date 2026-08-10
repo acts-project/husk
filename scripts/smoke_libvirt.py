@@ -12,8 +12,21 @@ the libvirt domain state, exactly as the controller's classifier does.
 Run:
     uv run --extra libvirt python scripts/smoke_libvirt.py
 
+Two ways to get a golden onto the host:
+
+  HUSK_SMOKE_IMAGE  a qcow2 filename you already put in the pool dir (default).
+  HUSK_SMOKE_REF    an OCI ref, e.g. ghcr.io/acts-project/husk-base:v8. Stages it
+                    through the REAL delivery path — oras pull to the controller
+                    cache, scp to the host, digest-named — before the slot test.
+                    Takes precedence over HUSK_SMOKE_IMAGE.
+
+Prefer HUSK_SMOKE_REF on a host that has never served husk: it needs nothing
+pre-placed, and it exercises image delivery (`image_sync`, `_ensure_on_host`,
+`_gc_goldens`) which the IMAGE path skips entirely.
+
 Env overrides: HUSK_SMOKE_HOST (ssh alias / user@host), HUSK_SMOKE_URI,
-HUSK_SMOKE_POOL, HUSK_SMOKE_IMAGE, HUSK_SMOKE_SETTLE (seconds to watch RUNNING).
+HUSK_SMOKE_POOL, HUSK_SMOKE_IMAGE, HUSK_SMOKE_REF, HUSK_SMOKE_SETTLE (seconds to
+watch RUNNING), HUSK_SMOKE_STAGE_TIMEOUT (seconds to allow for the pull+scp).
 """
 
 from __future__ import annotations
@@ -29,7 +42,11 @@ HOST = os.environ.get("HUSK_SMOKE_HOST", "lenovo-gpu-acts")
 URI = os.environ.get("HUSK_SMOKE_URI", f"qemu+ssh://{HOST}/system")
 POOL = os.environ.get("HUSK_SMOKE_POOL", "husk")
 IMAGE = os.environ.get("HUSK_SMOKE_IMAGE", "husk-cpu-base.qcow2")
+REF = os.environ.get("HUSK_SMOKE_REF", "")
 SETTLE = int(os.environ.get("HUSK_SMOKE_SETTLE", "25"))
+# A cold pull is ~2 GB from ghcr plus an scp of the same to the host; the backend's
+# own scp cap is an hour (_PUSH_TIMEOUT_S), so don't be stingier than a few minutes.
+STAGE_TIMEOUT = int(os.environ.get("HUSK_SMOKE_STAGE_TIMEOUT", "900"))
 
 # Minimal valid cloud-init: a NoCloud seed cloud-init will actually consume. We
 # can't read the guest, so we don't assert on its effect — booting to RUNNING and
@@ -41,11 +58,76 @@ def banner(msg: str) -> None:
     print(f"\n=== {msg}", flush=True)
 
 
+def confirm(be: LibvirtBackend) -> None:
+    """Assert each host ADOPTED a golden, not merely that the op reported done.
+
+    capacity() gates on `_host_ready`, which in OCI mode means `image_digest is not
+    None` — a host that staged but never adopted contributes ZERO units, so the
+    symptom lands much later as `Capacity(can_create=False, free_instances=0)` with
+    nothing pointing at the image. Fail here instead, where the cause is legible.
+    """
+    for hname, h in be._hosts.items():  # noqa: SLF001 — smoke script, internals are fair game
+        if h.image_digest is None:
+            raise SystemExit(
+                f"host {hname}: staging finished but no golden was adopted, so the "
+                f"host reports no capacity. Check the pool dir on the host for a "
+                f"husk-golden-*.qcow2 and the free space beside it."
+            )
+        print(f"    {hname} serving {h.image} ({h.image_digest[:19]})")
+
+
+def stage(be: LibvirtBackend, cfg: BackendConfig) -> None:
+    """Drive image staging to completion, the way the controller's tick does.
+
+    sync_images is deliberately NON-blocking: it hands the multi-GB pull+scp to a
+    background worker and returns, so a reconcile tick is never stalled by it. A
+    one-shot script therefore has to poll it exactly as the controller would, which
+    is also why this is a fair test of the real path rather than a shortcut around
+    it.
+    """
+    banner(f"stage golden from {cfg.image_ref} (oras pull -> controller cache -> scp)")
+    deadline = time.time() + STAGE_TIMEOUT
+    last = None
+    while time.time() < deadline:
+        be.sync_images(cfg)
+        # ADOPTION is the postcondition, not the op board's "done".
+        #
+        # sync_images adopts only on a call where submit() observes an already-DONE
+        # op; a completion landing after this call's submit is adopted on the NEXT
+        # call. So returning on a `staging_ops()` reading — taken after that same
+        # submit — can exit in exactly that gap, leaving image_digest unset. The
+        # host then contributes zero units and capacity() reports free=0 with
+        # nothing pointing at the image. Poll the thing we actually need instead.
+        if all(h.image_digest for h in be._hosts.values()):  # noqa: SLF001
+            confirm(be)
+            return
+        views = be.staging_ops()
+        if views:
+            v = views[0]
+            if v.state == "failed":
+                raise SystemExit(
+                    f"staging failed after {v.attempts} attempt(s): {v.error}"
+                )
+            note = f"{v.state}: {v.progress or ''}".strip()
+            if note != last:  # only speak when something actually changed
+                print(f"    {note}", flush=True)
+                last = note
+        time.sleep(5)
+    raise SystemExit(
+        f"staging did not finish within {STAGE_TIMEOUT}s — raise "
+        f"HUSK_SMOKE_STAGE_TIMEOUT, or check the host's pool dir for free space"
+    )
+
+
 def main() -> int:
     cfg = BackendConfig(
         name="libvirt-smoke",
         type="libvirt",
-        image_name=IMAGE,
+        # Exactly one source wins: a ref goes through the real delivery path, a bare
+        # name trusts a file already in the pool dir. Setting both would make
+        # image_ref silently shadow image_name (see sync_images), so don't.
+        image_name="" if REF else IMAGE,
+        image_ref=REF,
         min_ready=1,
         max_total=1,
         hosts=(
@@ -53,7 +135,7 @@ def main() -> int:
                 name="smoke-host",
                 libvirt_uri=URI,
                 ssh_target=HOST,
-                pool=POOL,
+                storage_pool=POOL,
                 network="default",
                 memory_mb=2048,
                 vcpus=2,
@@ -65,6 +147,9 @@ def main() -> int:
     name = f"husk-smoke-{int(time.time())}"
     slot = None
     try:
+        if REF:
+            stage(be, cfg)
+
         banner("capacity (expect free=1, can_create=True)")
         cap = be.capacity()
         print(f"    {cap}")
