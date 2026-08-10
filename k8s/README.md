@@ -265,8 +265,10 @@ kill loses at most a minute.
 
 ## Not covered yet
 
-- **libvirt pools.** The cern overlay runs the OpenStack pool only. The **pod side
-  is now wired** (see [SSH to libvirt hosts](#ssh-to-libvirt-hosts)); what is still
-  unproven is **cluster egress** to the VM hosts and the `[[pool]]` entry itself.
+- **libvirt pools.** Both prerequisites are now proven: the pod side is wired (see
+  [SSH to libvirt hosts](#ssh-to-libvirt-hosts)), and **cluster egress works** —
+  `ssh husk@acts-gpu-ci-1 true` from the pod exits 0. `config.example.toml` carries
+  a drafted `[[pool]]`; what remains is enabling it in the real `config.toml` and
+  soaking it. The host itself is validated (`scripts/host-setup.md`).
 - **`advertise_addr`.** Set it to the Route hostname once assigned, or
   `/sd/targets` hands central Prometheus the pod-internal bind address.

@@ -25,7 +25,13 @@ reap_runners = "dry-run"
 # without it a config change (which always means a restart) resets them, and any
 # long-window query silently only sees back as far as the last deploy.
 metrics_state_path = "/var/lib/husk/metrics.json"
-# advertise_addr = "husk.app.cern.ch"  # set once the Route hostname is known
+# Set BOTH once the Route hostname is known. Without advertise_addr, /sd/targets
+# falls back to http_addr and hands Prometheus "0.0.0.0:9100" — the bind wildcard,
+# which is not routable from anywhere. The Route terminates TLS at the edge and
+# redirects http, so the scheme has to be https; it rides on the proxied targets
+# because the same endpoint also serves direct plain-HTTP guest targets.
+# advertise_addr = "husk.app.cern.ch:443"
+# advertise_scheme = "https"
 
 [[pool]]
 name = "openstack-cern-oci"
@@ -70,7 +76,82 @@ starting_timeout_sec = 1800
 [pool.container]
 env = ["HUSK_APT_MIRROR=http://ch.archive.ubuntu.com/ubuntu"]
 
-# The libvirt pools are NOT here yet. They need SSH access from the pod to
-# lenovo-gpu-acts (qemu+ssh://), which means a Secret with the private key mounted
-# at /app/.ssh plus a known_hosts entry — and the cluster egress to reach the host
-# at all. Add them once that path is proven; the OpenStack pool works without it.
+# ---------------------------------------------------------------- libvirt pool
+# A second pool on a bare-metal VM-host, reached over qemu+ssh:// from this pod.
+# The prerequisites are now proven: the huskd-ssh Secret mounts at /app/.ssh (key,
+# known_hosts, ssh_config — see k8s/README.md) and egress from the cluster to the
+# host's :22 works. Host setup is scripts/host-setup.md.
+#
+# CPU-ONLY FOR NOW. acts-gpu-ci-1 has a GPU, but it is still serving GitLab CI and
+# the vfio cutover is deliberately deferred (host-setup step 5). Until then this
+# declares max_slots and carries no GPU labels, so a job wanting a GPU cannot
+# accidentally land here.
+[[pool]]
+# Names what this serves TODAY. At the GPU cutover it does not have to be
+# renamed: two pools can share a host (which is why `_occupied` is pool-blind, so
+# a GPU unit is never double-assigned), so a `libvirt-gpu` pool can be added
+# alongside with a host entry declaring `gpu_pci_addresses`. What is NOT allowed
+# is both on one host entry — config rejects `gpu_pci_addresses` + `max_slots`.
+#
+# If it ever is renamed, drain the pool first: `list_slots` filters on
+# `meta["pool"] == <name>`, while `_occupied` only requires the tag to exist — so
+# renaming with live slots leaves them invisible to their own pool yet still
+# consuming a unit, unmanaged and never recycled.
+name = "libvirt-cpu"
+# A separate runner group from the OpenStack pool's `husk`, so this soak cannot be
+# reached by repos that only prod is meant to serve. It MUST already exist in the
+# org — huskd resolves groups by name (it never creates them) and silently-ish
+# falls back to Default/1, logging a warning, then caches that miss for the
+# process lifetime. Create it before starting huskd, not after.
+target = { org = "acts-project", group = "husk-test" }
+
+[pool.runner]
+arch = "x64"
+size = "standard"
+# Derived labels: self-hosted linux x64 x86_64 husk husk-pool-libvirt-cpu
+#                 husk-backend-libvirt husk-size-standard
+# `husk-pool-libvirt-cpu` is the handle for a test job's runs-on. Never write
+# `labels` by hand — husk.labels derives them, and the husk-* namespace is
+# reserved.
+#
+# Unlike the OpenStack pool's 0.0.0.0/0, the libvirt scrape is issued FROM the
+# hypervisor: huskd SSHes in over the channel it already holds and curls the
+# guest, so the libvirt bridge is the only client :9100 ever sees.
+scrape_cidr = "192.168.122.1/32"
+
+[pool.backend]
+type = "libvirt"
+# Pinned rather than derived (`husk-<slug(pool.name)>`), exactly as the OpenStack
+# pool above pins husk-prod. vm_prefix names the VMs and hence the GitHub runners,
+# and is what match_runner and the reaper key on — decoupling it from the pool name
+# means a future rename touches only the label and the metrics dimension.
+vm_prefix = "husk-lv-cpu"
+# Through CERN's Harbor proxy cache, matching the OpenStack pool above and the
+# app image in kustomization.yaml — a cold pull should not depend on ghcr being up
+# and not rate-limiting. huskd oras-pulls this once into the shared controller
+# cache and scp's it to the host's pool dir by digest; the host needs no registry
+# access of its own.
+image_ref = "registry.cern.ch/ghcr.io/acts-project/husk-base:v9"
+min_ready = 1
+max_total = 1
+
+[[pool.backend.hosts]]
+name = "acts-gpu-ci-1"
+# No ~/.ssh/config alias exists in the pod, so this is the real hostname — and it
+# must match the name known_hosts was keyed on (ssh-keyscan uses whatever you
+# typed). ssh_target is derived from this URI when omitted.
+libvirt_uri = "qemu+ssh://husk@acts-gpu-ci-1/system"
+storage_pool = "husk"
+network = "default"
+# Modest deliberately: that box still runs GitLab CI and husk should not contend
+# for its memory. Revisit when the GPU cutover retires that workload.
+memory_mb = 4096
+vcpus = 2
+max_slots = 1
+
+[pool.timeouts]
+poll_interval_sec = 15
+idle_timeout_sec = 1800
+startup_grace_sec = 240
+max_job_duration_sec = 21600
+starting_timeout_sec = 1800
