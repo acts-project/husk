@@ -42,6 +42,21 @@ class CreateSlotError(BackendError):
     """
 
 
+class SlotActionError(BackendError):
+    """An action (rebuild / start / stop) the backend rejected with its own
+    explanation — the same bargain as `CreateSlotError`, for the actions the
+    reconcile loop retries every tick.
+
+    The traceback for one of these is pure plumbing: `to_thread` →
+    `run_in_executor` → the executor's `run` → the `raise` itself. Not one frame
+    names the slot, the action, or the cloud's complaint, while the message
+    carries all three. And because the loop retries every tick, a persistent
+    cause (an instance Nova no longer has, a quota wall) prints that plumbing
+    once per slot per tick until someone notices — which is exactly when the log
+    needs to be readable. Failures with no message worth reading still raise bare
+    and still get their traceback."""
+
+
 @runtime_checkable
 class Backend(Protocol):
     """Infrastructure backend that owns a pool of recyclable slots."""

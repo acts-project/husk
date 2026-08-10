@@ -20,7 +20,7 @@ from datetime import datetime
 
 import openstack
 
-from husk.backend import CreateSlotError, ListSlotsError
+from husk.backend import CreateSlotError, ListSlotsError, SlotActionError
 from husk.cloudinit import b64
 from husk.config import BackendConfig
 from husk.image_sync import ImageSync
@@ -494,7 +494,9 @@ class OpenStackBackend:
             timeout=_API_TIMEOUT_S,
         )
         if resp.status_code not in (200, 202):
-            raise RuntimeError(
+            # No slot id here: every consumer (the controller's log line, the
+            # per-slot dashboard error) already carries it.
+            raise SlotActionError(
                 f"rebuild rejected: HTTP {resp.status_code}: {resp.text[:300]}"
             )
         # Update durable state so a restart recovers cycle + provision clock. A
@@ -538,7 +540,7 @@ class OpenStackBackend:
             f"/servers/{slot.id}/action", json=body, timeout=_API_TIMEOUT_S
         )
         if resp.status_code not in (200, 202):
-            raise RuntimeError(
+            raise SlotActionError(
                 f"action {action} on {slot.id} rejected: "
                 f"HTTP {resp.status_code}: {resp.text[:200]}"
             )

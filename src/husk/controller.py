@@ -21,7 +21,7 @@ import logging
 import time
 from dataclasses import replace
 
-from husk.backend import CreateSlotError, ListSlotsError
+from husk.backend import CreateSlotError, ListSlotsError, SlotActionError
 from husk.cloudinit import render_cloud_init
 from husk.config import Config
 from husk.demand import DemandRegistry
@@ -546,6 +546,13 @@ class Controller:
                 self.backend.rebuild_slot, slot, user_data=user_data, cycle=cycle
             )
             self.slot_errors.pop(slot.id, None)  # cleared on a successful rebuild
+        except SlotActionError as e:
+            # Self-explaining; no traceback. See SlotActionError — this fires once
+            # per tick for as long as the cause persists.
+            log.error("rebuild of slot %s failed: %s", slot.id, e)
+            self.slot_errors[slot.id] = (now, f"rebuild failed: {e}")
+            self.metrics.action_failures.inc(self.pool, "rebuild")
+            return
         except Exception as e:
             log.exception("rebuild of slot %s failed", slot.id)
             self.slot_errors[slot.id] = (now, f"rebuild failed: {e}")
@@ -894,6 +901,11 @@ class Controller:
             await awaitable
             if slot_id is not None:
                 self.slot_errors.pop(slot_id, None)  # cleared on success
+        except SlotActionError as e:
+            log.error("%s failed: %s", what, e)  # self-explaining; no traceback
+            self.metrics.action_failures.inc(self.pool, _action(what))
+            if slot_id is not None:
+                self.slot_errors[slot_id] = (self._clock(), f"{what} failed: {e}")
         except Exception as e:
             log.exception("%s failed", what)
             self.metrics.action_failures.inc(self.pool, _action(what))
