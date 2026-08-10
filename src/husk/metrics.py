@@ -56,10 +56,20 @@ from prometheus_client.metrics_core import (
     HistogramMetricFamily,
 )
 
+from husk.slot import SlotState
 from husk.snapshot import ControllerState
 from husk.storage import DiskUsage
 
 log = logging.getLogger("husk.metrics")
+
+# The classified state as a small integer, for `husk_slot_state_code`. A
+# state-timeline panel colours a lane by a numeric field value, so the state has
+# to reach Grafana as a number; declaration order in `SlotState` is the encoding
+# and the dashboard's value mappings mirror it 1:1. Derived rather than written
+# out so a new state cannot be added to the enum and forgotten here — it gets a
+# code automatically, and only the dashboard mapping needs the new name. Codes
+# start at 1 so that 0 stays free as "no such state" if anything ever needs it.
+_STATE_CODE = {s.value: i for i, s in enumerate(SlotState, start=1)}
 
 # Bucket boundaries (seconds), in upper-bound order and WITHOUT the implicit
 # +Inf. The library defaults top out at 10s, which is useless for everything
@@ -431,6 +441,22 @@ class SnapshotCollector:
         cycle = GaugeMetricFamily(
             "husk_slot_cycle", "Current recycle cycle of the slot", labels=labels
         )
+        # The slot's CURRENT state, encoded as _STATE_CODE. This is deliberately
+        # NOT derivable from husk_slot_state_seconds below, and the dashboard used
+        # to try: it thresholded each state's rate at >0.5 and summed the ordinals
+        # of whichever fired, on the assumption that only one state can hold more
+        # than half an interval. rate() extrapolates (a 4x-scrape window samples
+        # only 3/4 of itself, so the effective threshold is 37.5%, not 50%), so a
+        # slot that spent one window half BUSY and half NEEDS_RECYCLE fired BOTH —
+        # and 2+4 is the code for ERROR. Every ordinary recycle painted itself as
+        # a state the slot was never in. A time-share counter cannot answer "what
+        # is it now", so this gauge answers it instead: one series per slot,
+        # exact, expiring with the slot like everything else here.
+        state_code = GaugeMetricFamily(
+            "husk_slot_state_code",
+            "Classified state of the slot, encoded as an integer (see _STATE_CODE)",
+            labels=labels,
+        )
         # Time-in-state as a counter, replacing the precomputed
         # husk_slot_live_fraction gauge. A ratio baked inside husk fixes the
         # window to "since huskd started" and resets silently on restart; two
@@ -499,6 +525,9 @@ class SnapshotCollector:
                 if v.recycle_seconds is not None:
                     recycle.add_metric(key, v.recycle_seconds)
                 cycle.add_metric(key, v.cycle)
+                code = _STATE_CODE.get(v.state)
+                if code is not None:
+                    state_code.add_metric(key, code)
                 for state, secs in v.state_seconds.items():
                     state_seconds.add_metric([*key, state], secs)
                 if v.failing_seconds is not None:
@@ -516,7 +545,16 @@ class SnapshotCollector:
                     ],
                     1,
                 )
-        yield from (cloudinit, recycle, cycle, state_seconds, failing, failures, info)
+        yield from (
+            cloudinit,
+            recycle,
+            cycle,
+            state_code,
+            state_seconds,
+            failing,
+            failures,
+            info,
+        )
 
     # ---------------------------------------------------------------- storage
     def _storage_families(self) -> Iterator:

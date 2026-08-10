@@ -8,11 +8,14 @@ only exist after serialization."""
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 from prometheus_client.parser import text_string_to_metric_families
 
 from conftest import make_runner, make_slot, render_metrics
-from husk.metrics import Counter, Histogram, Metrics
+from husk.metrics import _STATE_CODE, Counter, Histogram, Metrics
 from husk.slot import SlotState
 from husk.snapshot import ControllerState
 from husk.timing import SlotTiming
@@ -259,6 +262,38 @@ def test_state_seconds_replaces_the_precomputed_live_fraction():
     assert seconds[key("starting")] == 60.0
     # ...and the ratio itself is no longer exposed as a gauge.
     assert "husk_slot_live_fraction" not in text
+
+
+# --------------------------------------------------------- current-state gauge
+@pytest.mark.parametrize("state", list(SlotState))
+def test_state_code_reports_the_current_state_exactly(state):
+    """The timeline panel used to DERIVE the current state from the time-in-state
+    counter: threshold each state's rate at >0.5 and sum the ordinals that fired,
+    assuming only one state can hold half an interval. rate() extrapolates, so two
+    could fire at once — and busy(2) + needs_recycle(4) is the code for error, on
+    every ordinary recycle. Read, don't derive: there is nothing here to alias."""
+    slot, runner, _ = _one()
+    text = render_metrics([_snap((slot, runner, state))])
+
+    assert _samples(text, "husk_slot_state_code") == {
+        (("backend", "pool-a"), ("slot", "husk-a-1")): _STATE_CODE[state.value]
+    }
+
+
+def test_state_codes_match_the_dashboard_value_mappings():
+    """The encoding is split across two repos-worth of file: the codes come from
+    SlotState's declaration order, and Grafana turns them back into names with a
+    hard-coded value mapping. Adding or reordering a state silently mislabels
+    every lane, which is exactly the class of bug this metric was added to kill —
+    so the dashboard is asserted against the enum here rather than trusted."""
+    panels = json.loads(
+        (Path(__file__).resolve().parents[1] / "grafana" / "husk.json").read_text()
+    )["panels"]
+    panel = next(p for p in panels if p["title"] == "Slot state")
+    mapping = panel["fieldConfig"]["defaults"]["mappings"][0]["options"]
+
+    assert "husk_slot_state_code" in panel["targets"][0]["expr"]
+    assert {int(k) for k in mapping} == set(_STATE_CODE.values())
 
 
 def test_live_fraction_is_still_published_for_the_dashboard():

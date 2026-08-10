@@ -852,7 +852,7 @@
     {
       "type": "state-timeline",
       "title": "Slot state",
-      "description": "One lane per slot, coloured by state. Derived from husk_slot_state_seconds_total (see the panel query): a slot caught mid-transition reads as 'transition' for a single interval. Lanes appear and disappear as slots are created and destroyed.",
+      "description": "One lane per slot, coloured by the state huskd classified it as. Read straight from husk_slot_state_code, so it is exact at scrape resolution — a state shorter than one scrape can be missed, but nothing is ever mislabelled. Lanes appear and disappear as slots are created and destroyed.",
       "id": 10,
       "datasource": {
         "type": "prometheus",
@@ -871,7 +871,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (backend, slot) (\n  (rate(husk_slot_state_seconds_total{backend=~\"$backend\",slot=~\"$slot\",state=\"idle\"}[$__rate_interval]) > bool 0.5) * 1\n  or (rate(husk_slot_state_seconds_total{backend=~\"$backend\",slot=~\"$slot\",state=\"busy\"}[$__rate_interval]) > bool 0.5) * 2\n  or (rate(husk_slot_state_seconds_total{backend=~\"$backend\",slot=~\"$slot\",state=\"starting\"}[$__rate_interval]) > bool 0.5) * 3\n  or (rate(husk_slot_state_seconds_total{backend=~\"$backend\",slot=~\"$slot\",state=\"needs_recycle\"}[$__rate_interval]) > bool 0.5) * 4\n  or (rate(husk_slot_state_seconds_total{backend=~\"$backend\",slot=~\"$slot\",state=\"unhealthy\"}[$__rate_interval]) > bool 0.5) * 5\n  or (rate(husk_slot_state_seconds_total{backend=~\"$backend\",slot=~\"$slot\",state=\"error\"}[$__rate_interval]) > bool 0.5) * 6\n)",
+          "expr": "husk_slot_state_code{backend=~\"$backend\",slot=~\"$slot\"}",
           "legendFormat": "{{slot}}",
           "instant": false,
           "range": true,
@@ -884,11 +884,6 @@
             {
               "type": "value",
               "options": {
-                "0": {
-                  "text": "transition",
-                  "color": "text",
-                  "index": 0
-                },
                 "1": {
                   "text": "idle",
                   "color": "green",

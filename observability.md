@@ -405,7 +405,8 @@ split into two halves that behave very differently.
 
 ### Snapshot-derived — `SnapshotCollector`
 
-`husk_slots*`, `husk_slot_last_*_seconds`, `husk_slot_cycle`, `husk_slot_info`,
+`husk_slots*`, `husk_slot_last_*_seconds`, `husk_slot_cycle`, `husk_slot_state_code`,
+`husk_slot_info`,
 `husk_slot_failing_seconds`, `husk_slot_failure_streak`, `husk_image*`. These describe the **present**,
 and huskd already holds a complete immutable description of the present: the
 per-pool `ControllerState` the reconcile loop swaps in each tick. They are rendered
@@ -493,6 +494,55 @@ its accumulator is owned by the slot — so it must expire when the slot does.
 
 `live_fraction` is still in `/status` for the dashboard, which has no PromQL to
 divide with.
+
+### `husk_slot_state_code` — the current state, read rather than derived
+
+The time-in-state counter answers "where did this slot's time go". It cannot
+answer "what state is this slot in *now*", and the "Slot state" timeline panel
+spent a while pretending otherwise. Its query thresholded each state's rate at
+`> bool 0.5` and summed the ordinals of whichever fired, on the assumption that at
+most one state can hold more than half an interval:
+
+```promql
+# WRONG — kept here as the cautionary tale.
+sum by (backend, slot) (
+    (rate(husk_slot_state_seconds_total{state="idle"}[$__rate_interval]) > bool 0.5) * 1
+ or (rate(husk_slot_state_seconds_total{state="busy"}[$__rate_interval]) > bool 0.5) * 2
+ or ...
+)
+```
+
+`rate()` extrapolates. `$__rate_interval` is `4 × scrape`, and four samples span
+only three of those slots, so every rate is scaled by `60/45 = 1.333` — the
+effective threshold is **37.5% of the window, not 50%**, and two states can clear
+it at once. Their ordinals then *add*, and the sum is a valid code for a third
+state the slot was never in:
+
+| what the slot did in that window | sum | rendered as |
+|---|---|---|
+| busy 50% + needs_recycle 50% | 2+4 | **error** |
+| busy + starting | 2+3 | **unhealthy** |
+| idle + starting | 1+3 | **recycling** |
+| idle + busy | 1+2 | **starting** |
+| three-way split, none ≥ 37.5% | 0 | *transition* |
+
+So a libvirt slot ending a job and powering off — the most ordinary event there
+is — painted itself bright red on every recycle, while the same moment on a
+slower OpenStack recycle dissolved into a grey "transition" band. Neither state
+ever existed; had `error` been real, the controller would have destroyed the slot
+on the spot (it is the one state that earns a destroy), which is what gives the
+artifact away: the lanes kept their names across every red band.
+
+`husk_slot_state_code{backend,slot}` is the classified state as a small integer,
+`_STATE_CODE` in `husk.metrics` — `SlotState` declaration order, starting at 1.
+A state-timeline panel colours a lane by a numeric field, so the state has to
+arrive as a number; Grafana's value mappings turn it back into a name, and
+`tests/test_metrics.py` asserts the dashboard's mapping against the enum so a new
+state cannot silently shift every lane's colour.
+
+The gauge samples at scrape resolution, so a state shorter than one scrape can be
+missed entirely. That is the honest failure mode, and the right trade: a gap
+where nothing is claimed, instead of a confident label that is wrong.
 
 ### Alerting on wedged slots
 

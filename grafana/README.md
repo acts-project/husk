@@ -32,12 +32,15 @@ count is a number you'd trust.
 
 ## Notes on two panels
 
-**Slot state** (the status plot) is derived, not read directly: huskd exposes
-state as a per-pool *count* (`husk_slots`) and a per-slot cumulative
-seconds-in-state *counter*, never as a per-slot categorical. The panel recovers
-the current state by asking which state is accruing ~1 s/s right now. A slot
-caught mid-transition splits its rate between two states and shows one interval
-of "transition" — that is the derivation showing through, not a real state.
+**Slot state** (the status plot) reads `husk_slot_state_code` — the classified
+state as a small integer, decoded back into a name by the panel's value mappings.
+It used to *derive* the state instead, by asking which state was accruing ~1 s/s
+in the seconds-in-state counter, and that quietly invented states: `rate()`
+extrapolation let two states clear the "more than half the interval" test at
+once, and the ordinals were summed, so an ordinary busy→poweroff recycle rendered
+as `error`. See the `husk_slot_state_code` section in `../observability.md`. The
+codes come from `SlotState` declaration order, so if you add a state, add its
+mapping here too — `tests/test_metrics.py` fails until you do.
 
 **Filesystem headroom** describes filesystems, not directories, so two `kind`s on
 one disk report identical numbers. Aggregate with `min()`/`max()`, never `sum()`.
