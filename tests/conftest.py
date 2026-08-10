@@ -97,9 +97,7 @@ def make_config(
     return Config(
         github=GithubConfig(app_id=123456, private_key="-----FAKE PRIVATE KEY-----"),
         target=TEST_TARGET,
-        runner=RunnerConfig(
-            version="2.334.0", labels=["self-hosted"], runner_group="husk"
-        ),
+        runner=RunnerConfig(labels=["self-hosted"], runner_group="husk"),
         backend=BackendConfig(
             name="fake",
             type="fake",

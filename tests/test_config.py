@@ -16,7 +16,6 @@ app_id = 123456
 name = "openstack-cern"
 target = {{ org = "acts-project", group = "husk" }}
 [pool.runner]
-version = "2.334.0"
 arch = "x64"
 [pool.backend]
 cloud = "cern"
@@ -171,7 +170,6 @@ http_addr = "127.0.0.1:9100"
 name = "openstack-cpu"
 target = { org = "acts-project", group = "husk" }
 [pool.runner]
-version = "2.334.0"
 arch = "x64"
 [pool.backend]
 type = "openstack"
@@ -186,7 +184,6 @@ max_total = 4
 name = "libvirt-gpu"
 target = { org = "acts-project", group = "husk" }
 [pool.runner]
-version = "2.334.0"
 arch = "x64"
 gpu = "nvidia"
 [pool.backend]
@@ -338,7 +335,7 @@ def _pools(*names: str) -> str:
     head = "[github]\napp_id = 1\n"
     body = "".join(
         f'[[pool]]\nname = "{n}"\ntarget = {{ org = "acme" }}\n'
-        f'[pool.runner]\nversion="1"\narch="x64"\n'
+        f'[pool.runner]\narch="x64"\n'
         "[pool.backend]\n"
         'cloud="cern"\nimage_name="img"\nflavor_name="m2.small"\nnetwork_name="net"\n'
         for n in names

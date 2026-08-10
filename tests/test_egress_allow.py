@@ -153,7 +153,6 @@ name = "p"
 target = {{ org = "acts-project" }}
 
 [pool.runner]
-version = "2.334.0"
 
 [pool.backend]
 type = "openstack"

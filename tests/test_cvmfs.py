@@ -114,7 +114,6 @@ private_key_path = "{pem}"
 name = "cern"
 target = {{ org = "acts-project" }}
 [pool.runner]
-version = "2.334.0"
 arch = "x64"
 [pool.backend]
 cloud = "cern"

@@ -28,11 +28,16 @@ name = "libvirt-gpu"          # → backend name + default vm_prefix "husk-libvi
 target = { org = "acts-project", group = "husk" }
 
 [pool.runner]
-version = "2.334.0"
-labels = ["self-hosted", "linux", "x64", "gpu"]   # jobs target the GPU pool via `gpu`
-# gpu = true       # activate the NVIDIA driver (modprobe + CDI) each boot
-# The baked runner version is authoritative, so `version` above must match the
-# image's husk.runner.version — nothing downloads a runner at boot.
+arch = "x64"
+# The GPU VENDOR ("nvidia" | "amd"): it activates the driver (modprobe + CDI) each
+# boot AND mints the accelerator labels. Labels are DERIVED from these facts, never
+# listed by hand — huskd logs the computed set per pool at startup. Note there is
+# no `size` here: GPU pools carry no size label, the accelerator labels ARE the
+# class. This pool derives:
+#   self-hosted linux x64 x86_64 husk husk-pool-libvirt-gpu husk-backend-libvirt
+#   gpu gpu-nvidia cuda
+gpu = "nvidia"
+# gpu_model = "a100"    # optional → adds the `gpu-a100` label
 # In-guest metrics (observability.md). Opens :9100 (node_exporter, baked into the
 # golden) to this source ONLY — it has no TLS/auth, so the allowlist IS the access
 # control. Unset = fail-closed (no rule, no exporter running).
@@ -54,7 +59,7 @@ max_total = 2                          # one GPU host, one GPU → 1 (raise as t
 #      every host pool (named by content digest). Pin a tag or a digest. To roll
 #      out a new build, edit this and restart huskd: the new image is staged and
 #      idle slots drain onto it (running jobs finish first), old goldens are GC'd.
-image_ref = "ghcr.io/acts-project/husk-gpu:v1"
+image_ref = "ghcr.io/acts-project/husk-gpu:v8"
 #
 #  (b) image_name: a qcow2 filename you placed in each host's pool dir yourself
 #      (the manual path — no registry, no auto-sync/drain).

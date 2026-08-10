@@ -54,7 +54,6 @@ name = "openstack-cern-oci"            # same as live, on purpose — see above
 target = { org = "acts-project", group = "husk" }
 
 [pool.runner]
-version = "2.334.0"                    # MUST match the golden's husk.runner.version
 arch = "x64"
 size = "standard"
 scrape_cidr = "0.0.0.0/0"

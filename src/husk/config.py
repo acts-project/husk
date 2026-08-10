@@ -113,10 +113,6 @@ class GithubConfig:
 
 @dataclass(frozen=True)
 class RunnerConfig:
-    # The runner version this pool's golden image is expected to carry. Nothing
-    # downloads a runner any more (it is baked), so this is an assertion about the
-    # image rather than an instruction — see the note in config.example.toml.
-    version: str
     # DERIVED, never written by hand: `husk.labels.derive_labels` computes this
     # from the pool's facts at load time (see that module for the scheme). The
     # TOML knob is `extra_labels`, which contributes the tail of this list.
@@ -425,7 +421,6 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
             return Target.org(self.org) if self.org else Target.repo(self.repo)
 
     class _Runner(_Strict):
-        version: str
         # Facts, not labels — the label set is derived from these (husk.labels).
         arch: Literal["x64", "arm64"] = "x64"
         # Deliberately no default: an accelerator pool must leave it unset (it
@@ -888,7 +883,6 @@ def _pool_config(p, github: GithubConfig, controller: ControllerConfig) -> Confi
         egress=egress,
         container=container,
         runner=RunnerConfig(
-            version=p.runner.version,
             labels=derive_labels(
                 pool_name=p.name,
                 backend_type=b.type,

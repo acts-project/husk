@@ -27,7 +27,6 @@ app_id = 1
 name = "{name}"
 target = {{ org = "acts-project", group = "husk" }}
 [pool.runner]
-version = "2.334.0"
 {runner}
 [pool.backend]
 cloud = "cern"

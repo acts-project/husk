@@ -54,7 +54,6 @@ http_addr = "{http_addr}"
 name = "openstack-cpu"
 target = {{ org = "acts-project", group = "husk" }}
 [pool.runner]
-version = "2.334.0"
 arch = "x64"
 [pool.backend]
 type = "openstack"
@@ -67,7 +66,6 @@ network_name = "CERN_NETWORK"
 name = "libvirt-gpu"
 target = {{ org = "acts-project", group = "husk" }}
 [pool.runner]
-version = "2.334.0"
 arch = "x64"
 [pool.backend]
 type = "libvirt"

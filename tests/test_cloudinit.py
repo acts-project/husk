@@ -97,7 +97,7 @@ def test_gpu_activates_before_the_egress_lockdown():
 
 
 def test_runner_config_defaults_gpu_off():
-    cfg = RunnerConfig(version="2.334.0", labels=["self-hosted"], runner_group="husk")
+    cfg = RunnerConfig(labels=["self-hosted"], runner_group="husk")
     assert cfg.gpu is False
 
 
