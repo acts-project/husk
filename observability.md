@@ -493,6 +493,29 @@ its accumulator is owned by the slot — so it must expire when the slot does.
 `live_fraction` is still in `/status` for the dashboard, which has no PromQL to
 divide with.
 
+### Alerting on wedged slots
+
+A slot held in `starting` is capacity you are paying for and cannot sell, and until
+the `starting_timeout_sec` backstop landed it could stay there indefinitely — an
+incident where several slots sat in `starting` across a weekend is what motivated
+the backstop. The controller now force-destroys such a slot itself, so this alert
+is the *second* line: it fires when slots are churning through the backstop faster
+than the pool can replace them, which the backstop cannot fix on its own (a bad
+golden image, a dead Neutron, a hypervisor refusing to boot guests).
+
+```promql
+# Slots being force-destroyed for wedging in "starting" — should be ~never.
+sum by (backend) (increase(husk_slots_destroyed_total{reason="stuck_starting"}[1h])) > 2
+```
+
+Pair it with a plain "too much time in starting" signal, which catches a pool that
+is merely slow rather than wedged:
+
+```promql
+sum by (backend) (rate(husk_slot_state_seconds_total{state="starting"}[1h]))
+/ sum by (backend) (rate(husk_slot_state_seconds_total[1h])) > 0.5
+```
+
 ### Persistence across restarts
 
 huskd restarts on every config change (there is no hot reload), and a restart zeros

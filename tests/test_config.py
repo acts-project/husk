@@ -297,6 +297,20 @@ def test_a_misspelt_key_is_rejected(tmp_path, monkeypatch):
         load_configs(str(p))
 
 
+def test_starting_timeout_must_outlast_startup_grace(tmp_path, monkeypatch):
+    """The backstop force-destroys slots stuck in STARTING, and the startup grace
+    is measured inside that same window. Setting it shorter would destroy slots
+    that are still legitimately booting, so it has to fail at load."""
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    p = tmp_path / "backstop.toml"
+    p.write_text(
+        _TOML.format(extra="")
+        + "\n[pool.timeouts]\nstartup_grace_sec = 600\nstarting_timeout_sec = 300\n"
+    )
+    with pytest.raises(Exception, match="starting_timeout_sec"):
+        load_configs(str(p))
+
+
 def test_an_unknown_top_level_table_is_rejected(tmp_path, monkeypatch):
     """Nested tables are covered by extra="forbid", but the settings model itself
     must stay lenient (its env source sees every HUSK_* var), so the file's top

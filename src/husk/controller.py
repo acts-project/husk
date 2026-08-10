@@ -295,12 +295,31 @@ class Controller:
 
         # 3. PER-SLOT REMEDIATION (one action max per slot)
         for s, runner, state in classified:
+            # ERROR and the STARTING backstop are checked BEFORE the pending-start
+            # short-circuit. A rebuild that lands in ERROR, or one whose task_state
+            # never clears, is exactly the slot that is in `pending_start` — letting
+            # the short-circuit run first meant `_drain_pending_start` matched
+            # neither of its cases, returned without discarding, and the slot was
+            # skipped by this loop on every tick thereafter. Forever: `pending_start`
+            # is in-memory, so only a huskd restart freed it.
+            if state is SlotState.ERROR:
+                await self._destroy(s, "error")
+                continue
+            if state is SlotState.STARTING and self._starting_wedged(s, runner, now):
+                log.warning(
+                    "slot %s stuck in starting for %.0fs (status=%s task=%s); "
+                    "destroying — the pool will recreate it",
+                    s.id,
+                    self._state_age(s.id, now),
+                    s.status,
+                    s.task_state,
+                )
+                await self._destroy(s, "stuck_starting")
+                continue
             if s.id in self.pending_start:
                 await self._drain_pending_start(s, now)
                 continue
-            if state is SlotState.ERROR:
-                await self._destroy(s, "error")
-            elif state is SlotState.NEEDS_RECYCLE:
+            if state is SlotState.NEEDS_RECYCLE:
                 if surplus_remaining > 0:
                     # This powered-off slot is surplus. Don't rebuild it — either
                     # retire it (sustained surplus) or hold it off so a returning
@@ -347,7 +366,7 @@ class Controller:
                     "slot %s unhealthy (no runner past grace); rebuilding", s.id
                 )
                 await self._rebuild_then_start(s, now)
-            # STARTING: nothing — re-check next tick.
+            # STARTING (within the backstop): nothing — re-check next tick.
 
         # 4/5. GROW or RAMP DOWN (mutually exclusive — never thrash within a tick).
         # Sizing + surplus hysteresis were computed in 3-prep above; an excess slot
@@ -541,17 +560,36 @@ class Controller:
             t.on_issued(now)
         log.info("rebuilt slot %s as runner %s (cycle %d)", slot.id, name, cycle)
 
+    def _starting_wedged(self, slot: Slot, runner: Runner | None, now: float) -> bool:
+        """Has this slot been STARTING past the liveness backstop?
+
+        `startup_grace_sec` bounds only one of the three routes into STARTING (the
+        ACTIVE-without-runner tail, which ages out to UNHEALTHY). A slot held in
+        STARTING by an unsettled backend status — `status == "REBUILD"`, a
+        `task_state` that never clears, a create that never leaves BUILD — bypasses
+        that check entirely and has no other exit. This is the backstop for those.
+
+        The online-runner guard matters: `classify` tests `task_state` *before* it
+        looks at the runner, so a healthy slot mid-job whose server picks up a task
+        (snapshot, live migration) reads as STARTING. Destroying that would kill a
+        running job, so a slot with a live runner is never considered wedged — the
+        BUSY max_job_duration watchdog owns that case instead."""
+        if runner is not None and runner.online:
+            return False
+        return self._state_age(slot.id, now) > self.cfg.timeouts.starting_timeout_sec
+
     async def _drain_pending_start(self, slot: Slot, now: float) -> None:
         """Issue os-start once a rebuild has settled. Nova preserves power state,
         so a slot that was SHUTOFF before rebuild is SHUTOFF again — which would
         re-trigger NEEDS_RECYCLE if we didn't intercept it here first."""
-        if slot.task_state is not None:
+        if slot.task_state is not None or slot.status in ("BUILD", "REBUILD"):
             log.debug(
-                "slot %s pending-start: still settling (task=%s)",
+                "slot %s pending-start: still settling (status=%s task=%s)",
                 slot.id,
+                slot.status,
                 slot.task_state,
             )
-            return  # still settling
+            return  # still settling; the STARTING backstop bounds how long
         if slot.status == "SHUTOFF":
             log.info("slot %s rebuild settled to SHUTOFF; os-starting", slot.id)
             await self._safe(
@@ -564,6 +602,18 @@ class Controller:
         elif slot.status == "ACTIVE":
             log.debug("slot %s rebuilt while ACTIVE; no os-start needed", slot.id)
             self.pending_start.discard(slot.id)  # rebuilt-while-ACTIVE: no start needed
+        else:
+            # Not settling, and not a status this can act on. Rather than hold the
+            # slot in pending_start (where the loop's short-circuit would hide it
+            # from every other remediation), drop it and let the next tick classify
+            # it normally.
+            log.warning(
+                "slot %s pending-start: unexpected status %s; releasing to "
+                "normal remediation",
+                slot.id,
+                slot.status,
+            )
+            self.pending_start.discard(slot.id)
 
     async def _grow(self, want: int, now: float) -> None:
         cap = await asyncio.to_thread(self.backend.capacity)

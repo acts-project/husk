@@ -114,6 +114,7 @@ poll_interval_sec = 30
 idle_timeout_sec = 1800                # rebuild idle slots to refresh credentials
 startup_grace_sec = 300               # post-rebuild grace for the runner to register
 max_job_duration_sec = 21600          # 6h — stop (not destroy) busy slots beyond this
+starting_timeout_sec = 1800           # 30m — destroy slots wedged in "starting" (must exceed startup_grace_sec)
 
 # CernVM-FS (/cvmfs) for this pool's slots. Opt-in; omit the table for no CVMFS.
 # The client + autofs are BAKED into the golden image, so cloud-init supplies only
@@ -211,3 +212,4 @@ poll_interval_sec = 30
 idle_timeout_sec = 1800
 startup_grace_sec = 300
 max_job_duration_sec = 21600
+starting_timeout_sec = 1800

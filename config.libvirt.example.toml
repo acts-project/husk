@@ -92,3 +92,4 @@ poll_interval_sec = 30
 idle_timeout_sec = 1800
 startup_grace_sec = 300
 max_job_duration_sec = 21600
+starting_timeout_sec = 1800           # destroy slots wedged in "starting" (must exceed startup_grace_sec)

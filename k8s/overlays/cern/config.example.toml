@@ -59,6 +59,7 @@ poll_interval_sec = 5
 idle_timeout_sec = 1800
 startup_grace_sec = 240
 max_job_duration_sec = 21600
+starting_timeout_sec = 1800
 
 # Exported into every job container. The ACTS job images are shared with
 # GitHub-hosted runners, so a fact that only holds here cannot be baked into them

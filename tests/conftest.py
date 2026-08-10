@@ -90,6 +90,7 @@ def make_config(
     startup_grace: float = 300,
     idle_timeout: float = 1800,
     max_job_duration: float = 21600,
+    starting_timeout: float = 1800,
     shrink_ticks: int = 3,
     reap_runners: str = "off",
     vm_prefix: str = "husk",
@@ -116,6 +117,7 @@ def make_config(
             idle_timeout_sec=idle_timeout,
             startup_grace_sec=startup_grace,
             max_job_duration_sec=max_job_duration,
+            starting_timeout_sec=starting_timeout,
         ),
         controller=ControllerConfig(
             lock_path="/tmp/x.lock",

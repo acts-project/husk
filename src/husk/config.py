@@ -283,6 +283,12 @@ class TimeoutsConfig:
     idle_timeout_sec: float = 1800
     startup_grace_sec: float = 300
     max_job_duration_sec: float = 21600
+    # Liveness backstop for STARTING — the one state with no other exit. A slot
+    # whose backend status never settles (a wedged Nova task_state, a create that
+    # never leaves BUILD) is otherwise invisible to every other timeout here and
+    # sits forever. Must exceed startup_grace_sec, which measures a *subset* of
+    # the same window; enforced at load.
+    starting_timeout_sec: float = 1800
 
 
 @dataclass(frozen=True)
@@ -632,6 +638,20 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         idle_timeout_sec: float = Field(1800, gt=0)
         startup_grace_sec: float = Field(300, gt=0)
         max_job_duration_sec: float = Field(21600, gt=0)
+        starting_timeout_sec: float = Field(1800, gt=0)
+
+        @model_validator(mode="after")
+        def _backstop_outlasts_grace(self):
+            # STARTING spans the whole pre-runner window, of which the grace is
+            # only the tail (ACTIVE-but-no-runner). A backstop shorter than the
+            # grace would force-destroy slots that are still legitimately booting.
+            if self.starting_timeout_sec <= self.startup_grace_sec:
+                raise ValueError(
+                    f"starting_timeout_sec ({self.starting_timeout_sec}) must exceed "
+                    f"startup_grace_sec ({self.startup_grace_sec}) — the backstop "
+                    f"would fire on slots that are still within their boot grace"
+                )
+            return self
 
     class _Pool(_Strict):
         name: str  # pool identity → backend.name + default vm_prefix
@@ -908,6 +928,7 @@ def _pool_config(p, github: GithubConfig, controller: ControllerConfig) -> Confi
             idle_timeout_sec=p.timeouts.idle_timeout_sec,
             startup_grace_sec=p.timeouts.startup_grace_sec,
             max_job_duration_sec=p.timeouts.max_job_duration_sec,
+            starting_timeout_sec=p.timeouts.starting_timeout_sec,
         ),
         controller=controller,
     )
