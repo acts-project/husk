@@ -139,8 +139,26 @@ class Controller:
         self.timing: dict[str, SlotTiming] = {}
         # Last failed backend action per slot (rebuild/start/stop/…), surfaced on the
         # dashboard so a stuck slot's cause is visible without the logs. slot_id ->
-        # (epoch, message); cleared when the same slot's next action succeeds.
+        # (WALL-CLOCK epoch, message); cleared when the same slot's next action
+        # succeeds. Wall-clock because the dashboard renders it as `Date.now()/1000
+        # - epoch`, and because the backend's own slot_warnings() — which this is
+        # merged with in _all_errors — have always been time.time(). The controller
+        # clock is monotonic, so stamping these with it produced an "ago" of roughly
+        # the Unix epoch; durations that need a monotonic clock live in
+        # `slot_failing` below and are published pre-resolved.
         self.slot_errors: dict[str, tuple[float, str]] = {}
+        # The current *streak* of consecutive failed actions on a slot: slot_id ->
+        # (start of the run on the CONTROLLER clock, count). `slot_errors` above is
+        # overwritten on every failure, so on its own it cannot distinguish a slot
+        # that failed once from one that has failed every tick for three hours —
+        # which is precisely the difference between a blip and a dead slot. Reset
+        # the moment any action on the slot succeeds.
+        #
+        # Deliberately on `self._clock` (monotonic by default) and published as an
+        # elapsed duration, never as an epoch: this feeds a "how long has it been
+        # broken" number, and a monotonic clock is the only one that survives an
+        # NTP step. Wall-clock stamps meant for humans live in `slot_errors`.
+        self.slot_failing: dict[str, tuple[float, int]] = {}
 
         self._known: set[str] = set()
         self._last_tick: float | None = None
@@ -395,6 +413,7 @@ class Controller:
             ops=self._backend_ops(),
             image_ref=self.cfg.backend.image_ref,
             errors=self._all_errors(),
+            failing=self._failing_view(now),
         )
         log.debug(
             "tick %d done: %s",
@@ -431,6 +450,7 @@ class Controller:
             ops=self._backend_ops(),
             image_ref=self.cfg.backend.image_ref,
             errors=self._all_errors(),
+            failing=self._failing_view(now),
         )
         return self.snapshot
 
@@ -546,16 +566,19 @@ class Controller:
                 self.backend.rebuild_slot, slot, user_data=user_data, cycle=cycle
             )
             self.slot_errors.pop(slot.id, None)  # cleared on a successful rebuild
+            self._note_action_ok(slot.id)
         except SlotActionError as e:
             # Self-explaining; no traceback. See SlotActionError — this fires once
             # per tick for as long as the cause persists.
             log.error("rebuild of slot %s failed: %s", slot.id, e)
-            self.slot_errors[slot.id] = (now, f"rebuild failed: {e}")
+            self.slot_errors[slot.id] = (time.time(), f"rebuild failed: {e}")
+            self._note_action_failed(slot.id, now)
             self.metrics.action_failures.inc(self.pool, "rebuild")
             return
         except Exception as e:
             log.exception("rebuild of slot %s failed", slot.id)
-            self.slot_errors[slot.id] = (now, f"rebuild failed: {e}")
+            self.slot_errors[slot.id] = (time.time(), f"rebuild failed: {e}")
+            self._note_action_failed(slot.id, now)
             self.metrics.action_failures.inc(self.pool, "rebuild")
             return
         self.metrics.slot_recycles.inc(self.pool)
@@ -851,6 +874,7 @@ class Controller:
             self.cycle_counter,
             self.timing,
             self.slot_errors,
+            self.slot_failing,
         ):
             for k in list(d):
                 if k not in live:
@@ -865,6 +889,7 @@ class Controller:
         self.prev_status.pop(slot_id, None)
         self.cycle_counter.pop(slot_id, None)
         self.timing.pop(slot_id, None)
+        self.slot_failing.pop(slot_id, None)
         self.pending_start.discard(slot_id)
         self.runner_present.discard(slot_id)
         self._known.discard(slot_id)
@@ -881,6 +906,24 @@ class Controller:
     def _state_age(self, slot_id: str, now: float) -> float:
         entry = self.first_seen_state.get(slot_id)
         return now - entry[1] if entry else 0.0
+
+    def _note_action_failed(self, slot_id: str, now: float) -> None:
+        """Extend this slot's failure streak, preserving when it began."""
+        since, count = self.slot_failing.get(slot_id, (now, 0))
+        self.slot_failing[slot_id] = (since, count + 1)
+
+    def _note_action_ok(self, slot_id: str) -> None:
+        """Any successful action ends the streak — brokenness is about the current
+        run of failures, not a slot's lifetime record."""
+        self.slot_failing.pop(slot_id, None)
+
+    def _failing_view(self, now: float) -> dict[str, tuple[float, int]]:
+        """slot_id -> (seconds failing, consecutive failures), for the snapshot.
+
+        Resolved to a duration here, where the controller's clock is, so neither
+        the snapshot nor the metrics collector has to know which clock minted it.
+        """
+        return {sid: (now - since, n) for sid, (since, n) in self.slot_failing.items()}
 
     def _all_errors(self) -> dict[str, tuple[float, str]]:
         """Per-slot errors for the dashboard: the backend's non-fatal warnings
@@ -901,13 +944,16 @@ class Controller:
             await awaitable
             if slot_id is not None:
                 self.slot_errors.pop(slot_id, None)  # cleared on success
+                self._note_action_ok(slot_id)
         except SlotActionError as e:
             log.error("%s failed: %s", what, e)  # self-explaining; no traceback
             self.metrics.action_failures.inc(self.pool, _action(what))
             if slot_id is not None:
-                self.slot_errors[slot_id] = (self._clock(), f"{what} failed: {e}")
+                self.slot_errors[slot_id] = (time.time(), f"{what} failed: {e}")
+                self._note_action_failed(slot_id, self._clock())
         except Exception as e:
             log.exception("%s failed", what)
             self.metrics.action_failures.inc(self.pool, _action(what))
             if slot_id is not None:
-                self.slot_errors[slot_id] = (self._clock(), f"{what} failed: {e}")
+                self.slot_errors[slot_id] = (time.time(), f"{what} failed: {e}")
+                self._note_action_failed(slot_id, self._clock())

@@ -37,6 +37,14 @@ class SlotView:
     image_stale: bool = False  # active image differs from the pool's current target
     error: str | None = None  # last failed backend action (rebuild/start/…), if any
     error_epoch: float | None = None  # when that error was recorded (wall-clock)
+    # The current run of consecutive failed actions. `error_epoch` above is the
+    # LAST failure, which on a slot failing every tick always reads "just now" and
+    # so makes a three-hour outage look momentary; this is how long the run has
+    # lasted, and is the thing worth alerting on. None ⇒ last action succeeded.
+    # A duration, not a start epoch: it is measured on the controller's monotonic
+    # clock, which has no meaning to anyone downstream.
+    failing_seconds: float | None = None
+    failure_count: int = 0
     cloudinit_seconds: float | None = (
         None  # last ACTIVE→runner-online (cloud-init step)
     )
@@ -113,9 +121,11 @@ class ControllerState:
         ops: list[OpView] | None = None,  # backend async ops (image staging)
         image_ref: str = "",  # pool's configured target ref → per-slot tag labels
         errors: dict | None = None,  # slot_id -> (epoch, message) last-action failure
+        failing: dict | None = None,  # slot_id -> (seconds failing, count)
     ) -> "ControllerState":
         timing = timing or {}
         errors = errors or {}
+        failing = failing or {}
         tag = _ref_tag(image_ref)
         counts = {st.value: 0 for st in SlotState}
         views: list[SlotView] = []
@@ -140,6 +150,8 @@ class ControllerState:
                     image_stale=slot.image_stale,
                     error=(errors.get(slot.id) or (None, None))[1],
                     error_epoch=(errors.get(slot.id) or (None, None))[0],
+                    failing_seconds=_round1((failing.get(slot.id) or (None, 0))[0]),
+                    failure_count=(failing.get(slot.id) or (None, 0))[1],
                     cloudinit_seconds=(
                         round(t.last_cloudinit_seconds, 1)
                         if t is not None and t.last_cloudinit_seconds is not None

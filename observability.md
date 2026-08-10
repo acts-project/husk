@@ -405,7 +405,8 @@ split into two halves that behave very differently.
 
 ### Snapshot-derived — `SnapshotCollector`
 
-`husk_slots*`, `husk_slot_last_*_seconds`, `husk_slot_cycle`, `husk_slot_info`, `husk_image*`. These describe the **present**,
+`husk_slots*`, `husk_slot_last_*_seconds`, `husk_slot_cycle`, `husk_slot_info`,
+`husk_slot_failing_seconds`, `husk_slot_failure_streak`, `husk_image*`. These describe the **present**,
 and huskd already holds a complete immutable description of the present: the
 per-pool `ControllerState` the reconcile loop swaps in each tick. They are rendered
 straight from it at scrape time and are never stored.
@@ -515,6 +516,45 @@ is merely slow rather than wedged:
 sum by (backend) (rate(husk_slot_state_seconds_total{state="starting"}[1h]))
 / sum by (backend) (rate(husk_slot_state_seconds_total[1h])) > 0.5
 ```
+
+### Alerting on a broken slot — `husk_slot_failing_seconds`
+
+The state metric answers "what is this slot doing", not "is it working". A slot
+whose rebuild fails every tick — an instance the cloud no longer has, an exhausted
+quota — still classifies as `needs_recycle`, so a state panel renders it exactly
+like a healthy slot mid-recycle and it can sit there for days. That happened.
+
+`husk_slot_failing_seconds{backend,slot}` is how long the slot's current run of
+consecutive failed actions has lasted, with `husk_slot_failure_streak` carrying the
+count. **Both are absent while the slot is healthy** — recovery is a series going
+stale, not a value returning to zero, so a threshold alert can never be tripped by
+a working slot:
+
+```promql
+# A slot husk has been unable to act on for 15 minutes.
+husk_slot_failing_seconds > 900
+```
+
+Deliberately a duration rather than a `broken` boolean: "broken" is a judgement
+about how much patience the situation deserves, and that differs per pool and per
+consumer. Exporting the elapsed time leaves the threshold in the query, so an alert
+can say `> 900` while a dashboard panel says `> 60`, with no config knob in huskd
+to keep in sync.
+
+Brokenness is deliberately NOT a `SlotState`. It is orthogonal to the lifecycle — a
+slot can be broken while `needs_recycle` (its rebuild is failing) or broken while
+`starting` (the rebuild worked, the `os-start` 404s) — and folding it into the state
+would destroy that distinction and skew `state_seconds` for everything else. To
+annotate an existing state panel instead, `husk_slot_info` carries a `failing`
+label, in the same spirit as `image_stale`:
+
+```promql
+husk_slot_info{failing="true"}
+```
+
+Note `failing="true"` means only "the last action on this slot failed" — one bad
+tick sets it. The judgement lives in the duration, so join the two when you want
+"broken" rather than "blipped".
 
 ### Persistence across restarts
 

@@ -14,6 +14,10 @@ const STATES = ["idle","busy","starting","needs_recycle","unhealthy","error"];
 const ago = e => { const s = Math.max(0, Date.now()/1000 - e);
   return s<90 ? Math.round(s)+"s ago" : s<5400 ? Math.round(s/60)+"m ago" : (s/3600).toFixed(1)+"h ago"; };
 const secs = v => v==null ? "-" : Math.round(v)+"s";
+// A bare elapsed duration (no "ago"): the failing-streak length arrives already
+// resolved by the controller, because it is measured on its monotonic clock and
+// so cannot be differenced against Date.now() here.
+const dur = s => s<90 ? Math.round(s)+"s" : s<5400 ? Math.round(s/60)+"m" : (s/3600).toFixed(1)+"h";
 const pct = v => v==null ? "-" : Math.round(v*100)+"%";
 const esc = s => (s==null ? "" : ""+s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 
@@ -70,9 +74,15 @@ function poolHtml(p) {
           ? `<td>-</td>`
           : `<td><span class="${v.image_stale ? "stale" : "dim"}" title="${imgTitle}">${esc(v.image)}${v.image_stale ? " ⚠" : ""}</span></td>`;
         const errShort = v.error && v.error.length > 48 ? v.error.slice(0,48) + "…" : v.error;
+        // The streak, not the last failure: a slot retried every tick always has a
+        // seconds-old LAST error, so that alone made a multi-hour outage look
+        // momentary. "failing 3.2h (287×)" is the number that says "this is dead".
+        const streak = v.failing_seconds == null
+          ? ""
+          : `<span class="bad">failing ${dur(v.failing_seconds)}${v.failure_count > 1 ? " ("+v.failure_count+"×)" : ""}</span> `;
         const err = !v.error
           ? `<td>-</td>`
-          : `<td class="stale" title="${esc(v.error)}${v.error_epoch ? " ("+ago(v.error_epoch)+")" : ""}">⚠ ${esc(errShort)}</td>`;
+          : `<td class="stale" title="${esc(v.error)}${v.error_epoch ? " (last: "+ago(v.error_epoch)+")" : ""}">${streak}⚠ ${esc(errShort)}</td>`;
         return `
         <tr class="${v.error ? "errored" : ""}">
           <td>${esc(v.id)}</td><td>${esc(v.name)}</td>

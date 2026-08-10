@@ -448,16 +448,45 @@ class SnapshotCollector:
             "Cumulative seconds the slot has spent in each classified state",
             labels=[*labels, "state"],
         )
+        # How long the slot's CURRENT run of failed actions has lasted, as measured
+        # by the controller at its last tick. Emitted only while failing, so a
+        # healthy slot produces no sample and recovery is handled by Prometheus
+        # staleness — the same contract as the gauges above.
+        #
+        # A duration rather than a `broken` boolean on purpose: "broken" is a
+        # judgement about how much patience the situation deserves, and huskd has
+        # no business fixing that number for every pool. Exporting the elapsed time
+        # leaves the threshold in the query, where one alert can say `> 900` while a
+        # dashboard panel says `> 60`, with no config knob to keep in sync.
+        failing = GaugeMetricFamily(
+            "husk_slot_failing_seconds",
+            "Duration of the slot's current run of consecutive failed actions",
+            labels=labels,
+        )
+        # Companion count for the same run. Not a Counter: it RESETS to absent on
+        # the first success, which is the semantics of a gauge, and rate() over it
+        # would be meaningless anyway.
+        failures = GaugeMetricFamily(
+            "husk_slot_failure_streak",
+            "Consecutive failed actions on the slot since the last success",
+            labels=labels,
+        )
         # `image` is the slot's ACTIVE image (short digest, or the tag when the
         # slot is on the pool's current target), and `image_stale` flags a slot
         # still running a prior image. Together they turn a rollout into something
         # observable per slot: `count by (image) (husk_slot_info)` is the drain
         # curve, and `husk_slot_info{image_stale="true"}` is exactly the slots not
         # yet cycled. The pool's *configured* target is husk_pool_info.
+        #
+        # `failing` joins that family: it is a FACT (the last action on this slot
+        # failed), not the judgement "broken" — which stays a threshold on
+        # husk_slot_failing_seconds. It earns a label rather than only a series
+        # because the state panels are already built on this metric, so a broken
+        # slot can be annotated there with a join instead of a redesign.
         info = GaugeMetricFamily(
             "husk_slot_info",
             "Slot identity for joining in-guest metrics (always 1)",
-            labels=[*labels, "ip", "host", "runner", "image", "image_stale"],
+            labels=[*labels, "ip", "host", "runner", "image", "image_stale", "failing"],
         )
         for s in snaps:
             b = s.backend
@@ -472,6 +501,9 @@ class SnapshotCollector:
                 cycle.add_metric(key, v.cycle)
                 for state, secs in v.state_seconds.items():
                     state_seconds.add_metric([*key, state], secs)
+                if v.failing_seconds is not None:
+                    failing.add_metric(key, v.failing_seconds)
+                    failures.add_metric(key, v.failure_count)
                 info.add_metric(
                     [
                         *key,
@@ -480,10 +512,11 @@ class SnapshotCollector:
                         v.runner or "",
                         v.image or "",
                         "true" if v.image_stale else "false",
+                        "true" if v.failing_seconds is not None else "false",
                     ],
                     1,
                 )
-        yield from (cloudinit, recycle, cycle, state_seconds, info)
+        yield from (cloudinit, recycle, cycle, state_seconds, failing, failures, info)
 
     # ---------------------------------------------------------------- storage
     def _storage_families(self) -> Iterator:

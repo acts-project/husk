@@ -130,7 +130,8 @@ def test_render_prometheus_slot_info():
     )
     text = render_metrics([snap])
     assert (
-        'husk_slot_info{backend="pool-a",host="",image="",image_stale="false",'
+        'husk_slot_info{backend="pool-a",failing="false",host="",image="",'
+        'image_stale="false",'
         'ip="10.1.2.3",runner="run-x",slot="husk-a-1"} 1.0' in text
     )
     # `cycle` is a value, not an identity: as a label it minted a fresh series on
