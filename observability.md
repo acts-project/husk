@@ -536,9 +536,14 @@ artifact away: the lanes kept their names across every red band.
 `husk_slot_state_code{backend,slot}` is the classified state as a small integer,
 `_STATE_CODE` in `husk.metrics` — `SlotState` declaration order, starting at 1.
 A state-timeline panel colours a lane by a numeric field, so the state has to
-arrive as a number; Grafana's value mappings turn it back into a name, and
-`tests/test_metrics.py` asserts the dashboard's mapping against the enum so a new
-state cannot silently shift every lane's colour.
+arrive as a number; Grafana's value mappings turn it back into a name. Those
+mappings live in the dashboard, which is in the acts/monitoring repo (see
+`grafana/README.md`), so a new or reordered state would shift every code and
+relabel every lane out of sight of this repo. `tests/test_metrics.py` pins the
+encoding to make that impossible to do quietly. The panel may also map codes
+*above* the enum's range as overlays that win over the classified state —
+`broken` (7, thresholded on `husk_slot_failing_seconds`) is one, and huskd knows
+nothing about it.
 
 The gauge samples at scrape resolution, so a state shorter than one scrape can be
 missed entirely. That is the honest failure mode, and the right trade: a gap

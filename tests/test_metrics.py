@@ -8,9 +8,6 @@ only exist after serialization."""
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 import pytest
 from prometheus_client.parser import text_string_to_metric_families
 
@@ -280,24 +277,22 @@ def test_state_code_reports_the_current_state_exactly(state):
     }
 
 
-def test_state_codes_match_the_dashboard_value_mappings():
-    """The encoding is split across two repos-worth of file: the codes come from
-    SlotState's declaration order, and Grafana turns them back into names with a
-    hard-coded value mapping. Adding or reordering a state silently mislabels
-    every lane, which is exactly the class of bug this metric was added to kill —
-    so the dashboard is asserted against the enum here rather than trusted."""
-    panels = json.loads(
-        (Path(__file__).resolve().parents[1] / "grafana" / "husk.json").read_text()
-    )["panels"]
-    panel = next(p for p in panels if p["title"] == "Slot state")
-    mapping = panel["fieldConfig"]["defaults"]["mappings"][0]["options"]
-
-    assert "husk_slot_state_code" in panel["targets"][0]["expr"]
-    # Subset, not equality: the panel may map codes ABOVE the enum's range as
-    # overlays that win over the classified state (the deployed dashboard paints
-    # a slot husk cannot act on as `broken`, from husk_slot_failing_seconds).
-    # What must hold is that every state huskd can emit has a name in Grafana.
-    assert set(_STATE_CODE.values()) <= {int(k) for k in mapping}
+def test_state_codes_are_pinned_to_the_dashboard_mapping():
+    """The decode half of this encoding is a value mapping in the Grafana
+    dashboard, which lives in the acts/monitoring repo (see grafana/README.md) —
+    out of reach of any assertion here. Adding or reordering a SlotState member
+    would silently shift the codes and relabel every lane on a dashboard nobody
+    thought to edit, which is precisely the class of bug husk_slot_state_code was
+    added to kill. So the encoding is pinned: this test failing IS the reminder
+    to go update the mappings, and only then to update this list."""
+    assert _STATE_CODE == {
+        "idle": 1,
+        "busy": 2,
+        "starting": 3,
+        "needs_recycle": 4,
+        "unhealthy": 5,
+        "error": 6,
+    }
 
 
 def test_live_fraction_is_still_published_for_the_dashboard():
