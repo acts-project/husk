@@ -13,8 +13,10 @@ spec:
   storageClassName: cephfs-ssd-no-backup
   resources:
     requests:
-      # Sized from the real published artifacts (ghcr, 2026-07):
-      #   husk-base:v4  1.96 GB     husk-gpu:v4  4.08 GB   -> 6.0 GB resident today
+      # Sized from the real published artifacts (ghcr, measured 2026-07 at v3/v4;
+      # v8 is current and has NOT been re-measured — extrapolating the trend puts
+      # the pair near 7 GB, still nowhere near this claim):
+      #   husk-base:v4  1.96 GB     husk-gpu:v4  4.08 GB   -> 6.0 GB resident then
       #   husk-base:v3  1.93 GB     husk-gpu:v3  3.92 GB   (~2-4% growth per bump)
       #
       # The cache is keyed by CONTENT DIGEST (one dir per digest) and evicts

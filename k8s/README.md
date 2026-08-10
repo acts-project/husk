@@ -192,17 +192,19 @@ three — the controller pull cache mounted here (`ImageSync.gc`), per-host gold
 (`openstack_backend._gc_glance`). They are independent sweeps with independent
 keep-sets, so a digest can persist in one and not another.
 
-Measured from the published artifacts (ghcr, 2026-07):
+Measured from the published artifacts (ghcr, 2026-07). **v8 is current; these are
+v3/v4 figures and have not been re-measured** — kept because what matters here is
+the growth rate, which is what the headroom is sized against:
 
 | artifact | v3 | v4 |
 |---|---|---|
 | `husk-base` | 1.93 GB | 1.96 GB |
 | `husk-gpu` | 3.92 GB | 4.08 GB |
 
-So ~6 GB in service today, and transiently ~12 GB for the day after both variants
-are bumped. 50Gi leaves plenty of headroom; the reason to keep an eye on it is that
-a full cache fails the pull for a *new* golden, breaking exactly the rollout you
-were attempting. Check with `just k8s-live-cache`. Deleting digest directories
+So ~6 GB in service at v4, and transiently ~12 GB for the day after both variants
+are bumped. At ~2-4% per bump, v8 should be within a GB of that. 50Gi leaves
+plenty of headroom; the reason to keep an eye on it is that a full cache fails the
+pull for a *new* golden, breaking exactly the rollout you were attempting. Check with `just k8s-live-cache`. Deleting digest directories
 under `/app/.cache/husk/images/` by hand is still safe while running (a deleted
 digest is re-pulled on next resolve), but shouldn't be necessary.
 
