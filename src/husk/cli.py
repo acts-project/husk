@@ -438,6 +438,7 @@ def run(
             http_addr=shared.http_addr,
             ssh_targets=ssh_targets,
             advertise_addr=shared.advertise_addr or shared.http_addr,
+            advertise_scheme=shared.advertise_scheme,
             image_cache_dir=shared.image_cache_dir,
             metrics_state_path=shared.metrics_state_path,
         )
@@ -580,6 +581,7 @@ async def _serve(
     http_addr: str,
     ssh_targets: dict[tuple[str, str], str] | None = None,
     advertise_addr: str = "",
+    advertise_scheme: str = "http",
     image_cache_dir: str = "",
     metrics_state_path: str = "",
 ) -> None:
@@ -615,6 +617,7 @@ async def _serve(
         shutdown=stop,
         scraper=scraper,
         advertise_addr=advertise_addr,
+        advertise_scheme=advertise_scheme,
         storage_provider=state.storage,
         metrics=metrics,
         console_provider=state.console_output,

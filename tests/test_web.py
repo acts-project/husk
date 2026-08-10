@@ -202,6 +202,8 @@ def test_sd_targets_libvirt_points_back_at_huskd():
         scraper=_FakeScraper(),
         advertise_addr="huskd.internal:9100",
     )
+    # __scheme__ rides on the target even at its default, so the proxied half never
+    # depends on how the scrape job happens to be configured.
     assert _sd_get(app) == [
         {
             "targets": ["huskd.internal:9100"],
@@ -209,9 +211,40 @@ def test_sd_targets_libvirt_points_back_at_huskd():
                 "__metrics_path__": "/slot/pool-gpu/husk-g-1/metrics",
                 "backend": "pool-gpu",
                 "slot": "husk-g-1",
+                "__scheme__": "http",
             },
         }
     ]
+
+
+def test_sd_targets_proxied_carries_scheme_when_huskd_is_behind_tls():
+    # huskd behind an edge-terminating Route: Prometheus must speak https to the
+    # proxy hop. It cannot come from the scrape job, because the SAME job also
+    # gets direct plain-HTTP guest targets — so it has to ride on the target.
+    app = make_app(
+        lambda: [_libvirt_snap()],
+        scraper=_FakeScraper(),
+        advertise_addr="husk.app.cern.ch:443",
+        advertise_scheme="https",
+    )
+    assert _sd_get(app)[0]["labels"]["__scheme__"] == "https"
+
+
+def test_sd_targets_direct_never_carries_scheme():
+    # A guest's node_exporter is http and nothing else; tagging it with huskd's
+    # scheme would send Prometheus at TLS that isn't there.
+    snap = _snap_of(
+        (  # no host → OpenStack, routable, scraped directly
+            make_slot(name="husk-os-1", ip="10.0.0.5"),
+            make_runner(status="online"),
+            SlotState.IDLE,
+        ),
+        backend="pool-os",
+    )
+    app = make_app(
+        lambda: [snap], advertise_addr="husk.app.cern.ch:443", advertise_scheme="https"
+    )
+    assert "__scheme__" not in _sd_get(app)[0]["labels"]
 
 
 def test_sd_targets_libvirt_never_scraped_directly():

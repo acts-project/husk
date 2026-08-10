@@ -91,6 +91,7 @@ def make_app(
     shutdown: asyncio.Event | None = None,
     scraper: GuestScraper | None = None,
     advertise_addr: str = "",
+    advertise_scheme: str = "http",
     storage_provider: Callable[[], list[DiskUsage]] | None = None,
     metrics: Metrics | None = None,
     console_provider: Callable[[str, str], str | None] | None = None,
@@ -109,6 +110,11 @@ def make_app(
     node_exporter over the SSH channel huskd already holds to the host. Without it,
     libvirt slots are simply not published as metrics targets. (OpenStack guests are
     routable and are scraped directly — huskd is never in *their* data path.)
+
+    `advertise_scheme` is the scheme Prometheus must use for that address, emitted
+    as `__scheme__` on the proxied targets only: a direct OpenStack guest is always
+    plain-HTTP node_exporter, while huskd itself may sit behind TLS termination. One
+    scrape job has to serve both, which is only expressible per target.
 
     `advertise_addr` is where central Prometheus reaches THIS huskd — the address
     `/sd/targets` hands out for the proxied libvirt targets. Defaults to the
@@ -194,18 +200,20 @@ def make_app(
                         continue  # can't route to it → don't advertise a dead target
                     address = advertise_addr
                     path = f"/slot/{s.backend}/{v.name}/metrics"
+                    # Only the proxied half carries __scheme__: the direct half is
+                    # node_exporter, which is http and nothing else.
+                    scheme = advertise_scheme
                 else:  # OpenStack: routable guest → direct
                     address, path = f"{v.ip}:9100", "/metrics"
-                groups.append(
-                    {
-                        "targets": [address],
-                        "labels": {
-                            "__metrics_path__": path,
-                            "backend": s.backend,
-                            "slot": v.name,
-                        },
-                    }
-                )
+                    scheme = ""
+                labels = {
+                    "__metrics_path__": path,
+                    "backend": s.backend,
+                    "slot": v.name,
+                }
+                if scheme:
+                    labels["__scheme__"] = scheme
+                groups.append({"targets": [address], "labels": labels})
         return Response(json.dumps(groups), content_type="application/json")
 
     @app.get("/slot/<backend>/<slot>/metrics")

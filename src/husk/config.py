@@ -307,6 +307,15 @@ class ControllerConfig:
     # comes back through huskd). Empty → falls back to http_addr, which is right
     # unless huskd sits behind a NAT/ingress and is reached on a different address.
     advertise_addr: str = ""
+    # Scheme Prometheus must use to reach `advertise_addr` — emitted as
+    # `__scheme__` on the PROXIED targets only. It is a separate knob because
+    # `advertise_addr` is a host:port (it lands in `__address__`, which may not
+    # carry a scheme), and because the two halves of `/sd/targets` differ: an
+    # OpenStack guest is scraped directly on plain-HTTP node_exporter, while a
+    # libvirt guest comes back through huskd, which may sit behind TLS
+    # termination (an OpenShift edge Route, say). One scrape job therefore has to
+    # serve both schemes, which is only expressible per target.
+    advertise_scheme: str = "http"
     # Automatic cleanup of dead runner registrations. Each recycle can strand a
     # prior-cycle registration (see slot.orphaned_runners), and they accumulate
     # until something reaps them.
@@ -730,6 +739,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         http_addr: str = "127.0.0.1:9100"
         shrink_ticks: int = Field(3, ge=1)
         advertise_addr: str = ""
+        advertise_scheme: str = "http"
         image_cache_dir: str = ""
         # Literal, not a bool: a typo like "yes" must fail at load rather than
         # quietly reading as falsy and leaving orphans to pile up unnoticed.
@@ -749,6 +759,17 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         @classmethod
         def _advertise_addr_is_a_host_port(cls, v: str) -> str:
             return _check_addr("advertise_addr", v) if v.strip() else v
+
+        @field_validator("advertise_scheme")
+        @classmethod
+        def _advertise_scheme_is_http_or_https(cls, v: str) -> str:
+            s = v.strip().lower()
+            if s not in ("http", "https"):
+                raise ValueError(
+                    f"advertise_scheme {v!r} must be 'http' or 'https' — it becomes "
+                    "Prometheus's __scheme__ for the proxied targets"
+                )
+            return s
 
     class _Settings(BaseSettings):
         model_config = SettingsConfigDict(
@@ -823,6 +844,7 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         http_addr=s.controller.http_addr,
         shrink_ticks=s.controller.shrink_ticks,
         advertise_addr=s.controller.advertise_addr,
+        advertise_scheme=s.controller.advertise_scheme,
         image_cache_dir=s.controller.image_cache_dir,
         reap_runners=s.controller.reap_runners,
         metrics_state_path=s.controller.metrics_state_path,
