@@ -293,7 +293,11 @@ def test_state_codes_match_the_dashboard_value_mappings():
     mapping = panel["fieldConfig"]["defaults"]["mappings"][0]["options"]
 
     assert "husk_slot_state_code" in panel["targets"][0]["expr"]
-    assert {int(k) for k in mapping} == set(_STATE_CODE.values())
+    # Subset, not equality: the panel may map codes ABOVE the enum's range as
+    # overlays that win over the classified state (the deployed dashboard paints
+    # a slot husk cannot act on as `broken`, from husk_slot_failing_seconds).
+    # What must hold is that every state huskd can emit has a name in Grafana.
+    assert set(_STATE_CODE.values()) <= {int(k) for k in mapping}
 
 
 def test_live_fraction_is_still_published_for_the_dashboard():
