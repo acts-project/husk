@@ -1,19 +1,27 @@
 # libvirt VM-host setup (runbook)
 
 One-time prep to turn a GPU (or CPU-only) box into a husk libvirt VM-host. This is
-the **authoritative, live-validated** sequence (validated on `lenovo-gpu-acts`,
-Fedora 42, kernel 6.17, NVIDIA RTX 500 Ada). It is written to be mechanically
-translatable into an **Ansible role / Puppet module later** — each step notes
-whether it needs root and is idempotent. Automating it is **deferred** (see the
-project memory `deferred-ansible-host-provisioning`); do it by hand for now.
+the **authoritative, live-validated** sequence. Two hosts back it:
+
+| host | OS | validated |
+|---|---|---|
+| `lenovo-gpu-acts` | Fedora 42, kernel 6.17, NVIDIA RTX 500 Ada | steps 1–6 incl. **GPU passthrough** |
+| `acts-gpu-ci-1` | Ubuntu, libvirt 8.0.0, monolithic `libvirtd` | steps 1–4 + image staging + slot lifecycle; **no GPU yet** |
+
+Between them every step is covered, but **no single host has run the whole thing**
+— the Fedora box predates the `husk` service account (step 1b), and the Ubuntu box
+has not done vfio (step 5). Both gaps are called out where they occur.
+
+It is written to be mechanically translatable into an **Ansible playbook** — each
+step notes whether it needs root and is idempotent. See the project memory
+`deferred-ansible-host-provisioning` for the agreed scope (steps 1–4 only).
 
 > The VFIO/IOMMU groundwork (GPU isolated in its own IOMMU group, bound to
 > `vfio-pci`) was validated separately in `gpu-passthrough-poc-findings.md`.
 
-**Steps 1–6 below are Fedora/EL-specific.** For an Ubuntu or Debian host, work
+**Steps 1–6 below are written for Fedora/EL.** For an Ubuntu or Debian host, work
 through the same numbered steps but apply the deltas in
-[Ubuntu / Debian hosts](#ubuntu--debian-hosts-untested) — that path has **not**
-been validated on real hardware.
+[Ubuntu / Debian hosts](#ubuntu--debian-hosts).
 
 ## Host facts this assumes
 
@@ -46,6 +54,10 @@ sudo systemctl enable --now virtqemud.socket virtnetworkd.socket virtstoraged.so
 huskd logs in as its own unprivileged account — never a human's login. That keeps
 the credential rotatable without touching anyone's shell access, and keeps the
 audit trail on the host readable.
+
+> **Not yet re-verified on Fedora.** The `lenovo-gpu-acts` validation predates this
+> step — it ran as a personal login. Steps 1 and 3–6 are unaffected, but this step
+> and the step-2 rule now naming `husk` have only been exercised on Ubuntu.
 
 ```bash
 sudo useradd -m -s /bin/bash husk
@@ -156,25 +168,38 @@ lspci -nnk -d 10de:    # want: "Kernel driver in use: vfio-pci"
 A **CPU-only host** skips this entirely and declares `max_slots` instead of
 `gpu_pci_addresses`.
 
-## 6. Golden image (GPU hosts)
+## 6. Golden image — **no longer a host-setup step**
 
-Build it on the host (needs `guestfs-tools` from step 1):
+**Do not build an image on the host.** huskd delivers goldens itself: set
+`image_ref` on the pool (e.g. `ghcr.io/acts-project/husk-base:v8`) and it pulls
+that OCI artifact once into a controller-local cache keyed by the qcow2's layer
+digest (`image_sync.py`), then `scp`s it into every host's pool dir under a
+digest-derived name and GCs superseded ones (`libvirt_backend.sync_images`,
+`_gc_goldens`). **Hosts need no registry client and no credentials.** Changing
+`image_ref` and restarting huskd stages the new image and drains idle slots onto
+it; running jobs finish first.
 
-```bash
-scripts/build-golden-image.sh        # → /var/lib/libvirt/images/husk/husk-gpu-golden.qcow2
-```
+`scripts/build-golden-image.sh` survives for building images by hand, and
+`image_name` still names a qcow2 you placed yourself — but neither is part of
+standing up a host, and on a **non-SELinux host the local build is actively
+wrong** (see the Ubuntu step 6 note). CI builds both variants:
+`.github/workflows/build-images.yml` → `image-pipeline.md`.
+
+What you *do* need before the first boot test: **one qcow2 in the pool dir** for
+`scripts/smoke_libvirt.py`, which takes a plain filename (`HUSK_SMOKE_IMAGE`), not
+an `image_ref`. A stock AlmaLinux 10 GenericCloud image works as the backing file —
+no golden required for the CPU path.
+
+### GPU note (Stage 1, not host setup)
 
 CDI is generated at **first boot**, not in the image (the driver must load against
 a present GPU). Validate by hand-booting a throwaway VM with the GPU `<hostdev>`
-before pointing huskd at it (plan Stage 1):
+before pointing huskd at it:
 
 ```
 nvidia-smi                                                   # in the guest
 podman run --rm --device nvidia.com/gpu=all <cuda-img> nvidia-smi
 ```
-
-For a quick **CPU-path** smoke test you don't need the golden image — a stock
-AlmaLinux 10 GenericCloud qcow2 in the pool works as the backing image.
 
 ### Debugging a guest's boot / cloud-init
 
@@ -215,22 +240,35 @@ virsh -c qemu+ssh://husk@HOST/system list                      # libvirt RW over
 
 ## Verification checklist (Stage 0 "done")
 
+Run these **from the control machine, over SSH** — not as `sudo virsh` on the host.
+Every failure mode steps 1–4 can leave behind (polkit/group, pool-dir ownership)
+appears only on a *headless remote* connection; a local root shell proves nothing.
+
 ```bash
 # from the control machine:
+ssh husk@HOST id -nG                                           # group took effect
 virsh -c qemu+ssh://husk@HOST/system list --all                # RW, no polkit error
 virsh -c qemu+ssh://husk@HOST/system pool-info husk            # active, autostart
 virsh -c qemu+ssh://husk@HOST/system net-info default          # active, autostart
 ssh husk@HOST 'touch /var/lib/libvirt/images/husk/.w && rm /var/lib/libvirt/images/husk/.w && echo writable'
+ssh husk@HOST 'command -v qemu-img genisoimage curl'           # what the backend shells out to
 ```
 
-## Ubuntu / Debian hosts (untested)
+> If the private key lives outside `~/.ssh` (e.g. this repo's `secrets/id_ed25519`),
+> plain `ssh husk@HOST` will not find it and the first `virsh -c qemu+ssh://` fails
+> as an auth error that looks like a polkit or group problem. Give it an
+> `~/.ssh/config` alias with `IdentityFile` + `IdentitiesOnly yes` before running
+> any of the above — libvirt's ssh transport reads the same config.
 
-> **Status: not validated.** Every host husk has run on is Fedora. This section is
-> derived from the Fedora runbook plus known Debian-family differences; treat each
-> step as a hypothesis to confirm, and fold corrections back in once a real Ubuntu
-> host is stood up. The **verification checklist above is the actual acceptance
-> test** and is distro-independent — if all four commands pass, the host is good
-> regardless of how you got there.
+## Ubuntu / Debian hosts
+
+> **Status: live-validated** on `acts-gpu-ci-1` (Ubuntu, libvirt 8.0.0, monolithic
+> `libvirtd`) — steps 1–4 by hand, then `scripts/smoke_libvirt.py` green end to end:
+> golden staged from `ghcr.io/acts-project/husk-base:v8` through the real delivery
+> path (oras pull → controller cache → scp), slot created, metadata round-tripped,
+> domain stayed RUNNING, destroyed and cleaned up. **Step 5 (vfio/GPU) is still
+> untested here** — that box's GPU is in use by GitLab CI and the cutover is
+> deliberately deferred.
 
 Nothing in huskd itself is distro-aware. The backend only needs `qemu-img`,
 `genisoimage` **or** `mkisofs`, and `rm` to be on `PATH` for the `husk` user
@@ -258,10 +296,9 @@ generates is deliberately plain — BIOS boot with no `<loader>`/`<nvram>` (so O
 is never needed), `q35`, virtio disk/net/balloon, a SATA cdrom for the seed. Its
 newest requirement is `<cpu check='none'>`, libvirt **3.2** (2017).
 
-> **Data point (unvalidated):** the first Ubuntu host husk targets reports libvirt
-> **8.0.0** with the **monolithic** `libvirtd`. That clears both bars — helper
-> present, XML features trivially satisfied — so no version-driven deviation is
-> needed there.
+> **Confirmed on the first Ubuntu host:** libvirt **8.0.0**, **monolithic**
+> `libvirtd`, and `virt-ssh-helper` **present**. Step 0 passes there — no
+> `netcat-openbsd`, no version-driven deviation.
 
 ### Step 1 — packages
 
@@ -286,15 +323,38 @@ accepts either. The emulator path is **hardcoded** to `/usr/bin/qemu-system-x86_
 `qemu-system-x86` puts it, so there is nothing to do, but a host that keeps qemu
 elsewhere would need a code change rather than a config one.
 
-### Step 2 — read-write access: **group, not polkit**
+### Step 2 — read-write access: **group, not polkit** (confirmed)
 
-This is the single biggest divergence. On Fedora the socket is world-writable and
-polkit is the lever; on Debian-family the socket is `0770 root:libvirt`
-(`unix_sock_group = "libvirt"`), so **group membership is the lever** and the
-Fedora "no polkit agent available" symptom typically never appears:
+This is the single biggest divergence, and the mechanism is now measured rather
+than assumed. On `acts-gpu-ci-1` (Ubuntu, libvirt 8.0.0):
+
+```
+/etc/libvirt/libvirtd.conf:179:  auth_unix_rw = "none"
+/usr/share/polkit-1/rules.d/60-libvirt.rules:
+    action.id == "org.libvirt.unix.manage" && subject.isInGroup("libvirt") -> YES
+```
+
+`auth_unix_rw = "none"` means libvirtd **does not consult polkit at all** for the
+unix socket — whoever can open it gets read-write. Access is therefore gated purely
+by the socket's group, so the shipped `60-libvirt.rules` is inert on this host. It
+is a useful backstop rather than dead weight: it grants by *group membership* with
+`Result.YES`, which needs no agent, so it would still work headless if someone set
+`auth_unix_rw = "polkit"`. Either way, one thing does it:
 
 ```bash
 sudo usermod -aG libvirt husk
+```
+
+**Do not add the step-2 polkit rule on Debian-family** — it is redundant under
+both settings.
+
+`unix_sock_group` is *commented out* in `libvirtd.conf`; the socket's group comes
+from the systemd socket unit instead. Worth reading rather than assuming if RW
+fails:
+
+```bash
+ls -l /run/libvirt/libvirt-sock
+systemctl cat libvirtd.socket | grep -iE 'SocketMode|SocketGroup'
 ```
 
 A **new** SSH session picks the group up — no reboot, but existing connections
@@ -305,9 +365,12 @@ machine:
 ssh husk@HOST id -nG          # must list: libvirt
 ```
 
-The polkit rule from step 2 is still valid and harmless to add as a belt-and-braces
-measure, but do not treat its absence as the fault when RW fails here — check group
-membership and the socket's mode/ownership first (`ls -l /run/libvirt/*-sock`).
+> **Security consequence of `auth_unix_rw = "none"`:** the `libvirt` group *is* the
+> privilege boundary — membership means full control of every VM on the host, with
+> no further authentication. Fine for `husk` on a dedicated box; a reason not to add
+> human logins to that group casually. Note this is precisely the setting the Fedora
+> step 2 fallback offers as a coarse workaround, cautioning it suits only a
+> single-tenant host. On Debian-family it is simply the default.
 
 ### Steps 3–4 — pool and network
 
@@ -353,15 +416,25 @@ modules inside the runner image); `vfio-pci` ships signed with the distro kernel
 ### AppArmor replaces SELinux
 
 Ubuntu confines qemu with AppArmor (`security_driver` in `/etc/libvirt/qemu.conf`).
-`virt-aa-helper` generates a per-domain profile and adds each disk path from the
-domain XML, so overlays and seed ISOs under a non-default pool dir are expected to
-work unmodified. If a domain fails to start with a permission error, check
-`dmesg | grep DENIED` / `journalctl -b -u apparmor` before suspecting libvirt, and
-add the pool dir to `/etc/apparmor.d/local/abstractions/libvirt-qemu`.
+**Nothing had to be done for it** — a slot booted on `acts-gpu-ci-1` with no profile
+edits at all: `virt-aa-helper` builds a per-domain profile from the domain XML and
+grants each disk path, including the **backing chain** (the overlay's golden) and
+the seed ISO, wherever they live.
 
-The deferred file-backed serial console (`console_log_path`) is blocked here too,
-just by AppArmor rather than SELinux relabeling — same workaround shape, different
-mechanism.
+This was the section's biggest open question and the answer is "not a problem." It
+is worth being clear *why*, since the earlier framing here tied the risk to the pool
+dir being owned by `husk`: AppArmor is **path**-based, so DAC ownership is
+irrelevant to it, and the paths are granted per domain rather than by a static rule
+over the pool dir.
+
+If a domain ever does fail to start with a permission error, `dmesg | grep DENIED`
+is the first stop and `/etc/apparmor.d/libvirt/libvirt-<uuid>.files` is the decisive
+one — it lists exactly what `virt-aa-helper` granted. The fix would be a line in
+`/etc/apparmor.d/local/abstractions/libvirt-qemu` plus `systemctl reload apparmor`.
+
+The deferred file-backed serial console (`console_log_path`) is a separate matter
+and remains untested here: it is blocked on Fedora by SELinux relabeling, and would
+be AppArmor's business on Ubuntu.
 
 ### Step 6 — building the golden image on an Ubuntu host
 
@@ -386,32 +459,36 @@ ls -l /dev/kvm                       # absent ⇒ TCG emulation, very slow
 |---|---|---|
 | 0 transport | n/a (`virt-ssh-helper` present) | check libvirt ≥ 6.9, else `netcat-openbsd` |
 | 1 packages | `dnf`, `virtqemud.socket` | `apt`, `libvirt-daemon-system` (auto-enables), `genisoimage` |
-| 2 RW access | **polkit rule** (socket world-writable) | **`libvirt` group** (socket `0770 root:libvirt`) |
+| 2 RW access | **polkit rule** (socket world-writable) | **`libvirt` group** (`auth_unix_rw = "none"`; do NOT add the polkit rule) |
 | 3 pool | qemu runs as `qemu:qemu` | qemu runs as `libvirt-qemu:kvm` |
 | 4 network | `default` NAT | same; watch for a system `dnsmasq` on `:53` |
 | 5 vfio | kernel cmdline + `dracut` | `/etc/default/grub` + `update-grub` + `update-initramfs` |
-| — MAC | SELinux (relabel, `.autorelabel`) | AppArmor (`virt-aa-helper`, `DENIED` in dmesg) |
+| — MAC | SELinux (relabel, `.autorelabel`) | AppArmor — **nothing to do**; `virt-aa-helper` grants per domain |
 | 6 image | builds cleanly | SELinux relabel unreliable; 0600 kernel — prefer the CI image |
 
-## Automation notes (for the future Ansible role / Puppet module)
+## Automation notes (for the Ansible playbook)
 
 Map of steps → tasks, with the root/idempotency notes that matter for automation:
 
 | Step | Ansible-ish | Root | Idempotent | Gotcha |
 |---|---|---|---|---|
-| 1 packages | `dnf`, `systemd` | yes | yes | enable the **modular** `.socket` units, not `libvirtd` |
-| 2 polkit rule | `copy`/`template` of `50-husk-libvirt.rules` | yes | yes | this — not group membership — is the RW lever for headless SSH |
+| 1 packages | `ansible.builtin.package`, `systemd_service` | yes | yes | Fedora: enable the **modular** `.socket` units. Debian: `libvirt-daemon-system` self-enables. `python3-libvirt` is needed for the `virt_*` modules below |
+| 1b account | `ansible.builtin.user` + `ansible.posix.authorized_key` | yes | yes | omit `password` (leaves `!` = no password auth); a real shell, no sudo; `authorized_key` is idempotent by key content |
+| 2 RW access | Fedora: `copy` of `50-husk-libvirt.rules`. Debian: `groups: libvirt` on the user | yes | yes | **the lever differs by family** — polkit on Fedora, socket group on Debian (`auth_unix_rw = "none"`). Do NOT ship the polkit rule to Debian |
 | 3 pool | `community.libvirt.virt_pool` + `file` (owner) | yes | yes | **chown the target dir to the `husk` user** after build |
 | 4 network | `community.libvirt.virt_net` | yes | yes | start + autostart the built-in `default` |
 | 5 vfio | kernel cmdline + `modprobe.d` + dracut | yes | needs reboot | out of scope of the libvirt role; pairs with host provisioning |
-| 6 golden image | `command: build-golden-image.sh creates=…` | no¹ | via `creates=` | long-running; driver/kernel is the risk (see findings) |
+| 6 golden image | **nothing — out of scope** | — | — | huskd syncs goldens itself from `image_ref`; hosts need no registry access |
 | 7 control machine | not host-side | n/a | — | `PKG_CONFIG_PATH` for `libvirt-python` on macOS |
 
-¹ runs as the `husk` user but needs `guestfs-tools` installed (step 1).
+`guestfs-tools` is only needed if you build an image on the host by hand — the
+standing path never does, so a role may reasonably drop it from step 1.
 
 The SSH user (`husk` here), pool path, and `gpu_pci_addresses` are the obvious role variables.
 
-If the role ever has to cover both families, steps 1, 2 and 5 are the ones that
-need `ansible_os_family` branches (package names + unit, group-vs-polkit,
-`update-initramfs`-vs-`dracut`); 3, 4 and 7 are already portable. See
-[Ubuntu / Debian hosts](#ubuntu--debian-hosts-untested).
+Steps 1, 2 and 5 need `ansible_os_family` branches (package names + unit,
+group-vs-polkit, `update-initramfs`-vs-`dracut`); 1b, 3, 4 and 7 are portable as-is.
+The playbook connects as a **privileged admin login, never as `husk`** — that
+account has no password and no sudo, so it is the playbook's output, not its
+credential. See
+[Ubuntu / Debian hosts](#ubuntu--debian-hosts).
