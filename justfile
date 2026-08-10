@@ -151,6 +151,7 @@ k8s-init:
     echo "  secrets/clouds.yaml       openstacksdk profile (or: just k8s-secrets clouds=~/.config/openstack/clouds.yaml)"
     echo "  secrets/id_ed25519        libvirt-host SSH key   (OPTIONAL: libvirt pools only)"
     echo "  secrets/known_hosts       ssh-keyscan -t ed25519 HOST >> secrets/known_hosts"
+    echo "  secrets/ssh_config        OPTIONAL override; k8s-secrets ships a sane default"
     echo "Then: just k8s-secrets"
 
 # Reads from the gitignored secrets/ dir. Re-run to rotate: the create|apply pipe
@@ -262,17 +263,44 @@ k8s-secrets env="local" pem="secrets/private-key.pem" clouds="":
             echo "$ssh_key is passphrase-protected; BatchMode ssh cannot unlock it" >&2
             exit 1
         fi
-        # Secret KEYS are fixed: id_ed25519 is a DEFAULT ssh identity filename, so
-        # nothing in the pod needs an IdentityFile directive for it to be found.
+        # An ssh_config always ships, because one of its settings is not optional
+        # in this environment: OpenSSH defaults UpdateHostKeys to yes, so after
+        # authenticating it tries to APPEND the server's other host-key types to
+        # known_hosts — and that file is a read-only Secret mount. The connection
+        # succeeds, but every ssh the pod makes (libvirt's qemu+ssh transport,
+        # libvirt_backend._ssh, each guest_scrape master) then emits
+        #   hostfile_replace_entries: mkstemp: Read-only file system
+        # on stderr, which reads like a failure in logs and is pure noise.
+        #
+        # Mounting it into the same Secret is what makes it reach all three: they
+        # are separate processes with nothing in common except $HOME/.ssh.
+        # Drop a secrets/ssh_config to override this default wholesale.
+        ssh_cfg="secrets/ssh_config"
+        tmp_cfg=""
+        if [ ! -f "$ssh_cfg" ]; then
+            tmp_cfg="$(mktemp)"
+            trap 'rm -f "$tmp_cfg"' EXIT
+            # printf, not a heredoc: a recipe line at column 0 ENDS the recipe body
+            # (just then parses the heredoc as justfile items and errors), and
+            # `<<-` strips only tabs, not the spaces this file indents with.
+            printf 'Host *\n    UpdateHostKeys no\n    StrictHostKeyChecking yes\n    UserKnownHostsFile /app/.ssh/known_hosts\n    IdentitiesOnly yes\n    IdentityFile /app/.ssh/id_ed25519\n' > "$tmp_cfg"
+            ssh_cfg="$tmp_cfg"
+        fi
+        # Secret KEYS are fixed: id_ed25519 is a DEFAULT ssh identity filename and
+        # `config` is where ssh looks, both relative to $HOME/.ssh (image pins
+        # HOME=/app). ssh accepts a root-owned 0440 config — it rejects only files
+        # that are neither root- nor self-owned, or that are group/world WRITABLE.
         kubectl create secret generic huskd-ssh \
             --from-file=id_ed25519="$ssh_key" \
             --from-file=known_hosts="$ssh_known" \
+            --from-file=config="$ssh_cfg" \
             -n {{k8s_namespace}} --dry-run=client -o yaml | kubectl apply -f -
         # Count real entries, not lines: a known_hosts of nothing but comments is
         # exactly the placeholder state, and reporting "2 entries" for it would
         # hide the one thing this line exists to show.
         n_hosts="$(grep -cvE '^[[:space:]]*(#|$)' "$ssh_known" || true)"
-        echo "secret huskd-ssh is in namespace {{k8s_namespace}} ($n_hosts known_hosts entries)"
+        cfg_src="default"; [ -z "$tmp_cfg" ] && cfg_src="secrets/ssh_config"
+        echo "secret huskd-ssh is in namespace {{k8s_namespace}} ($n_hosts known_hosts entries, ssh_config: $cfg_src)"
         if [ "$n_hosts" -eq 0 ]; then
             echo "warning: $ssh_known has no host keys — every ssh from the pod will fail." >&2
             echo "         ssh-keyscan -t ed25519 HOST >> $ssh_known && just k8s-secrets {{env}}" >&2
