@@ -84,6 +84,26 @@ def test_failed_op_restarts_only_after_cooldown():
     assert calls == [1, 1]
 
 
+def test_retry_progress_carries_the_real_error():
+    # Without retry_max_wait_s=0 tenacity's exponential backoff would actually
+    # sleep between attempts, even though spawn runs the worker inline.
+    store = _inline(retry_giveup_s=60, retry_max_wait_s=0)
+    seen_progress = []
+
+    def fn(report):
+        seen_progress.append(store.view("k").progress)
+        if len(seen_progress) == 1:
+            raise RuntimeError("connection refused")
+        return "ok"
+
+    view = store.submit("k", "demo", fn)
+    assert view.state == DONE
+    assert seen_progress[0] is None  # nothing to report before the first attempt
+    # the second attempt's progress (read before fn ran) carries the first
+    # attempt's real exception, not a content-free "retrying" placeholder
+    assert "connection refused" in seen_progress[1]
+
+
 def test_opabort_is_not_retried():
     # Even with a generous giveup window, an OpAbort fails immediately (no retry).
     store = OpStore(spawn=lambda fn: fn(), retry_giveup_s=600)

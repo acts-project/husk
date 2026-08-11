@@ -223,7 +223,14 @@ class OpStore:
 
     def _with_retry(self, op: _Op, fn: OpFn, report: Callable[[str], None]) -> Any:
         """Run `fn` under tenacity: transient errors back off and retry in-worker
-        (op stays PENDING); an `OpAbort` or the give-up deadline propagates → FAILED."""
+        (op stays PENDING); an `OpAbort` or the give-up deadline propagates → FAILED.
+
+        `last_exc` carries each attempt's real exception into the *next* attempt's
+        progress report — the op stays PENDING for up to `_RETRY_GIVEUP_S`, and
+        without this the dashboard/logs show only a content-free "retrying" line
+        for that whole window, with the actual cause visible nowhere until (if)
+        the op eventually gives up and FAILs."""
+        last_exc: BaseException | None = None
         for attempt in Retrying(
             retry=retry_if_not_exception_type(OpAbort),
             wait=wait_random_exponential(multiplier=1, max=self._retry_max_wait),
@@ -235,9 +242,18 @@ class OpStore:
                     op.attempts += 1
                     op.updated_at = self._now()
                     n = op.attempts
-                if n > 1:
-                    report(f"retrying (attempt {n}) after error")
-                return fn(report)
+                if last_exc is not None:
+                    report(
+                        f"retrying (attempt {n}) after "
+                        f"{type(last_exc).__name__}: {last_exc}"
+                    )
+                try:
+                    return fn(report)
+                except OpAbort:
+                    raise
+                except Exception as e:
+                    last_exc = e
+                    raise
 
     def _view(self, op: _Op) -> OpView:
         return OpView(
