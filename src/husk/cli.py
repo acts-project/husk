@@ -1059,70 +1059,75 @@ def recycle(
     from husk.discovery import discover_targets
     from husk.github import GitHubClient
 
-    tokens = _tokens(cfgs[0])
-    # Discovered once and reused across pools: recycle is target-agnostic (it acts
-    # on slots), and the targets only matter for best-effort busy detection.
-    try:
-        targets = asyncio.run(discover_targets(tokens, [c.target for c in cfgs]))
-    except Exception as e:
-        typer.echo(f"target discovery failed: {e}", err=True)
-        raise typer.Exit(code=1)
-    total_acted, any_unknown, any_err = 0, False, False
-    for cfg in pools:
-        backend = _backend_for(cfg)
-        # A pool's slots are always minted against the one target it serves, so
-        # busy detection needs exactly that target's runner listing.
-        githubs = (
-            [
-                GitHubClient(
-                    target=cfg.target,
-                    tokens=tokens,
-                    labels=cfg.runner.labels,
-                    runner_group=cfg.runner.runner_group,
-                )
-            ]
-            if cfg.target in targets
-            else []  # not servable → skip the listing, recycle on slots alone
-        )
-        if multi:
-            typer.echo(f"── {cfg.backend.name} ──")
-
-        async def go(backend=backend, githubs=githubs):
-            try:
-                return await _recycle(
-                    backend,
-                    githubs,
-                    names=names or [],
-                    all_slots=all_slots,
-                    force=force,
-                    dry_run=dry_run,
-                )
-            finally:
-                for gh in githubs:
-                    await gh.aclose()
-
+    # Every await lives in ONE event loop: the token provider's httpx connections
+    # are bound to the loop that opened them, so closing them from a second
+    # `asyncio.run` would fail with "Event loop is closed".
+    async def main() -> tuple[int, bool, bool]:
+        tokens = _tokens(cfgs[0])
         try:
-            acted, skipped, unknown = asyncio.run(go())
-        except Exception as e:
-            # One pool failing (e.g. a wedged libvirt host) must not abort the
-            # rest of a fleet-wide recycle; report and keep going.
-            typer.echo(f"recycle failed for {cfg.backend.name}: {e}", err=True)
-            any_err = True
-            continue
+            # Discovered once and reused across pools: recycle is target-agnostic
+            # (it acts on slots), and the targets only matter for best-effort busy
+            # detection.
+            try:
+                targets = await discover_targets(tokens, [c.target for c in cfgs])
+            except Exception as e:
+                typer.echo(f"target discovery failed: {e}", err=True)
+                raise typer.Exit(code=1)
+            total_acted, any_unknown, any_err = 0, False, False
+            for cfg in pools:
+                backend = _backend_for(cfg)
+                # A pool's slots are always minted against the one target it
+                # serves, so busy detection needs exactly that target's listing.
+                githubs = (
+                    [
+                        GitHubClient(
+                            target=cfg.target,
+                            tokens=tokens,
+                            labels=cfg.runner.labels,
+                            runner_group=cfg.runner.runner_group,
+                        )
+                    ]
+                    if cfg.target in targets
+                    else []  # not servable → skip listing, recycle on slots alone
+                )
+                if multi:
+                    typer.echo(f"── {cfg.backend.name} ──")
 
-        verb = "would recycle" if dry_run else "recycling"
-        for s in acted:
-            typer.echo(f"{verb}: {s.name} ({s.id}) cycle={s.cycle}")
-        for s, why in skipped:
-            typer.echo(f"skipped {s.name} ({s.id}): {why}", err=True)
-        for tok in unknown:
-            typer.echo(f"not found (managed-by=husk): {tok}", err=True)
-        if not acted and not skipped and not unknown:
-            typer.echo("no matching slots")
-        total_acted += len(acted)
-        any_unknown = any_unknown or bool(unknown)
+                try:
+                    acted, skipped, unknown = await _recycle(
+                        backend,
+                        githubs,
+                        names=names or [],
+                        all_slots=all_slots,
+                        force=force,
+                        dry_run=dry_run,
+                    )
+                except Exception as e:
+                    # One pool failing (e.g. a wedged libvirt host) must not abort
+                    # the rest of a fleet-wide recycle; report and keep going.
+                    typer.echo(f"recycle failed for {cfg.backend.name}: {e}", err=True)
+                    any_err = True
+                    continue
+                finally:
+                    for gh in githubs:
+                        await gh.aclose()
 
-    asyncio.run(tokens.aclose())
+                verb = "would recycle" if dry_run else "recycling"
+                for s in acted:
+                    typer.echo(f"{verb}: {s.name} ({s.id}) cycle={s.cycle}")
+                for s, why in skipped:
+                    typer.echo(f"skipped {s.name} ({s.id}): {why}", err=True)
+                for tok in unknown:
+                    typer.echo(f"not found (managed-by=husk): {tok}", err=True)
+                if not acted and not skipped and not unknown:
+                    typer.echo("no matching slots")
+                total_acted += len(acted)
+                any_unknown = any_unknown or bool(unknown)
+            return total_acted, any_unknown, any_err
+        finally:
+            await tokens.aclose()
+
+    total_acted, any_unknown, any_err = asyncio.run(main())
 
     if total_acted and not dry_run:
         typer.echo(

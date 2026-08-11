@@ -26,12 +26,18 @@ class _NullTokens:
     than reading them from config — the allowlist alone can't tell it which orgs
     the App is actually installed on."""
 
+    def __init__(self) -> None:
+        #: every event loop this provider was awaited in — see the one-loop test
+        self.loops: set = set()
+
     async def installations(self, *, refresh: bool = False) -> list[dict]:
+        self.loops.add(asyncio.get_running_loop())
         return [
             {"id": 11, "account": {"login": "acts-project", "type": "Organization"}}
         ]
 
-    async def aclose(self) -> None: ...
+    async def aclose(self) -> None:
+        self.loops.add(asyncio.get_running_loop())
 
 
 def _names(slots):
@@ -122,6 +128,19 @@ def test_one_pool_failure_does_not_abort_the_others(tmp_path, monkeypatch):
     assert result.exit_code == 1  # surfaced as failure...
     assert "recycle failed for openstack-cpu" in result.output
     assert backends["libvirt-gpu"].ops() == ["stop"]  # ...but the healthy pool ran
+
+
+def test_whole_command_runs_in_one_event_loop(tmp_path, monkeypatch):
+    """The token provider's httpx connections belong to the loop that opened them,
+    so discovery, every pool, and the final aclose must share one loop. Spreading
+    them over separate `asyncio.run` calls closed the sockets from a dead loop —
+    "RuntimeError: Event loop is closed" after the slots had already been stopped."""
+    cfg, backends = _two_pool_cli(tmp_path, monkeypatch)
+    tokens = _NullTokens()
+    monkeypatch.setattr("husk.cli._tokens", lambda c: tokens)
+    result = _cli.invoke(huskctl_app, ["recycle", "--all", "-c", cfg])
+    assert result.exit_code == 0, result.output
+    assert len(tokens.loops) == 1, "recycle awaited the token provider in >1 loop"
 
 
 def test_named_slot_still_needs_pool_when_multipool(tmp_path, monkeypatch):
