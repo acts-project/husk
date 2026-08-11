@@ -19,9 +19,11 @@ step notes whether it needs root and is idempotent. See the project memory
 > The VFIO/IOMMU groundwork (GPU isolated in its own IOMMU group, bound to
 > `vfio-pci`) was validated separately in `gpu-passthrough-poc-findings.md`.
 
-**Steps 1–6 below are written for Fedora/EL.** For an Ubuntu or Debian host, work
+**Steps 1–6 below are written for Fedora.** For an Ubuntu or Debian host, work
 through the same numbered steps but apply the deltas in
-[Ubuntu / Debian hosts](#ubuntu--debian-hosts).
+[Ubuntu / Debian hosts](#ubuntu--debian-hosts). For an EL9-family host (RHEL/CentOS
+Stream/Rocky/Alma), the packaging is close to Fedora's but **not** identical — see
+the callout under step 1.
 
 ## Host facts this assumes
 
@@ -48,6 +50,19 @@ sudo systemctl enable --now virtqemud.socket virtnetworkd.socket virtstoraged.so
 `guestfs-tools` provides `virt-customize` (used to build the golden image in
 `build-golden-image.sh`). The backend's seed-ISO step auto-selects whichever of
 `genisoimage`/`mkisofs` is present.
+
+> **EL9-family diverges on the emulator binary path (confirmed on AlmaLinux 9)** —
+> nothing to do on the host, huskd handles it. Fedora's `qemu-kvm` install pulls in
+> `qemu-system-x86`, which puts the binary at `/usr/bin/qemu-system-x86_64`.
+> RHEL/CentOS Stream/Rocky/Alma's `qemu-kvm` ships no `/usr/bin` entry at all
+> (`rpm -ql qemu-kvm-core` is empty for `bin`); the binary lives only at
+> `/usr/libexec/qemu-kvm`. `LibvirtBackend` probes each host once for a known
+> binary path (`_EMULATOR_CANDIDATES` in `libvirt_backend.py`) and writes whichever
+> one exists into the domain XML, so this is transparent as of that change. If you
+> see `libvirt.libvirtError: Cannot check QEMU binary ... No such file or
+> directory` on an older huskd, that's this issue — upgrade rather than
+> symlinking, so the fix travels with the code instead of being a manual step per
+> host.
 
 ## 1b. The `husk` service account (root)
 

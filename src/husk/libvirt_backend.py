@@ -62,6 +62,11 @@ _PROGRESS_INTERVAL_S = 30  # how often to log golden-transfer progress (MiB/%)
 # blocking the reconcile loop forever; it needs the event loop (below) running.
 _KEEPALIVE_INTERVAL_S = 5
 _KEEPALIVE_COUNT = 3
+# Known qemu binary locations, tried in order. Fedora's qemu-kvm pulls in
+# qemu-system-x86 (DEFAULT_EMULATOR); EL9-family (RHEL/CentOS Stream/Rocky/Alma)
+# ships no /usr/bin entry at all, only /usr/libexec/qemu-kvm. Absolute paths
+# only — libexec is usually not on $PATH, so `command -v` can't find it.
+_EMULATOR_CANDIDATES = (lx.DEFAULT_EMULATOR, "/usr/libexec/qemu-kvm")
 
 try:  # optional extra: pip install husk[libvirt]
     import libvirt
@@ -104,6 +109,7 @@ class _HostConn:
         self.units = lx.host_units(list(cfg.gpu_pci_addresses), cfg.max_slots or 1)
         self._conn = None
         self._pool_dir: str | None = None
+        self.emulator: str | None = None  # resolved lazily; see _resolve_emulator
 
     def conn(self):
         """Open (or reopen a dropped) libvirt connection."""
@@ -259,6 +265,30 @@ class LibvirtBackend:
                 f"{r.stderr.decode(errors='replace')[:300]}"
             )
         return r.stdout
+
+    def _resolve_emulator(self, host: _HostConn) -> str:
+        """The host's qemu binary path, probed once and cached on `host.emulator`.
+
+        Domain XML names the emulator by absolute path with no libvirt-side
+        fallback, and distros disagree on where it lives (see
+        `_EMULATOR_CANDIDATES`). Falls back to `lx.DEFAULT_EMULATOR` (with a
+        warning) if none of the candidates exist — matches the old hardcoded
+        behavior rather than leaving the domain unbootable outright."""
+        if host.emulator is None:
+            test = " || ".join(
+                f"test -x {shlex.quote(p)} && echo {shlex.quote(p)}"
+                for p in _EMULATOR_CANDIDATES
+            )
+            found = self._ssh(host, f"{test} || true").decode().strip()
+            if not found:
+                log.warning(
+                    "host %s: no known qemu binary among %s; falling back to %s",
+                    host.cfg.name,
+                    _EMULATOR_CANDIDATES,
+                    lx.DEFAULT_EMULATOR,
+                )
+            host.emulator = found or lx.DEFAULT_EMULATOR
+        return host.emulator
 
     def _make_overlay(self, host: _HostConn, name: str) -> str:
         overlay = f"{host.pool_dir()}/{name}.qcow2"
@@ -835,6 +865,7 @@ class LibvirtBackend:
             seed_path=seed,
             network=host.cfg.network,
             metadata=meta,
+            emulator=self._resolve_emulator(host),
             gpu_pci_address=unit if lx.is_gpu_unit(unit) else None,
             # console_log_path intentionally unset → interactive pty console.
             # A file-backed serial log (domain_xml supports it) needs the qemu

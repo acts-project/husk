@@ -27,7 +27,11 @@ DOM_PMSUSPENDED = 7
 HUSK_NS = "https://husk.cern/xmlns/slot/1"
 MANAGED_BY = "husk"
 
-# Default emulator path on EL/Fedora hosts. Overridable per host later if needed.
+# Last-resort emulator path, used only if a host doesn't resolve one of its own.
+# `LibvirtBackend` normally probes each host once (see `_EMULATOR_CANDIDATES` in
+# libvirt_backend.py) and passes the result in as `domain_xml(emulator=...)` —
+# Fedora and EL9-family (RHEL/CentOS Stream/Rocky/Alma) ship the qemu binary at
+# different paths.
 DEFAULT_EMULATOR = "/usr/bin/qemu-system-x86_64"
 
 
