@@ -361,6 +361,17 @@ k8s-local: _local-only (k8s-validate "local") k8s-build
     kubectl rollout restart deployment/huskd -n {{k8s_namespace}}
     just k8s-wait
 
+# k8s-secrets rotates Secret *content* in place under a static name (huskd-github,
+# huskd-openstack, huskd-ssh) — unlike the ConfigMap (kustomize-hashed, so a config
+# change gets a new name and triggers a rollout on its own), the Deployment spec
+# never changes, so k8s has no reason to restart pods. Run this after any
+# `k8s-secrets` call to pick the new values up. Works against whichever cluster
+# `kubectl`/`oc` is currently pointed at (same as k8s-secrets itself).
+# Force pods to pick up rotated Secret content.
+k8s-restart:
+    kubectl rollout restart deployment/huskd -n {{k8s_namespace}}
+    just k8s-wait
+
 # `kubectl rollout status` only ever prints "waiting for rollout to finish" — it
 # cannot distinguish "still pulling a 2 GB golden" from "this pod will NEVER
 # start", so a config error looks identical to slow progress until the timeout

@@ -66,6 +66,17 @@ and `clouds.yaml` mounts at `/app/.config/openstack/` because the image pins
 `HOME=/app`. `k8s-secrets` uses `create --dry-run | apply`, so re-running it
 rotates the values in place.
 
+**Rotating a Secret does not restart the pods on its own — run `just
+k8s-restart` after `k8s-secrets`.** The ConfigMap is kustomize-generated
+(`configMapGenerator`), so a config change gets a new hashed name and the
+Deployment spec changes, which is what makes `kubectl apply`/`oc apply` roll
+pods automatically. The three Secrets (`huskd-github`, `huskd-openstack`,
+`huskd-ssh`) are referenced by **static** name and updated in place, so their
+content can change with the Deployment spec staying byte-identical — nothing
+tells k8s to restart anything. `just k8s-restart` forces it (same
+`kubectl rollout restart` + wait that `k8s-local` already does for the
+image-tag-unchanged case).
+
 ### SSH to libvirt hosts
 
 Only libvirt pools need this; an OpenStack-only deployment can ignore the whole
