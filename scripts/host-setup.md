@@ -253,6 +253,29 @@ ssh husk@HOST true                                              # key works
 virsh -c qemu+ssh://husk@HOST/system list                      # libvirt RW over ssh
 ```
 
+### If huskd runs in Kubernetes instead
+
+Same key from step 1b, delivered as a Secret rather than `~/.ssh/config`:
+
+```bash
+ssh-keygen -t ed25519 -N '' -f secrets/id_ed25519 -C huskd
+# install secrets/id_ed25519.pub on the host's husk account (step 1b above —
+# NOT ssh-copy-id, that account has no password to auth with)
+ssh-keyscan -t ed25519 HOST > secrets/known_hosts
+just k8s-secrets                     # creates/rotates the huskd-ssh Secret
+```
+
+`k8s-secrets` bundles `secrets/id_ed25519` + `secrets/known_hosts` into the
+**`huskd-ssh`** Secret, mounted at `/app/.ssh` (`HOME=/app` in the image) — no
+`IdentityFile` needed since `id_ed25519` is ssh's default identity filename.
+`known_hosts` is mandatory (everything runs `BatchMode=yes`, so an unknown host
+key fails hard with no prompt); the `ssh` volume is `optional: true`, so an
+OpenStack-only deployment can skip this entirely. The host sees the **worker
+node's** IP, not the pod's (egress is SNAT'd) — that's what a firewall rule or
+`authorized_keys from=` restriction has to name. Full detail (permission bits,
+why `0440` not `0600`, the three things in the pod that shell out to `ssh`):
+`k8s/README.md` → "SSH to libvirt hosts".
+
 ## Verification checklist (Stage 0 "done")
 
 Run these **from the control machine, over SSH** — not as `sudo virsh` on the host.
