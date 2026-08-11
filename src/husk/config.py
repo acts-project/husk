@@ -28,7 +28,7 @@ def _slug(name: str) -> str:
 # The tables this file may define. Anything else at the top level is a typo
 # (`[controler]`, `[[pools]]`) that pydantic's env-facing `extra="ignore"` cannot
 # catch — see `_check_top_level`.
-_TOP_LEVEL = {"github", "controller", "pool"}
+_TOP_LEVEL = {"github", "controller", "defaults", "pool"}
 
 # domain:bus:device.function, as libvirt's <hostdev> wants it (0000:01:00.0).
 _PCI_RE = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$", re.I)
@@ -96,6 +96,88 @@ def _ssh_target_from_uri(uri: str) -> str:
     host = hostpart[-1].rsplit(":", 1)[0]  # drop :port
     user = f"{hostpart[0]}@" if len(hostpart) == 2 and hostpart[0] else ""
     return f"{user}{host}"
+
+
+def _with_defaults(defaults: dict, pool: dict, tables: frozenset[str]) -> dict:
+    """Overlay one `[[pool]]`'s raw TOML onto `[defaults]`.
+
+    `[defaults]` may set anything a `[[pool]]` can except `name`, and every pool
+    inherits all of it. This exists because the interesting facts are mostly
+    site-wide, not pool-wide: the CVMFS proxy, the package mirror to punch through
+    the egress firewall, the org being served. Re-typing them into every pool is
+    how three pools end up with two different proxies.
+
+    A pool that writes the same table wins KEY BY KEY (`memory_max = "24G"` keeps
+    the default's `env`), and `false` at either level declines an inherited table
+    or key — `cvmfs = false` for the pool that must not mount it, `size = false`
+    on the GPU pool that cannot carry a size label. Declining matters because
+    inheriting is not neutral: `[pool.cvmfs]` mints the `cvmfs` label and
+    `[pool.egress]` opens firewall holes. (`false` is unambiguous as a sentinel
+    only because nothing in the pool schema is boolean-valued — facts are named,
+    not flagged, so `gpu` is a vendor and `size` a class. test_config guards it.)
+
+    Two levels deep, no further: a list is a value like any other and replaces
+    rather than appends. An inherited `allow_hosts` that silently grew an entry
+    would be a firewall hole nobody wrote.
+
+    `target` replaces wholesale instead of merging, because `org` and `repo` are
+    mutually exclusive: key-merging a repo pool onto an org default would produce
+    a target carrying both, which is not a config anyone could have written.
+
+    Runs on raw dicts, BEFORE validation, so a default table may be partial —
+    `[defaults.cvmfs]` can carry just the site proxy and leave `repositories` to
+    each pool. Required keys are enforced on the merged result, which is the thing
+    that actually has to be complete.
+    """
+    from copy import deepcopy
+
+    declined = {k for k, v in pool.items() if k in tables and v is False}
+    merged = {k: v for k, v in pool.items() if k not in declined}
+    for key, base in defaults.items():
+        if key in declined:
+            continue
+        if key not in merged:
+            merged[key] = deepcopy(base)
+        elif (
+            key != "target" and isinstance(base, dict) and isinstance(merged[key], dict)
+        ):
+            merged[key] = {**deepcopy(base), **merged[key]}
+    # Second level: `size = false` inside a pool table means "not this one" — the
+    # only way to unset an inherited key, since TOML has no null.
+    return {
+        k: {ik: iv for ik, iv in v.items() if iv is not False}
+        if isinstance(v, dict)
+        else v
+        for k, v in merged.items()
+    }
+
+
+def _check_defaults(defaults, tables: frozenset[str]) -> None:
+    """Reject a `[defaults]` table that no pool could have carried.
+
+    Its keys are merged into pools *before* validation, so a typo here would not be
+    caught by anyone's `extra="forbid"` — `[defaults.egres]` would simply apply to
+    nothing, and the pools would come up without the firewall holes it was meant to
+    give them."""
+    if not isinstance(defaults, dict):
+        raise ValueError(f"[defaults] must be a table, not {type(defaults).__name__}")
+    if "name" in defaults:
+        raise ValueError(
+            "[defaults] cannot set `name`: it is the pool's identity (backend name, "
+            "vm_prefix, husk-pool-* label), so it must be unique per [[pool]]"
+        )
+    if unknown := sorted(set(defaults) - tables):
+        raise ValueError(
+            f"[defaults] has no {'keys' if len(unknown) > 1 else 'key'} "
+            f"{', '.join(repr(k) for k in unknown)} — it may set anything a [[pool]] "
+            f"can except name: {', '.join(sorted(tables))}"
+        )
+    if stray := sorted(k for k, v in defaults.items() if not isinstance(v, dict)):
+        raise ValueError(
+            f"[defaults] {', '.join(repr(k) for k in stray)} must be "
+            f"{'tables' if len(stray) > 1 else 'a table'}, exactly as written under a "
+            '[[pool]] (e.g. [defaults.egress], or target = { org = "..." })'
+        )
 
 
 @dataclass(frozen=True)
@@ -734,6 +816,11 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
                     )
             return self
 
+    # Everything a [[pool]] carries except its identity — and so exactly what
+    # [defaults] may set. Read off the model rather than restated, so a new pool
+    # table is defaultable the day it is added.
+    pool_tables = frozenset(_Pool.model_fields) - {"name"}
+
     class _Controller(_Strict):
         lock_path: str = "/tmp/huskd.lock"
         http_addr: str = "127.0.0.1:9100"
@@ -781,6 +868,28 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         github: _Github
         controller: _Controller = Field(default_factory=_Controller)
         pool: list[_Pool] = []
+
+        @model_validator(mode="before")
+        @classmethod
+        def _spread_defaults(cls, data):
+            """Fold `[defaults]` into every `[[pool]]` before anything is validated.
+
+            It has to happen here rather than after parsing: a default table is
+            allowed to be partial, so it is only the *merged* pool that can satisfy
+            `_Cvmfs`/`_Backend`'s required fields. `[defaults]` is consumed
+            entirely — it is not a field on this model and never reaches `Config`,
+            which stays a flat per-pool value object that knows nothing about
+            inheritance."""
+            if not isinstance(data, dict) or "defaults" not in data:
+                return data
+            data = dict(data)
+            defaults = data.pop("defaults")
+            _check_defaults(defaults, pool_tables)
+            data["pool"] = [
+                _with_defaults(defaults, p, pool_tables) if isinstance(p, dict) else p
+                for p in data.get("pool") or []
+            ]
+            return data
 
         @classmethod
         def settings_customise_sources(

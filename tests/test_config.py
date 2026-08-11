@@ -485,3 +485,216 @@ def test_libvirt_config_parses_host_storage_pool(tmp_path, monkeypatch):
     assert h.gpu_pci_addresses == ("0000:01:00.0",)
     assert h.max_slots is None
     assert h.storage_pool == "husk" and h.network == "default"  # defaults applied
+
+
+# ------------------------------------------------------------------ [defaults]
+# `[defaults]` is what keeps a site-wide fact — the CVMFS proxy, the package
+# mirror, the org being served — written once instead of once per pool. It is
+# folded into every [[pool]] before validation and never reaches `Config`, which
+# stays a flat per-pool value object.
+_DEFAULTS_TOML = """
+[github]
+app_id = 1
+
+[defaults]
+target = { org = "acts-project", group = "husk" }
+
+[defaults.runner]
+arch = "x64"
+size = "standard"
+scrape_cidr = "137.138.0.0/16"
+
+[defaults.timeouts]
+poll_interval_sec = 5
+
+[defaults.cvmfs]
+http_proxy = "http://ca-proxy.cern.ch:3128"
+
+[defaults.egress]
+allow_hosts = ["linuxsoft.cern.ch"]
+
+[defaults.container]
+env = ["HUSK_APT_MIRROR=http://ch.archive.ubuntu.com/ubuntu"]
+memory_max = "6G"
+
+[[pool]]
+name = "openstack-cpu"
+[pool.cvmfs]
+repositories = ["sft.cern.ch"]
+[pool.backend]
+type = "openstack"
+cloud = "cern"
+image_name = "husk-base"
+flavor_name = "m2.small"
+network_name = "CERN_NETWORK"
+
+[[pool]]
+name = "libvirt-gpu"
+target = { repo = "acts-project/acts" }
+cvmfs = false
+egress = false
+[pool.runner]
+gpu = "nvidia"
+size = false
+scrape_cidr = "192.168.122.1/32"
+[pool.container]
+memory_max = "24G"
+[pool.backend]
+type = "libvirt"
+image_ref = "ghcr.io/acts-project/husk-gpu:v8"
+[[pool.backend.hosts]]
+name = "gpubox"
+libvirt_uri = "qemu+ssh://paul@GpuBox/system"
+gpu_pci_addresses = ["0000:01:00.0"]
+"""
+
+
+def _defaults(tmp_path, monkeypatch, toml: str = _DEFAULTS_TOML):
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    p = tmp_path / "defaults.toml"
+    p.write_text(toml)
+    return load_configs(str(p))
+
+
+def test_a_pool_that_writes_nothing_inherits_every_default(tmp_path, monkeypatch):
+    cpu, _ = _defaults(tmp_path, monkeypatch)
+    assert cpu.target == Target.org("acts-project")
+    assert cpu.runner.runner_group == "husk"
+    assert cpu.runner.arch == "x64" and cpu.runner.size == "standard"
+    assert cpu.runner.scrape_cidr == "137.138.0.0/16"
+    assert cpu.timeouts.poll_interval_sec == 5
+    assert cpu.egress.allow_hosts == ("linuxsoft.cern.ch",)
+    assert cpu.container.env == ("HUSK_APT_MIRROR=http://ch.archive.ubuntu.com/ubuntu",)
+    assert cpu.container.memory_max == "6G"
+
+
+def test_a_default_table_may_be_partial(tmp_path, monkeypatch):
+    """The half that is site-wide (the CERN Squid chain) lives in [defaults]; the
+    half that is per-pool (which repos to mount) stays in the pool. Only the MERGED
+    table has to satisfy the required fields, which is why the merge runs on raw
+    TOML rather than on parsed models."""
+    cpu, _ = _defaults(tmp_path, monkeypatch)
+    assert cpu.cvmfs.http_proxy == "http://ca-proxy.cern.ch:3128"
+    assert cpu.cvmfs.repositories == ("sft.cern.ch",)
+    assert cpu.cvmfs.quota_limit_mb == 4000  # still the schema default
+
+
+def test_a_pool_table_overrides_key_by_key(tmp_path, monkeypatch):
+    """The point of merging rather than replacing: the GPU pool raises the memory
+    ceiling without restating the mirror it has no opinion about."""
+    _, gpu = _defaults(tmp_path, monkeypatch)
+    assert gpu.container.memory_max == "24G"
+    assert gpu.container.env == ("HUSK_APT_MIRROR=http://ch.archive.ubuntu.com/ubuntu",)
+    assert gpu.runner.scrape_cidr == "192.168.122.1/32"  # bridge, not Prometheus
+    assert gpu.runner.arch == "x64"  # untouched keys still inherited
+
+
+def test_false_declines_an_inherited_table(tmp_path, monkeypatch):
+    """Inheriting is not neutral: [pool.cvmfs] mints the `cvmfs` label and
+    [pool.egress] opens firewall holes. A pool must be able to say no."""
+    _, gpu = _defaults(tmp_path, monkeypatch)
+    assert gpu.cvmfs is None and gpu.egress is None
+    assert "cvmfs" not in gpu.runner.labels
+
+
+def test_false_declines_an_inherited_key(tmp_path, monkeypatch):
+    """`size = false` is the only way to UNSET an inherited key — TOML has no null.
+    Without it, a site-wide `size = "standard"` would make every GPU pool a config
+    error (accelerator pools carry no size label)."""
+    _, gpu = _defaults(tmp_path, monkeypatch)
+    assert gpu.runner.size is None
+    assert "husk-size-standard" not in gpu.runner.labels
+    assert gpu.runner.gpu_vendor == "nvidia"
+
+
+def test_target_replaces_rather_than_merging(tmp_path, monkeypatch):
+    """org and repo are mutually exclusive, so key-merging a repo pool onto an org
+    default would produce a target carrying both — a config nobody could write."""
+    _, gpu = _defaults(tmp_path, monkeypatch)
+    assert gpu.target == Target.repo("acts-project/acts")
+    assert gpu.runner.runner_group == "Default"  # the org default's group went too
+
+
+def test_a_list_replaces_and_never_appends(tmp_path, monkeypatch):
+    """An inherited allow_hosts that silently grew an entry would be a firewall
+    hole nobody wrote."""
+    toml = _DEFAULTS_TOML.replace(
+        '[pool.cvmfs]\nrepositories = ["sft.cern.ch"]',
+        '[pool.cvmfs]\nrepositories = ["sft.cern.ch"]\n'
+        '[pool.egress]\nallow_hosts = ["lxsoft.cern.ch"]',
+    )
+    cpu, _ = _defaults(tmp_path, monkeypatch, toml)
+    assert cpu.egress.allow_hosts == ("lxsoft.cern.ch",)
+
+
+def test_defaults_are_deep_copied_per_pool(tmp_path, monkeypatch):
+    """Two pools inheriting the same table must not end up sharing one mutable
+    list — a later override on one would silently reach the other."""
+    cpu, gpu = _defaults(tmp_path, monkeypatch)
+    assert cpu.container.env == gpu.container.env
+    assert cpu.container.env is not gpu.container.env
+
+
+def test_a_typo_in_defaults_is_rejected(tmp_path, monkeypatch):
+    """[defaults] is merged before validation, so nobody's extra="forbid" would
+    catch a misspelt TABLE: [defaults.egres] would apply to nothing, and the pools
+    would come up without the firewall holes it was meant to give them."""
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    p = tmp_path / "c.toml"
+    p.write_text(_DEFAULTS_TOML.replace("[defaults.egress]", "[defaults.egres]"))
+    with pytest.raises(Exception, match="egres"):
+        load_configs(str(p))
+
+
+def test_a_misspelt_key_inside_a_default_table_is_rejected(tmp_path, monkeypatch):
+    """Sub-keys ARE covered, because they are validated on the merged pool."""
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    p = tmp_path / "c.toml"
+    p.write_text(_DEFAULTS_TOML.replace("allow_hosts =", "allow_host ="))
+    with pytest.raises(Exception, match="allow_host"):
+        load_configs(str(p))
+
+
+def test_defaults_cannot_set_a_pool_name(tmp_path, monkeypatch):
+    """`name` is the pool's identity — backend name, vm_prefix, husk-pool-* label —
+    so a shared one would collide across every pool that inherited it."""
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    p = tmp_path / "c.toml"
+    p.write_text(
+        _DEFAULTS_TOML.replace("[defaults]\n", '[defaults]\nname = "shared"\n')
+    )
+    with pytest.raises(Exception, match="cannot set `name`"):
+        load_configs(str(p))
+
+
+def test_a_scalar_in_defaults_says_it_wants_a_table(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    p = tmp_path / "c.toml"
+    p.write_text(
+        _DEFAULTS_TOML.replace("[defaults]\n", '[defaults]\nbackend = "openstack"\n')
+    )
+    with pytest.raises(Exception, match="must be a table"):
+        load_configs(str(p))
+
+
+def test_no_pool_table_is_boolean_valued(tmp_path):
+    """The invariant that makes `false` usable as the decline sentinel: husk names
+    facts rather than flagging them (`gpu` is a vendor, `size` a class), so no key
+    a pool can write has a legitimate boolean value. Adding one would make
+    `gpu = false` ambiguous between "no GPU" and "don't inherit"."""
+    import dataclasses
+
+    from husk import config as cfgmod
+
+    for table in (
+        cfgmod.RunnerConfig,
+        cfgmod.BackendConfig,
+        cfgmod.HostConfig,
+        cfgmod.TimeoutsConfig,
+        cfgmod.CvmfsConfig,
+        cfgmod.EgressConfig,
+        cfgmod.ContainerConfig,
+    ):
+        assert not [
+            f.name for f in dataclasses.fields(table) if "bool" in str(f.type)
+        ], f"{table.__name__} grew a boolean field — see _with_defaults"

@@ -362,7 +362,11 @@ def validate(
 
     Touches nothing external — no cloud, no libvirt, no GitHub — so it is safe as a
     k8s initContainer or a CI step: a bad ConfigMap fails the rollout before the
-    daemon ever takes the lock."""
+    daemon ever takes the lock.
+
+    Prints each pool's EFFECTIVE config — what [defaults] and the pool add up to —
+    because inheritance makes a pool non-local: reading its [[pool]] block no
+    longer tells you what it will do."""
     cfgs = _load_all(config, secrets_dir)
     for c in cfgs:
         b = c.backend
@@ -374,6 +378,22 @@ def validate(
         # change actually did to job routing before rolling it out. A pool that
         # parses fine can still advertise the wrong thing.
         typer.echo(f"  labels: {' '.join(c.runner.labels)}")
+        # The three opt-in guest tables, which are the ones worth inheriting and
+        # therefore the ones you can no longer read off the pool. Each is silent
+        # when unset, so a pool that mounts nothing and opens nothing says so by
+        # printing nothing.
+        if c.cvmfs:
+            typer.echo(
+                f"  cvmfs: {' '.join(c.cvmfs.repositories)} "
+                f"via {c.cvmfs.http_proxy} ({c.cvmfs.quota_limit_mb}M)"
+            )
+        if c.egress:
+            typer.echo(f"  egress: {' '.join(c.egress.allow_hosts)}")
+        if c.container:
+            bits = list(c.container.env)
+            if c.container.memory_max:
+                bits.append(f"MemoryMax={c.container.memory_max}")
+            typer.echo(f"  container: {' '.join(bits)}")
     typer.echo(f"ok: {len(cfgs)} pool(s) in {config}")
 
 
