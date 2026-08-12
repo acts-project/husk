@@ -182,6 +182,12 @@ name = "openstack-cpu"
 [pool.backend]
 type = "openstack"
 cloud = "cern"                         # clouds.yaml profile (app credential)
+# Changing this mid-flight: Nova's rebuild action (what recycle issues) cannot
+# change a running server's flavor, so huskd destroys a flavor-stale slot at
+# its next poweroff instead of rebuilding it — one per tick, so a new flavor
+# that doesn't fit the project's quota fails a create and stops there rather
+# than destroying the whole pool's still-working capacity in one sweep. If
+# quota is tight, drop min_ready before changing this so the swap has room.
 flavor_name = "m2.small"
 network_name = "CERN_NETWORK"
 keypair = "acts-gha"

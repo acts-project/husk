@@ -35,6 +35,9 @@ class SlotView:
     host: str | None = None  # libvirt host name — metrics routes via its proxy
     image: str | None = None  # short id of the slot's ACTIVE image (digest / glance id)
     image_stale: bool = False  # active image differs from the pool's current target
+    # Running flavor differs from the pool's configured one (OpenStack only).
+    # Visibility only — see Slot.flavor_stale for why nothing auto-drains it.
+    flavor_stale: bool = False
     error: str | None = None  # last failed backend action (rebuild/start/…), if any
     error_epoch: float | None = None  # when that error was recorded (wall-clock)
     # The current run of consecutive failed actions. `error_epoch` above is the
@@ -148,6 +151,7 @@ class ControllerState:
                     host=slot.host,
                     image=_slot_image_label(slot.active_image, slot.image_stale, tag),
                     image_stale=slot.image_stale,
+                    flavor_stale=slot.flavor_stale,
                     error=(errors.get(slot.id) or (None, None))[1],
                     error_epoch=(errors.get(slot.id) or (None, None))[0],
                     failing_seconds=_round1((failing.get(slot.id) or (None, 0))[0]),

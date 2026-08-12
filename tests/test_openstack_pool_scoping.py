@@ -54,6 +54,7 @@ def _backend(
     b._warnings = {}
     b._backend_ref = ""
     b.image_id = "image-current"
+    b.flavor_id = "flavor-current"  # matches _server()'s default flavor
     b.conn = types.SimpleNamespace(
         compute=types.SimpleNamespace(
             servers=lambda details=True: list(servers),

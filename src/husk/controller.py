@@ -305,6 +305,11 @@ class Controller:
         )
         surplus_remaining = over  # how many powered-off excess slots to shed/hold
         did_retire = False
+        # Throttles flavor_stale destroys to one per tick — see the NEEDS_RECYCLE
+        # branch below. Separate from did_retire: a flavor rollout and a surplus
+        # retirement are independent reasons to destroy a slot, so one firing must
+        # not silently block the other from firing the same tick.
+        did_flavor_retire = False
 
         # 2b. REAP dead runner registrations (opt-in; see controller.reap_runners).
         #     Placed here, on the same fresh slots+runners snapshot the tick has
@@ -350,6 +355,32 @@ class Controller:
                         )
                         await self._destroy(s, "decommission")
                         did_retire = True
+                elif s.flavor_stale and not did_flavor_retire:
+                    # Nova's rebuild action (issued by _rebuild_then_start) cannot
+                    # change a server's flavor — only resize can, and that's a
+                    # stateful two-phase operation (VERIFY_RESIZE, explicit
+                    # confirm/revert, temporarily doubled quota) this controller
+                    # doesn't attempt. Destroying here instead is safe precisely
+                    # because NEEDS_RECYCLE already means idle/drained: the next
+                    # _grow (this tick or the next) replaces it via create_slot,
+                    # which reads the pool's CURRENT flavor_id fresh.
+                    #
+                    # Throttled to one per tick: unlike ordinary min_ready backfill
+                    # lag, this destroys STILL-WORKING old-flavor capacity before
+                    # confirming the new flavor even fits. Without the throttle, a
+                    # pool that goes idle right after a flavor bump could destroy
+                    # every slot in one tick and then fail every recreate on the
+                    # same quota/capacity limit — a self-inflicted outage rather
+                    # than a lag. One per tick fails that scenario slowly enough
+                    # (create errors, one lost slot) to notice and stop it instead.
+                    log.info(
+                        "slot %s flavor-stale at poweroff; destroying instead of "
+                        "rebuilding — the pool recreates it under the current "
+                        "flavor",
+                        s.id,
+                    )
+                    await self._destroy(s, "flavor_stale")
+                    did_flavor_retire = True
                 else:
                     await self._rebuild_then_start(s, now)
             elif state is SlotState.BUSY:

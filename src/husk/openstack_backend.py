@@ -172,19 +172,26 @@ class OpenStackBackend:
             and image_id
             and image_id != self.image_id
         )
+        flavor_id = _ref_id(getattr(server, "flavor", None))
+        # Visibility only — see Slot.flavor_stale. Unlike image_stale, nothing
+        # drains this: recycle's rebuild action can't change a server's flavor.
+        flavor_stale = bool(
+            self.flavor_id and flavor_id and flavor_id != self.flavor_id
+        )
         return Slot(
             id=server.id,
             name=server.name,
             status=server.status,
             task_state=_task_state(server),
             created_at=_epoch(getattr(server, "created_at", None)),
-            flavor_id=_ref_id(getattr(server, "flavor", None)),
+            flavor_id=flavor_id,
             image_id=image_id,
             cycle=cycle,
             provisioned_at=provisioned_at,
             fault=getattr(server, "fault", None),
             image_stale=stale,
             active_image=image_id,  # the Glance image this server booted from
+            flavor_stale=flavor_stale,
             ip=_fixed_ip(server),
         )
 

@@ -504,6 +504,12 @@ class SnapshotCollector:
         # curve, and `husk_slot_info{image_stale="true"}` is exactly the slots not
         # yet cycled. The pool's *configured* target is husk_pool_info.
         #
+        # `flavor_stale` is the OpenStack analog for a running server's flavor,
+        # but — unlike image_stale — it is visibility ONLY: Nova's rebuild action
+        # (what recycle issues) cannot change a server's flavor, only its image.
+        # `husk_slot_info{flavor_stale="true"}` names slots an operator needs to
+        # destroy+recreate by hand; nothing here drains them automatically.
+        #
         # `failing` joins that family: it is a FACT (the last action on this slot
         # failed), not the judgement "broken" — which stays a threshold on
         # husk_slot_failing_seconds. It earns a label rather than only a series
@@ -512,7 +518,16 @@ class SnapshotCollector:
         info = GaugeMetricFamily(
             "husk_slot_info",
             "Slot identity for joining in-guest metrics (always 1)",
-            labels=[*labels, "ip", "host", "runner", "image", "image_stale", "failing"],
+            labels=[
+                *labels,
+                "ip",
+                "host",
+                "runner",
+                "image",
+                "image_stale",
+                "flavor_stale",
+                "failing",
+            ],
         )
         for s in snaps:
             b = s.backend
@@ -541,6 +556,7 @@ class SnapshotCollector:
                         v.runner or "",
                         v.image or "",
                         "true" if v.image_stale else "false",
+                        "true" if v.flavor_stale else "false",
                         "true" if v.failing_seconds is not None else "false",
                     ],
                     1,

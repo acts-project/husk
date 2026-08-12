@@ -70,9 +70,12 @@ function poolHtml(p) {
         const imgTitle = v.image_stale
           ? "stale — older than the pool current golden; will drain onto it"
           : "current image";
+        const flavorBadge = v.flavor_stale
+          ? ` <span class="stale" title="flavor stale — differs from the pool's configured flavor; destroyed (not rebuilt) at its next poweroff, one per tick">flavor ⚠</span>`
+          : "";
         const img = !v.image
           ? `<td>-</td>`
-          : `<td><span class="${v.image_stale ? "stale" : "dim"}" title="${imgTitle}">${esc(v.image)}${v.image_stale ? " ⚠" : ""}</span></td>`;
+          : `<td><span class="${v.image_stale ? "stale" : "dim"}" title="${imgTitle}">${esc(v.image)}${v.image_stale ? " ⚠" : ""}</span>${flavorBadge}</td>`;
         const errShort = v.error && v.error.length > 48 ? v.error.slice(0,48) + "…" : v.error;
         // The streak, not the last failure: a slot retried every tick always has a
         // seconds-old LAST error, so that alone made a multi-hour outage look

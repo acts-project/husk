@@ -52,6 +52,14 @@ class Slot:
     # OpenStack: the booted Glance image id. Surfaced on the dashboard so a rollout
     # is visible per slot. None when the backend can't report it.
     active_image: str | None = None
+    # True when the slot's running flavor no longer matches the pool's configured
+    # one (OpenStack only). Unlike image_stale, NOTHING drains this automatically:
+    # Nova's rebuild action (what recycle issues) cannot change a server's flavor
+    # — that needs resize, a stateful two-phase operation (VERIFY_RESIZE, explicit
+    # confirm/revert, temporarily doubled quota) recycle does not attempt. This
+    # field is visibility only, so an operator knows to force a destroy+recreate
+    # instead of assuming an ordinary recycle already caught up.
+    flavor_stale: bool = False
     # Metrics-discovery hints (observability http_sd). OpenStack: the guest fixed
     # IP (directly scrapeable). libvirt: no guest IP (never contacted) — carries the
     # host name instead, and scraping routes through that host's metrics proxy.

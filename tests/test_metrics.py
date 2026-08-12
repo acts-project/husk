@@ -132,6 +132,7 @@ def test_hostile_label_values_do_not_break_the_scrape():
             (
                 ("backend", "pool-a"),
                 ("failing", "false"),
+                ("flavor_stale", "false"),
                 ("host", ""),
                 ("image", ""),
                 ("image_stale", "false"),
