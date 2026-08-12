@@ -188,6 +188,12 @@ keypair = "acts-gha"
 rebuild_microversion = "2.79"
 min_ready = 1
 max_total = 2
+# Bridge for renaming this pool without orphaning its VMs: list_slots also
+# adopts servers/domains still tagged with a retired `name`. New/rebuilt slots
+# always stamp the CURRENT name, so recycle each adopted slot once (huskctl
+# recycle --pool <this name> --all) then delete this line — it exists only
+# to carry old-tagged capacity across the rename, not as a standing alias.
+# adopt_from = ["openstack-cpu-old"]
 # Image source — a husk golden image, either way. Pick ONE:
 #  (a) image_ref: an OCI golden built by build-images.yml on ghcr — the SAME artifact the
 #      libvirt hosts use. huskd oras-pulls it and uploads it to Glance as

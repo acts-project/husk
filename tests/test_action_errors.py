@@ -41,6 +41,7 @@ def _backend(*, status: int, body: str):
     b.cfg = BackendConfig(name="os", type="openstack", min_ready=1, max_total=1)
     b._warnings = {}
     b._pool = b.cfg.name
+    b._owned_pool_names = frozenset({b.cfg.name})
     b.image_id = "img-1"
 
     def post(path, **kw):

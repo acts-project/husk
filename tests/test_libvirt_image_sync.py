@@ -36,7 +36,7 @@ class FakeSync:
         pass
 
 
-def _backend(**host_overrides):
+def _backend(*, adopt_from=(), **host_overrides):
     host = HostConfig(
         name="h1",
         libvirt_uri="qemu+ssh://u@host/system",
@@ -50,6 +50,7 @@ def _backend(**host_overrides):
         max_total=1,
         image_ref="ghcr.io/acts-project/husk-gpu:v1",
         hosts=(host,),
+        adopt_from=adopt_from,
     )
     b = LibvirtBackend(cfg)
     b._hosts["h1"]._pool_dir = "/pool"  # avoid opening a connection
@@ -229,6 +230,19 @@ def test_list_slots_filters_by_pool():
     ]
     slots = b.list_slots()
     assert [s.name for s in slots] == ["husk-lv-1"]  # only this pool's domain
+
+
+def test_list_slots_adopts_a_retired_pool_name():
+    # Renamed lv-old -> lv with adopt_from = ["lv-old"] must still see domains
+    # still tagged under the old name, so a rename doesn't orphan them.
+    b = _backend(adopt_from=("lv-old",))
+    b._list_raw = lambda: [
+        ("h1", _FakeDom("u1", "husk-lv-1"), {"pool": "lv", "unit": "cpu0"}),
+        ("h1", _FakeDom("u2", "husk-lv-old-1"), {"pool": "lv-old", "unit": "cpu1"}),
+        ("h1", _FakeDom("u3", "other-1"), {"pool": "other-pool", "unit": "cpu2"}),
+    ]
+    slots = b.list_slots()
+    assert {s.name for s in slots} == {"husk-lv-1", "husk-lv-old-1"}
 
 
 def test_guest_ip_failure_never_breaks_list_slots():

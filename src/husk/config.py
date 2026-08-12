@@ -357,6 +357,11 @@ class BackendConfig:
     rebuild_microversion: str = "2.79"
     # libvirt-only (optional / unused for the OpenStack backend)
     hosts: tuple[HostConfig, ...] = ()
+    # Retired pool names whose VMs this pool should adopt (list_slots widens its
+    # ownership match to include these) — a bridge for renaming a pool without
+    # orphaning the VMs already tagged under the old name. Remove once every
+    # adopted slot has been recycled at least once under the new name.
+    adopt_from: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -714,6 +719,8 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         rebuild_microversion: str = "2.79"
         # libvirt-only (optional for the OpenStack backend)
         hosts: list[_Host] = []
+        # See BackendConfig.adopt_from.
+        adopt_from: list[str] = []
 
         @model_validator(mode="after")
         def _ready_fits_in_total(self):
@@ -964,6 +971,14 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
     names = [c.backend.name for c in configs]
     if len(set(names)) != len(names):
         raise RuntimeError(f"duplicate pool name across [[pool]] entries: {names}")
+    name_set = set(names)
+    for c in configs:
+        if claimed := name_set & set(c.backend.adopt_from):
+            raise RuntimeError(
+                f"pool {c.backend.name!r} adopt_from {sorted(claimed)} names a "
+                "pool that still exists in this config — adopt_from is for "
+                "retired names only, or two pools would both claim those VMs"
+            )
     for c in configs:
         # The one place intent (the pool's facts) and effect (what jobs can select)
         # can be diffed by eye. Without it, "why is my job queued" means reading
@@ -995,6 +1010,7 @@ def _pool_config(p, github: GithubConfig, controller: ControllerConfig) -> Confi
         rebuild_microversion=b.rebuild_microversion,
         min_ready=b.min_ready,
         max_total=b.max_total,
+        adopt_from=tuple(b.adopt_from),
         hosts=tuple(
             HostConfig(
                 name=h.name,

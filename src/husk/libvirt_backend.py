@@ -197,6 +197,10 @@ class LibvirtBackend:
             )
         self.cfg = cfg
         self._pool = cfg.name  # stamped into domain metadata; scopes list_slots
+        # Names list_slots() also adopts, beside the current one — domains left
+        # over from a pool rename (cfg.adopt_from). New/rebuilt slots always
+        # stamp self._pool, never these.
+        self._owned_pool_names = frozenset({cfg.name, *cfg.adopt_from})
         # huskd passes one shared ImageSync so the registry pull is single-flighted
         # and the cache is shared across pools; a fresh default keeps one-shot
         # callers and tests self-contained.
@@ -818,13 +822,13 @@ class LibvirtBackend:
             raw = self._list_raw()
         except Exception as e:  # libvirt/SSH/network — MUST raise, never []
             raise ListSlotsError(f"list domains failed: {e}") from e
-        # Only this pool's domains (two pools can share a host). Placement/capacity
-        # still consider ALL husk domains on the host (see _occupied) so a GPU unit
-        # is never double-assigned across pools.
+        # Only this pool's domains, or a retired name it adopts (two pools can
+        # share a host). Placement/capacity still consider ALL husk domains on the
+        # host (see _occupied) so a GPU unit is never double-assigned across pools.
         slots = [
             self._slot(hn, dom, meta)
             for hn, dom, meta in raw
-            if meta.get("pool") == self._pool
+            if meta.get("pool") in self._owned_pool_names
         ]
         log.debug(
             "listed %d managed slot(s) for pool %s across %d host(s)",

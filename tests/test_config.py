@@ -365,6 +365,30 @@ def test_duplicate_pool_name_rejected(tmp_path, monkeypatch):
         load_configs(str(p))
 
 
+def test_adopt_from_a_still_configured_pool_is_rejected(tmp_path, monkeypatch):
+    """adopt_from is for retired names only — naming a pool that's still in this
+    config would let two pools both claim the same VMs."""
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    p = tmp_path / "c.toml"
+    toml = _pools("a", "b").replace(
+        'network_name="net"\n', 'network_name="net"\nadopt_from = ["b"]\n', 1
+    )
+    p.write_text(toml)
+    with pytest.raises(RuntimeError, match="adopt_from"):
+        load_configs(str(p))
+
+
+def test_adopt_from_a_retired_name_loads(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    p = tmp_path / "c.toml"
+    toml = _pools("a-v2").replace(
+        'network_name="net"\n', 'network_name="net"\nadopt_from = ["a"]\n', 1
+    )
+    p.write_text(toml)
+    cfg = load_config(str(p))
+    assert cfg.backend.adopt_from == ("a",)
+
+
 # ---------------------------------------------------------------- validation
 # These all used to load fine and fail later — at serve time, at backend
 # construction (which needs libvirt-python or a live cloud), or not at all. huskd

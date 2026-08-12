@@ -29,6 +29,7 @@ def _backend(*, meta_raises: bool):
     b.cfg = BackendConfig(name="os", type="openstack", min_ready=1, max_total=1)
     b._warnings = {}
     b._pool = b.cfg.name
+    b._owned_pool_names = frozenset({b.cfg.name})
 
     def set_server_metadata(server_id, **kw):
         if meta_raises:

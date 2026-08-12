@@ -117,6 +117,7 @@ def _backend(ref: str = REF, servers=None) -> OpenStackBackend:
     b.conn = FakeConn(servers or [])
     b._warnings = {}
     b._pool = b.cfg.name
+    b._owned_pool_names = frozenset({b.cfg.name, *b.cfg.adopt_from})
     b._sync = FakeSync(CURR)
     b._backend_ref = ref
     b._synced_ref = ""

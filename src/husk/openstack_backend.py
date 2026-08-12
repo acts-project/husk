@@ -103,6 +103,10 @@ class OpenStackBackend:
         # runner matches their prefix — and rebuilds them out from under their
         # owner. See _owns().
         self._pool = cfg.name
+        # Names list_slots() also adopts, beside the current one — VMs left over
+        # from a pool rename (cfg.adopt_from). New slots always stamp self._pool,
+        # never these; a recycle re-stamps an adopted slot under the current name.
+        self._owned_pool_names = frozenset({cfg.name, *cfg.adopt_from})
         # Non-fatal per-slot issues (swallowed metadata-write failures) for the
         # dashboard — slot_id -> (epoch, message). See slot_warnings().
         self._warnings: dict[str, tuple[float, str]] = {}
@@ -186,15 +190,19 @@ class OpenStackBackend:
 
     # --------------------------------------------------------------- backend
     def _owns(self, server) -> bool:
-        """Whether this server belongs to THIS pool.
+        """Whether this server belongs to THIS pool (or a name it adopts).
 
         Ownership is the `husk-pool` metadata tag, and only that: several pools
         share one OpenStack project, so `managed-by=husk` alone is not ownership.
         A husk server without the tag is not adopted — huskd stamps it at create,
         so an untagged one is foreign or hand-made, and silently adopting it would
-        mean rebuilding something nobody asked us to manage."""
+        mean rebuilding something nobody asked us to manage. `adopt_from` widens
+        the match to a retired pool name so a rename doesn't orphan its VMs."""
         meta = getattr(server, "metadata", None) or {}
-        return meta.get("managed-by") == MANAGED_BY and meta.get(POOL_KEY) == self._pool
+        return (
+            meta.get("managed-by") == MANAGED_BY
+            and meta.get(POOL_KEY) in self._owned_pool_names
+        )
 
     def list_slots(self) -> list[Slot]:
         try:

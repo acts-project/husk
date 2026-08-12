@@ -40,14 +40,17 @@ def _server(id, name, metadata):
     )
 
 
-def _backend(pool: str, prefix: str, servers: list) -> OpenStackBackend:
+def _backend(
+    pool: str, prefix: str, servers: list, adopt_from: tuple[str, ...] = ()
+) -> OpenStackBackend:
     """An OpenStackBackend with its __init__ bypassed — this exercises ownership
     and metadata, not cloud connection setup."""
     cfg = make_config().backend
-    cfg = dataclasses.replace(cfg, name=pool, vm_prefix=prefix)
+    cfg = dataclasses.replace(cfg, name=pool, vm_prefix=prefix, adopt_from=adopt_from)
     b = OpenStackBackend.__new__(OpenStackBackend)
     b.cfg = cfg
     b._pool = pool
+    b._owned_pool_names = frozenset({pool, *cfg.adopt_from})
     b._warnings = {}
     b._backend_ref = ""
     b.image_id = "image-current"
@@ -90,6 +93,21 @@ def test_an_untagged_husk_server_is_not_adopted():
     untagged = _server("old-1", "husk-gpu-a-7", {"managed-by": MANAGED_BY})
     b = _backend("gpu-a", "husk-gpu-a", [untagged])
     assert b.list_slots() == []
+
+
+def test_adopt_from_widens_ownership_to_a_retired_pool_name():
+    """A pool renamed gpu-a -> gpu-a-v2 with adopt_from = ["gpu-a"] must still see
+    VMs tagged under the old name, or a rename orphans them (silently running,
+    unreaped — see the module's own regression story, one level up)."""
+    b = _backend("gpu-a-v2", "husk-gpu-a", [TAGGED_A, TAGGED_B], adopt_from=("gpu-a",))
+    assert [s.id for s in b.list_slots()] == ["a-1"]
+
+
+def test_adopt_from_does_not_widen_a_sibling_pools_ownership():
+    """adopt_from must be additive to the adopting pool only — it must not make
+    gpu-b's servers visible just because gpu-a-v2 adopts a THIRD name."""
+    b = _backend("gpu-a-v2", "husk-gpu-a", [TAGGED_A, TAGGED_B], adopt_from=("gpu-c",))
+    assert [s.id for s in b.list_slots()] == []
 
 
 def test_list_slots_still_raises_rather_than_returning_empty():
