@@ -75,20 +75,27 @@ def _flavor_matches(server_flavor, flavor_id: str, flavor_name: str) -> bool:
     """Whether a server's live flavor is the pool's configured one.
 
     Nova's `flavor` field on a server is `{'id': ..., 'links': [...]}` before
-    microversion 2.47, but from 2.47 on it's an EXPANDED dict with no `id` at
-    all — `{'original_name': ..., 'vcpus': ..., ...}` — deliberately, since
-    hiding the raw id was the point of that change. `_ref_id` degrades an
-    id-less dict to `original_name`, so comparing its output against
-    `flavor_id` (always a real id, from find_flavor) compares a NAME to an ID
-    on any cloud using 2.47+ and is false on every server, always — which is
-    what made every slot read flavor_stale regardless of whether anything
-    changed. The two representations need different comparisons, chosen by
-    which key is actually present, not flattened into one string first."""
-    if not isinstance(server_flavor, dict):
-        return str(server_flavor or "") == flavor_id
-    if "id" in server_flavor:
-        return server_flavor["id"] == flavor_id
-    return server_flavor.get("original_name") == flavor_name
+    microversion 2.47, or an EXPANDED dict with no real id at all from 2.47 on
+    — deliberately, since hiding the raw id was the point of that change.
+    "Check whether the dict has an `id` key" is NOT a reliable way to tell
+    those two shapes apart, because openstacksdk's `Resource` wrapper has its
+    own `alternate_id` aliasing: when the raw body has no `id`, the SDK
+    backfills `.get('id')` with `original_name`'s value anyway. So `'id' in
+    server_flavor` is True either way, and branching on it compares the
+    aliased NAME against the real id on every server, unconditionally — wrong
+    even for a server that just booted on exactly the right flavor.
+
+    Trying both comparisons and accepting either match sidesteps needing to
+    correctly detect which shape (or aliasing quirk) is in play at all: the
+    real id only ever matches a real id, and the aliased id only ever
+    coincides with the configured NAME, not the configured id."""
+    if not server_flavor:
+        return False
+    get = getattr(server_flavor, "get", None)
+    if not callable(get):
+        return str(server_flavor) == flavor_id
+    sid, sname = get("id"), get("original_name")
+    return bool((sid and sid == flavor_id) or (sname and sname == flavor_name))
 
 
 def _fixed_ip(server) -> str | None:

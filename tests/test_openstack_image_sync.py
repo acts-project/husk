@@ -211,21 +211,27 @@ def test_slot_flavor_stale_matches_by_id_pre_247():
 
 
 def test_slot_flavor_stale_matches_by_name_at_microversion_247():
-    """Nova's server `flavor` field drops `id` entirely from microversion 2.47
-    on, replacing it with an expanded dict keyed by `original_name` instead —
-    deliberately, since hiding the raw id was the point of that change. Compare
-    that against the id (b.flavor_id) and EVERY server reads stale regardless
-    of whether anything changed — this is the exact regression: it must compare
-    against the configured NAME when Nova gives us the expanded form."""
+    """Nova's server `flavor` field drops the real id entirely from
+    microversion 2.47 on, replaced by an expanded body keyed by
+    `original_name` instead. This MUST use the real openstacksdk Flavor
+    resource, not a plain dict: a plain dict without an 'id' key genuinely
+    lacks one, but openstacksdk's Resource has its own alternate_id aliasing
+    that backfills `.get('id')` with `original_name`'s value regardless — a
+    plain-dict test wouldn't have caught the bug this reproduces (branching
+    on `'id' in server_flavor` looked right against a dict double and was
+    still wrong against the real SDK type, which reports 'id' present either
+    way)."""
+    from openstack.compute.v2.flavor import Flavor
+
     b = _backend()
     b.cfg = dataclasses.replace(b.cfg, flavor_name="m2.xlarge")
 
     matching = FakeServer("s", "img-cur")
-    matching.flavor = {"original_name": "m2.xlarge", "vcpus": 8, "ram": 16384}
+    matching.flavor = Flavor(original_name="m2.xlarge", vcpus=8, ram=16384)
     assert b._slot(matching).flavor_stale is False
 
     drifted = FakeServer("s", "img-cur")
-    drifted.flavor = {"original_name": "m2.small", "vcpus": 2, "ram": 4096}
+    drifted.flavor = Flavor(original_name="m2.small", vcpus=2, ram=4096)
     assert b._slot(drifted).flavor_stale is True
 
 
