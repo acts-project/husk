@@ -201,6 +201,34 @@ def test_slot_image_stale_only_in_oci_mode():
     assert b._slot(FakeServer("s", "img-old")).image_stale is False
 
 
+def test_slot_flavor_stale_matches_by_id_pre_247():
+    b = _backend()  # b.flavor_id == "flavor-1"; server.flavor == {"id": "flavor-1"}
+    assert b._slot(FakeServer("s", "img-cur")).flavor_stale is False
+
+    s = FakeServer("s", "img-cur")
+    s.flavor = {"id": "flavor-OTHER"}
+    assert b._slot(s).flavor_stale is True
+
+
+def test_slot_flavor_stale_matches_by_name_at_microversion_247():
+    """Nova's server `flavor` field drops `id` entirely from microversion 2.47
+    on, replacing it with an expanded dict keyed by `original_name` instead —
+    deliberately, since hiding the raw id was the point of that change. Compare
+    that against the id (b.flavor_id) and EVERY server reads stale regardless
+    of whether anything changed — this is the exact regression: it must compare
+    against the configured NAME when Nova gives us the expanded form."""
+    b = _backend()
+    b.cfg = dataclasses.replace(b.cfg, flavor_name="m2.xlarge")
+
+    matching = FakeServer("s", "img-cur")
+    matching.flavor = {"original_name": "m2.xlarge", "vcpus": 8, "ram": 16384}
+    assert b._slot(matching).flavor_stale is False
+
+    drifted = FakeServer("s", "img-cur")
+    drifted.flavor = {"original_name": "m2.small", "vcpus": 2, "ram": 4096}
+    assert b._slot(drifted).flavor_stale is True
+
+
 def test_gc_bails_quietly_when_slots_cannot_be_enumerated():
     """ListSlotsError is the contract for "couldn't enumerate". Deleting a golden
     without knowing which are referenced could pull an image out from under a

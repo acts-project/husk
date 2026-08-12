@@ -71,6 +71,26 @@ def _ref_id(value) -> str:
     return str(value or "")
 
 
+def _flavor_matches(server_flavor, flavor_id: str, flavor_name: str) -> bool:
+    """Whether a server's live flavor is the pool's configured one.
+
+    Nova's `flavor` field on a server is `{'id': ..., 'links': [...]}` before
+    microversion 2.47, but from 2.47 on it's an EXPANDED dict with no `id` at
+    all — `{'original_name': ..., 'vcpus': ..., ...}` — deliberately, since
+    hiding the raw id was the point of that change. `_ref_id` degrades an
+    id-less dict to `original_name`, so comparing its output against
+    `flavor_id` (always a real id, from find_flavor) compares a NAME to an ID
+    on any cloud using 2.47+ and is false on every server, always — which is
+    what made every slot read flavor_stale regardless of whether anything
+    changed. The two representations need different comparisons, chosen by
+    which key is actually present, not flattened into one string first."""
+    if not isinstance(server_flavor, dict):
+        return str(server_flavor or "") == flavor_id
+    if "id" in server_flavor:
+        return server_flavor["id"] == flavor_id
+    return server_flavor.get("original_name") == flavor_name
+
+
 def _fixed_ip(server) -> str | None:
     """The guest's fixed IPv4, for metrics discovery (already on the detailed
     server object — no extra API call). `addresses` is {net_name: [port, ...]}."""
@@ -172,11 +192,14 @@ class OpenStackBackend:
             and image_id
             and image_id != self.image_id
         )
-        flavor_id = _ref_id(getattr(server, "flavor", None))
+        server_flavor = getattr(server, "flavor", None)
+        flavor_id = _ref_id(server_flavor)
         # Visibility only — see Slot.flavor_stale. Unlike image_stale, nothing
         # drains this: recycle's rebuild action can't change a server's flavor.
         flavor_stale = bool(
-            self.flavor_id and flavor_id and flavor_id != self.flavor_id
+            self.flavor_id
+            and server_flavor
+            and not _flavor_matches(server_flavor, self.flavor_id, self.cfg.flavor_name)
         )
         return Slot(
             id=server.id,
