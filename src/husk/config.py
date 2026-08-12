@@ -330,6 +330,14 @@ class HostConfig:
     max_slots: int | None = None  # CPU host capacity; None → 1 (and GPU forbids it)
     image_name: str | None = None  # per-host override of the backend golden image
     image_ref: str | None = None  # per-host override of the backend OCI image ref
+    # Overlay's virtual disk size (qemu-img create's SIZE arg), or None to inherit
+    # the golden's own virtual size (today's behavior — no explicit SIZE passed).
+    # Must be >= the golden's virtual size: qemu-img create does not reject a
+    # smaller SIZE, it silently truncates what the guest sees of the backing
+    # file. A larger SIZE gives the guest unallocated space past the golden's
+    # partition table; cloud images grow into it themselves via cloud-init's
+    # growpart/resizefs modules on first boot, so this needs no runcmd here.
+    disk_size_gb: int | None = None
 
 
 @dataclass(frozen=True)
@@ -669,6 +677,8 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         max_slots: int | None = Field(None, gt=0)
         image_name: str | None = None
         image_ref: str | None = None
+        # See HostConfig.disk_size_gb.
+        disk_size_gb: int | None = Field(None, gt=0)
 
         @field_validator("libvirt_uri")
         @classmethod
@@ -1024,6 +1034,7 @@ def _pool_config(p, github: GithubConfig, controller: ControllerConfig) -> Confi
                 max_slots=h.max_slots,
                 image_name=h.image_name,
                 image_ref=h.image_ref,
+                disk_size_gb=h.disk_size_gb,
             )
             for h in b.hosts
         ),

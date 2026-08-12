@@ -195,6 +195,7 @@ max_total = 1
 name = "lenovo-gpu"
 libvirt_uri = "qemu+ssh://paul@GpuBox/system"
 gpu_pci_addresses = ["0000:01:00.0"]
+disk_size_gb = 80
 """
 
 
@@ -507,8 +508,18 @@ def test_libvirt_config_parses_host_storage_pool(tmp_path, monkeypatch):
     h = cfg.backend.hosts[0]
     assert h.ssh_target == "paul@GpuBox"  # derived, case preserved
     assert h.gpu_pci_addresses == ("0000:01:00.0",)
+    assert h.disk_size_gb == 80
     assert h.max_slots is None
     assert h.storage_pool == "husk" and h.network == "default"  # defaults applied
+
+
+def test_disk_size_gb_defaults_to_none(tmp_path, monkeypatch):
+    # None → _make_overlay inherits the golden's own virtual size.
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    p = tmp_path / "multi.toml"
+    p.write_text(_MULTI_TOML.replace("disk_size_gb = 80\n", ""))
+    cfg = load_configs(str(p))[1]
+    assert cfg.backend.hosts[0].disk_size_gb is None
 
 
 # ------------------------------------------------------------------ [defaults]

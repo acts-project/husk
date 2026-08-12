@@ -297,11 +297,15 @@ class LibvirtBackend:
     def _make_overlay(self, host: _HostConn, name: str) -> str:
         overlay = f"{host.pool_dir()}/{name}.qcow2"
         golden = f"{host.pool_dir()}/{host.image}"
+        # SIZE is omitted when unset, which makes qemu-img inherit the golden's
+        # own virtual size — today's default behavior. See HostConfig.disk_size_gb
+        # for what a larger value does and doesn't do on its own.
+        size = f" {host.cfg.disk_size_gb}G" if host.cfg.disk_size_gb else ""
         self._ssh(host, f"rm -f {shlex.quote(overlay)}")
         self._ssh(
             host,
             f"qemu-img create -f qcow2 -b {shlex.quote(golden)} -F qcow2 "
-            f"{shlex.quote(overlay)}",
+            f"{shlex.quote(overlay)}{size}",
         )
         return overlay
 
@@ -891,25 +895,46 @@ class LibvirtBackend:
     def rebuild_slot(self, slot: Slot, *, user_data: bytes, cycle: int) -> None:
         host_name, host, dom = self._resolve(slot)
         name = dom.name()
+        dom_uuid = dom.UUIDString()
         if dom.isActive():
-            dom.destroy()  # ensure off before wiping the disk
+            dom.destroy()  # ensure off before wiping the disk / redefining
         meta = self._read_meta(dom) or {}
         unit = meta.get("unit") or "cpu0"
         created = meta.get("created_at") or time.time()
 
-        self._make_overlay(host, name)  # wipe: fresh COW overlay off the golden image
-        self._make_seed(host, name, cycle, user_data)  # NEW instance-id → re-runs
+        overlay = self._make_overlay(host, name)  # wipe: fresh COW overlay off golden
+        seed = self._make_seed(
+            host, name, cycle, user_data
+        )  # NEW instance-id → re-runs
         # Rebuild adopts the host's CURRENT golden (sync_images may have advanced
         # it), so stamp the current digest — this is what clears a slot's stale
         # flag once it has drained onto the new image.
-        self._write_meta(
-            dom,
+        meta_xml = lx.metadata_xml(
             cycle=cycle,
             provisioned_at=time.time(),
             created_at=created,
             unit=unit,
             image_digest=host.image_digest,
+            pool=self._pool,
         )
+        # Redefine from the host's CURRENT memory_mb/vcpus/network — not just the
+        # image — so a hardware-spec edit in config converges on the next ordinary
+        # recycle instead of staying frozen at whatever create_slot originally
+        # saw. Same unit as before: placement isn't re-run on rebuild, so a GPU
+        # unit can't be double-assigned by this redefine racing another create.
+        xml = lx.domain_xml(
+            name=name,
+            uuid=dom_uuid,
+            memory_mb=host.cfg.memory_mb,
+            vcpus=host.cfg.vcpus,
+            overlay_path=overlay,
+            seed_path=seed,
+            network=host.cfg.network,
+            metadata=meta_xml,
+            emulator=self._resolve_emulator(host),
+            gpu_pci_address=unit if lx.is_gpu_unit(unit) else None,
+        )
+        host.conn().defineXML(xml)
         log.info(
             "rebuilt slot %s as cycle %d (left SHUTOFF for drain→start)", slot.id, cycle
         )

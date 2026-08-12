@@ -12,8 +12,10 @@ import pytest
 from husk.backend import BackendError
 from husk.config import BackendConfig, HostConfig
 from husk.image_sync import ResolvedImage
+from husk.slot import Slot
 
 libvirt = pytest.importorskip("libvirt")
+from husk import libvirt_xml as lx  # noqa: E402
 from husk.libvirt_backend import LibvirtBackend  # noqa: E402
 
 CURR = "sha256:" + "c" * 64  # "current" image digest → short cccccccccccc
@@ -139,6 +141,32 @@ def test_ref_change_resyncs():
     assert b._sync.calls == 2  # new ref → re-resolved
 
 
+def test_make_overlay_omits_size_by_default():
+    # No disk_size_gb → qemu-img inherits the golden's own virtual size, same
+    # as before this knob existed.
+    b = _backend()
+    b._hosts["h1"].image = "husk-golden-cccccccccccc.qcow2"
+    cmds = []
+    b._ssh = lambda host, cmd, data=None: cmds.append(cmd) or b""
+
+    b._make_overlay(b._hosts["h1"], "husk-lv-1")
+
+    create = next(c for c in cmds if c.startswith("qemu-img create"))
+    assert not create.rstrip().endswith("G")
+
+
+def test_make_overlay_passes_disk_size_gb_as_the_size_argument():
+    b = _backend(disk_size_gb=80)
+    b._hosts["h1"].image = "husk-golden-cccccccccccc.qcow2"
+    cmds = []
+    b._ssh = lambda host, cmd, data=None: cmds.append(cmd) or b""
+
+    b._make_overlay(b._hosts["h1"], "husk-lv-1")
+
+    create = next(c for c in cmds if c.startswith("qemu-img create"))
+    assert create.endswith(" 80G")
+
+
 def test_gc_removes_only_unreferenced_goldens():
     b = _backend()
     host = b._hosts["h1"]
@@ -243,6 +271,129 @@ def test_list_slots_adopts_a_retired_pool_name():
     ]
     slots = b.list_slots()
     assert {s.name for s in slots} == {"husk-lv-1", "husk-lv-old-1"}
+
+
+class _RedefiningFakeDom:
+    """A domain that tracks destroy() and answers metadata()/isActive()/name()
+    off fixed values — enough surface for rebuild_slot, not a full fake libvirt."""
+
+    def __init__(self, uuid: str, name: str, meta_xml: str) -> None:
+        self._uuid, self._name, self._meta_xml = uuid, name, meta_xml
+        self.active = True
+        self.destroyed = False
+
+    def isActive(self):  # noqa: N802 (libvirt API)
+        return self.active
+
+    def destroy(self):
+        self.active = False
+        self.destroyed = True
+
+    def UUIDString(self):  # noqa: N802 (libvirt API)
+        return self._uuid
+
+    def name(self):
+        return self._name
+
+    def metadata(self, *_a):
+        return self._meta_xml
+
+
+class _RedefiningFakeConn:
+    """Records every defineXML call so a test can inspect what was redefined."""
+
+    def __init__(self, dom: _RedefiningFakeDom) -> None:
+        self._dom = dom
+        self.defined: list[str] = []
+
+    def defineXML(self, xml):  # noqa: N802 (libvirt API)
+        self.defined.append(xml)
+        return self._dom
+
+    def lookupByUUIDString(self, uuid):  # noqa: N802 (libvirt API)
+        return self._dom
+
+    def isAlive(self):  # noqa: N802 (libvirt API) — host.conn() liveness probe
+        return True
+
+
+def _rebuild_slot(slot_id: str = "h1:u1"):
+    host_name, _, dom_uuid = slot_id.partition(":")
+    return Slot(
+        id=slot_id,
+        name="husk-lv-1",
+        status="SHUTOFF",
+        task_state=None,
+        created_at=1.0,
+        flavor_id="",
+        image_id="",
+        host=host_name,
+    )
+
+
+def test_rebuild_redefines_the_domain_from_current_host_config():
+    """memory_mb/vcpus are only ever written into the domain XML at create_slot
+    time — rebuild_slot must redefine them too, or a config edit (e.g. the
+    hardware bump behind a pool rename) never reaches VMs already running under
+    that pool, no matter how many times they're recycled."""
+    b = _backend(memory_mb=8192, vcpus=6)
+    host = b._hosts["h1"]
+    host.emulator = "/usr/bin/qemu-system-x86_64"  # skip the SSH emulator probe
+    host.image_digest = "sha256:" + "d" * 64
+    b._make_overlay = lambda h, name: f"{h.pool_dir()}/{name}.qcow2"
+    b._make_seed = lambda h, name, cycle, user_data: f"{h.pool_dir()}/{name}-seed.iso"
+
+    old_meta = lx.metadata_xml(
+        cycle=0,
+        provisioned_at=1.0,
+        created_at=1.0,
+        unit="cpu0",
+        image_digest="sha256:" + "o" * 64,
+        pool=b._pool,
+    )
+    dom = _RedefiningFakeDom("u1", "husk-lv-1", old_meta)
+    host._conn = _RedefiningFakeConn(dom)
+
+    b.rebuild_slot(_rebuild_slot(), user_data=b"#cloud-config\n", cycle=1)
+
+    assert dom.destroyed  # powered off before redefining, per the docstring
+    assert len(host._conn.defined) == 1
+    xml = host._conn.defined[0]
+    assert "<memory unit='MiB'>8192</memory>" in xml
+    assert "<vcpu>6</vcpu>" in xml
+    assert "<uuid>u1</uuid>" in xml
+    assert "<name>husk-lv-1</name>" in xml
+
+
+def test_rebuild_preserves_the_original_placement_unit():
+    """rebuild_slot must NOT re-run placement — it reuses the unit recorded in
+    metadata, so a GPU slot keeps its PCI passthrough and a redefine can never
+    collide with a concurrent create() picking a fresh unit."""
+    b = _backend(
+        gpu_pci_addresses=("0000:21:00.0",), max_slots=None, memory_mb=16384, vcpus=8
+    )
+    host = b._hosts["h1"]
+    host.emulator = "/usr/bin/qemu-system-x86_64"
+    host.image_digest = "sha256:" + "d" * 64
+    b._make_overlay = lambda h, name: f"{h.pool_dir()}/{name}.qcow2"
+    b._make_seed = lambda h, name, cycle, user_data: f"{h.pool_dir()}/{name}-seed.iso"
+
+    old_meta = lx.metadata_xml(
+        cycle=0,
+        provisioned_at=1.0,
+        created_at=1.0,
+        unit="0000:21:00.0",
+        image_digest="sha256:" + "o" * 64,
+        pool=b._pool,
+    )
+    dom = _RedefiningFakeDom("u1", "husk-lv-gpu-1", old_meta)
+    host._conn = _RedefiningFakeConn(dom)
+
+    b.rebuild_slot(_rebuild_slot("h1:u1"), user_data=b"#cloud-config\n", cycle=1)
+
+    xml = host._conn.defined[0]
+    assert "0000:21:00.0" in xml  # the hostdev, still attached
+    assert "<memory unit='MiB'>16384</memory>" in xml
 
 
 def test_guest_ip_failure_never_breaks_list_slots():

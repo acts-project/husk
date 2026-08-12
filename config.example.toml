@@ -256,6 +256,12 @@ network = "default"
 memory_mb = 8192
 vcpus = 8
 gpu_pci_addresses = ["0000:01:00.0"]   # → one slot, GPU passed through via <hostdev>
+# Overlay's virtual disk size. Omit to inherit the golden's own size (the
+# default). Must be >= the golden's size — qemu-img won't reject a smaller
+# value, it silently truncates what the guest sees. A larger value gives
+# unallocated space cloud-init's growpart/resizefs grow into on first boot;
+# no runcmd needed here.
+# disk_size_gb = 80
 # NB: nothing here for metrics. huskd reaches this host's guests over ssh_target
 # (above), so adding a hypervisor needs no per-host metrics setup at all.
 
