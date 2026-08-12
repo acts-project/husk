@@ -77,26 +77,30 @@ function poolHtml(p) {
           ? `<td>-</td>`
           : `<td><span class="${v.image_stale ? "stale" : "dim"}" title="${imgTitle}">${esc(v.image)}${v.image_stale ? " ⚠" : ""}</span>${flavorBadge}</td>`;
         // BUSY and JOB are one column: `busy` (from the poll) is authoritative for
-        // whether the slot is working, and the job name (from webhooks) only ever
-        // decorates it. So a busy slot with no known job still reads "yes" rather
-        // than "-" — that is the honest state after a restart, a missed delivery,
-        // or with no webhook configured at all, and it must not look idle.
-        const jobShort = v.job_name && v.job_name.length > 40
-          ? v.job_name.slice(0,40) + "…" : v.job_name;
+        // whether the slot is working, and the job identity (from webhooks) only
+        // ever decorates it. So a busy slot with no known job still reads "yes" —
+        // that is the honest state after a restart, a missed delivery, or with no
+        // webhook configured at all, and it must not look idle.
+        //
+        // The job NAME is deliberately not rendered inline: names are author-chosen
+        // and unbounded ("build (ubuntu-24.04, gcc-13, Debug)"), so putting one in
+        // a cell makes the column as wide as the worst name in the fleet and pushes
+        // everything right of it off-screen. A fixed "job" link keeps the row width
+        // constant no matter what anyone calls their matrix legs; the full name
+        // lives in the title, and the link goes where the detail actually is.
         const jobElapsed = v.job_started_at
-          ? ` <span class="dim">${dur(Date.now()/1000 - v.job_started_at)}</span>` : "";
+          ? `, ${dur(Date.now()/1000 - v.job_started_at)}` : "";
         let job;
         if (!v.busy) {
           job = `<td>-</td>`;
-        } else if (!v.job_name) {
+        } else if (!v.job_url) {
+          // Busy, but no job known (or one with no URL) — nothing to link to.
           job = `<td><span class="s-busy">yes</span></td>`;
         } else {
-          const label = `<span class="s-busy">${esc(jobShort)}</span>${jobElapsed}`;
           // rel=noopener on a target=_blank link: the run page is github.com, but
           // the URL arrives from a webhook payload and is not huskd's to vouch for.
-          job = v.job_url
-            ? `<td><a href="${esc(v.job_url)}" target="_blank" rel="noopener noreferrer" title="${esc(v.job_name)}">${label}</a></td>`
-            : `<td title="${esc(v.job_name)}">${label}</td>`;
+          const tip = v.job_name ? esc(v.job_name) : "open this job on GitHub";
+          job = `<td><span class="s-busy">yes</span> <span class="dim">(<a href="${esc(v.job_url)}" target="_blank" rel="noopener noreferrer" title="${tip}">job</a>${jobElapsed})</span></td>`;
         }
         const errShort = v.error && v.error.length > 48 ? v.error.slice(0,48) + "…" : v.error;
         // The streak, not the last failure: a slot retried every tick always has a
@@ -127,7 +131,7 @@ function poolHtml(p) {
       }).join("");
     body = `<div class="tablewrap"><table><thead><tr>
         <th>ID</th><th>NAME</th><th>STATE</th><th>NOVA</th><th>TASK</th>
-        <th>RUNNER</th><th>RUNNER ST</th><th>JOB</th>
+        <th>RUNNER</th><th>RUNNER ST</th><th>BUSY</th>
         <th class="num">CYCLE</th>
         <th>IMAGE</th>
         <th class="num">RECYCLE</th><th class="num">LIVE%</th>
