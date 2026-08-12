@@ -27,6 +27,7 @@ from husk.config import Config
 from husk.demand import DemandRegistry
 from husk.metrics import Metrics
 from husk.poller import SnapshotRegistry
+from husk.webhook import JobRegistry
 from husk.slot import (
     Runner,
     Slot,
@@ -96,6 +97,7 @@ class Controller:
         registry: SnapshotRegistry | None = None,
         runner_snapshot_max_age: float = RUNNER_SNAPSHOT_MAX_AGE_S,
         metrics: Metrics | None = None,
+        jobs: JobRegistry | None = None,
     ) -> None:
         self.backend = backend
         self.github = github
@@ -116,6 +118,11 @@ class Controller:
         # batched behind a poll.
         self.registry = registry or SnapshotRegistry()
         self._runner_max_age = runner_snapshot_max_age
+        # Job identity from `workflow_job` webhooks, for the dashboard only. Read
+        # once per tick and joined onto runner names in the snapshot; nothing in
+        # this loop's sizing or classification consults it, so a missing, stale or
+        # never-configured registry changes no decision huskd makes.
+        self.jobs = jobs or JobRegistry()
         # Event-time instruments, shared across every pool in the daemon (huskd
         # builds one and hands it to each Controller). Defaulting to a private
         # instance keeps every instrumented path exercised in tests and on the
@@ -445,6 +452,7 @@ class Controller:
             image_ref=self.cfg.backend.image_ref,
             errors=self._all_errors(),
             failing=self._failing_view(now),
+            jobs=self.jobs.jobs(),
         )
         log.debug(
             "tick %d done: %s",
@@ -482,6 +490,7 @@ class Controller:
             image_ref=self.cfg.backend.image_ref,
             errors=self._all_errors(),
             failing=self._failing_view(now),
+            jobs=self.jobs.jobs(),
         )
         return self.snapshot
 

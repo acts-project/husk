@@ -61,6 +61,15 @@ class SlotView:
     # own window instead of being stuck with "since huskd started".
     state_seconds: dict[str, float] = field(default_factory=dict)
     boot_seconds: float | None = None  # spawn: issue→ACTIVE (controller clock)
+    # Which job this slot is running, from `workflow_job` webhooks (husk.webhook).
+    # All three are None whenever no delivery has named this slot's runner — the
+    # webhook is unconfigured, a delivery was missed, or huskd restarted mid-job
+    # (job state is not persisted, by design). `busy` above stays authoritative for
+    # WHETHER a slot is working; these only say what it is working on, so a
+    # dashboard renders `busy=True` with no job as a plain "yes".
+    job_name: str | None = None
+    job_url: str | None = None
+    job_started_at: float | None = None
 
 
 def _short_image(ref: str | None) -> str | None:
@@ -125,10 +134,16 @@ class ControllerState:
         image_ref: str = "",  # pool's configured target ref → per-slot tag labels
         errors: dict | None = None,  # slot_id -> (epoch, message) last-action failure
         failing: dict | None = None,  # slot_id -> (seconds failing, count)
+        # runner_name -> JobInfo, from `workflow_job` webhooks. Passed in as a
+        # plain dict rather than a registry handle so this stays a pure function of
+        # its arguments: the caller takes ONE consistent read of the registry per
+        # tick, and every slot in a snapshot is joined against the same instant.
+        jobs: dict | None = None,
     ) -> "ControllerState":
         timing = timing or {}
         errors = errors or {}
         failing = failing or {}
+        jobs = jobs or {}
         tag = _ref_tag(image_ref)
         counts = {st.value: 0 for st in SlotState}
         views: list[SlotView] = []
@@ -136,6 +151,12 @@ class ControllerState:
             counts[state.value] += 1
             t = timing.get(slot.id)
             lf = t.live_fraction if t is not None else None
+            # Only a slot GitHub reports as busy can meaningfully be running a job.
+            # Gating on `runner.busy` rather than on the lookup alone means a stale
+            # entry (a `completed` delivery that never arrived, still inside its
+            # TTL) cannot show a job on a slot the poll says is idle — the poll
+            # stays authoritative, and the webhook only ever decorates it.
+            job = jobs.get(runner.name) if runner is not None and runner.busy else None
             views.append(
                 SlotView(
                     id=slot.id,
@@ -172,6 +193,9 @@ class ControllerState:
                         if t is not None
                         else {}
                     ),
+                    job_name=job.name if job else None,
+                    job_url=job.run_url if job else None,
+                    job_started_at=(job.started_at if job and job.started_at else None),
                     boot_seconds=_round1(
                         t.last_boot_seconds if t is not None else None
                     ),

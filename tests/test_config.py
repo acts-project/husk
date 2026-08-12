@@ -77,6 +77,47 @@ def test_rejects_a_file_that_is_not_a_pem(tmp_path):
         load_config(_write(tmp_path, extra=f'private_key_path = "{junk}"'))
 
 
+def test_webhook_secret_is_optional(tmp_path, monkeypatch):
+    """No webhook is a supported deployment — huskd is poll-driven and complete
+    without one, so an unset secret must load, not raise."""
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    assert load_config(_write(tmp_path)).github.webhook_secret is None
+
+
+def test_webhook_secret_from_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    monkeypatch.setenv("HUSK_GITHUB__WEBHOOK_SECRET", "s3cret")
+    assert load_config(_write(tmp_path)).github.webhook_secret == "s3cret"
+
+
+def test_webhook_secret_path_file_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    f = tmp_path / "wh"
+    # Trailing newline is what `echo > file` and most Secret tooling produces; it
+    # is not part of the secret and would break every signature if kept.
+    f.write_text("s3cret\n")
+    cfg = load_config(_write(tmp_path, extra=f'webhook_secret_path = "{f}"'))
+    assert cfg.github.webhook_secret == "s3cret"
+
+
+def test_unreadable_webhook_secret_path_is_an_error(tmp_path, monkeypatch):
+    """Configured-but-missing is a mounted-Secret problem, and must not degrade
+    silently into "no webhook" — that would look like deliveries never arriving."""
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    missing = tmp_path / "nope"
+    with pytest.raises(RuntimeError, match="webhook_secret_path"):
+        load_config(_write(tmp_path, extra=f'webhook_secret_path = "{missing}"'))
+
+
+def test_empty_webhook_secret_is_rejected(tmp_path, monkeypatch):
+    """An empty secret would HMAC against a known constant — forgeable by anyone.
+    Worse than no webhook, and an easy way to mount a Secret wrong."""
+    monkeypatch.setenv("HUSK_GITHUB__PRIVATE_KEY", FAKE_PEM)
+    monkeypatch.setenv("HUSK_GITHUB__WEBHOOK_SECRET", "   ")
+    with pytest.raises(RuntimeError, match="webhook_secret is empty"):
+        load_config(_write(tmp_path))
+
+
 def _target(tmp_path, table: str) -> str:
     """Write the standard config with the pool's target table swapped out."""
     bad = _TOML.format(extra="").replace(

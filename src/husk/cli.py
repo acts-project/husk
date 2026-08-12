@@ -19,6 +19,7 @@ from husk.controller import Controller
 from husk.lock import LockHeld, SingleControllerLock
 from husk.multipool import MultiPoolController
 from husk.snapshot import ControllerState
+from husk.webhook import JobRegistry
 
 log = logging.getLogger("husk.cli")
 
@@ -461,11 +462,12 @@ def run(
             advertise_scheme=shared.advertise_scheme,
             image_cache_dir=shared.image_cache_dir,
             metrics_state_path=shared.metrics_state_path,
+            webhook_secret=cfgs[0].github.webhook_secret,
         )
     )
 
 
-def _build_daemon(cfgs: list[Config], *, image_sync, metrics):
+def _build_daemon(cfgs: list[Config], *, image_sync, metrics, jobs=None):
     """Assemble the reconcile machinery shared by `--once` and the daemon: the
     centralized poller, one Controller per servable [[pool]], target discovery, and
     the MultiPoolController facade over them. Returns (facade, poller, discovery,
@@ -513,6 +515,10 @@ def _build_daemon(cfgs: list[Config], *, image_sync, metrics):
                 target=cfg.target,
                 registry=registry,
                 metrics=metrics,
+                # Every pool reads the SAME job registry the webhook writes: a
+                # delivery names a runner, not a pool, and only the controller
+                # that owns that runner will find it in its own snapshot.
+                jobs=jobs,
             )
         )
     if not controllers:
@@ -604,6 +610,7 @@ async def _serve(
     advertise_scheme: str = "http",
     image_cache_dir: str = "",
     metrics_state_path: str = "",
+    webhook_secret: str | None = None,
 ) -> None:
     """Bind and serve the HTTP surface immediately, then become the active
     reconciler in the background once the controller lock is free.
@@ -629,6 +636,13 @@ async def _serve(
     # scraper and advertise address come from config, not the cloud, so they too
     # are ready up front.
     metrics = Metrics()
+    # Created here, alongside metrics, and for the same reason: the webhook route
+    # is live from the moment the app binds, which is BEFORE this pod holds the
+    # controller lock. A standby pod that receives a delivery records it, so the
+    # registry is already warm if it wins the lock — and if it never does, the
+    # entries simply age out. Shared by the app (writer) and every controller
+    # (reader), so it must outlive any single reconcile plane.
+    jobs = JobRegistry()
     scraper = GuestScraper(ssh_targets) if ssh_targets else None
     state = _Serving()
 
@@ -644,6 +658,8 @@ async def _serve(
         # The dashboard reads this to show whether THIS pod is the active reconciler
         # or a standby waiting for the lock (see _Serving).
         is_active=lambda: state.active,
+        jobs=jobs,
+        webhook_secret=webhook_secret,
     )
     host, port = parse_addr(http_addr)
     display_host = "127.0.0.1" if host == "0.0.0.0" else host
@@ -663,6 +679,7 @@ async def _serve(
             stop=stop,
             state=state,
             metrics=metrics,
+            jobs=jobs,
         ),
         name="husk-activate",
     )
@@ -691,6 +708,7 @@ async def _activate(
     stop: asyncio.Event,
     state: _Serving,
     metrics,
+    jobs=None,
 ) -> None:
     """Acquire the controller lock, then run the reconcile plane until `stop`.
 
@@ -711,7 +729,7 @@ async def _activate(
         # lookups) runs off the event loop so the already-bound dashboard stays
         # responsive while the cloud APIs answer.
         facade, poller, discovery, tokens = await asyncio.to_thread(
-            _build_daemon, cfgs, image_sync=image_sync, metrics=metrics
+            _build_daemon, cfgs, image_sync=image_sync, metrics=metrics, jobs=jobs
         )
         # Publish to the serving plane: from here the dashboard shows live slots.
         state.image_sync = image_sync

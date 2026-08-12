@@ -25,6 +25,21 @@
 [github]                               # GitHub App identity (replaces repo + PAT)
 app_id = 123456                        # from the App's settings page
 private_key_path = "/etc/husk/husk-app.pem"   # or env HUSK_GITHUB__PRIVATE_KEY (PEM contents)
+# OPTIONAL. Enables POST /webhook, which records which JOB each busy slot is
+# running (the runners API says only busy/not-busy) and the queue depth behind the
+# fleet, exposed as husk_jobs_queued. Nothing here influences scaling: sizing stays
+# min(max_total, busy + min_ready) off the poll, so a lost delivery costs you a
+# dashboard cell, never a wrong fleet size.
+#
+# Unset = no webhook, and POST /webhook then REFUSES every delivery (401) rather
+# than accepting unsigned ones. Same two sources as the key above, and for the same
+# reason — it is a credential, so never write it in this file:
+#   1. $HUSK_GITHUB__WEBHOOK_SECRET   (the secret itself)
+#   2. [github].webhook_secret_path   (k8s Secret mount, 0400)
+# It must match the secret set on the App's webhook config. Rotating it means
+# restarting huskd (no config reload), and until you do, deliveries 401 — watch
+# husk_webhook_deliveries_total{result="rejected"}.
+# webhook_secret_path = "/etc/husk/webhook-secret"
 
 # Each [[pool]] names the ONE target it serves:
 #   target = { org  = "acts-project", group = "husk" }   # org-level runners

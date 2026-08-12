@@ -14,6 +14,9 @@ coroutine the CLI awaits to run it on the main event loop.
   GET /livez    — 200 whenever the event loop is answering (process liveness)
   GET /healthz  — 200 if every pool has a recent reconcile, else 503
   GET /events   — Server-Sent Events stream of the per-pool snapshots
+  POST /webhook — GitHub `workflow_job` deliveries, HMAC-verified (husk.webhook).
+                  The only endpoint that takes input, and the only one meant to be
+                  reachable from outside CERN.
 
 All endpoints read the SAME in-memory snapshot provider (a 0-arg callable
 returning `list[ControllerState]`, swapped atomically per tick), so they never
@@ -21,8 +24,15 @@ touch the backends and a read is always of a complete, immutable state. This app
 shares one event loop with the centralized runner poller and every pool's
 reconcile task (see `husk.cli._serve`); reconcile keeps its blocking backend work
 off that loop via `asyncio.to_thread`, so a wedged hypervisor can't stall these
-handlers. No auth: it exposes slot ids / runner names (not secrets) — bind to
-localhost unless it sits behind network controls.
+handlers.
+
+Auth, in two halves. Every GET is unauthenticated: it exposes slot ids / runner
+names (not secrets) — bind to localhost unless it sits behind network controls.
+`POST /webhook` is the exception and is authenticated by HMAC signature, because
+it is deliberately exposed to the internet so GitHub can reach it. The two must
+not be confused when configuring ingress: the OpenShift Route that opens
+`/webhook` is path-scoped for exactly this reason, and widening it to the whole
+app would publish the dashboard, `/status` and the console endpoint along with it.
 """
 
 from __future__ import annotations
@@ -36,7 +46,10 @@ from typing import Callable
 from hypercorn.asyncio import serve
 from hypercorn.config import Config as HypercornConfig
 from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, generate_latest
-from quart import Quart, Response, render_template
+from quart import Quart, Response, render_template, request
+
+from husk import webhook as wh
+from husk.webhook import JobRegistry
 
 from husk.guest_scrape import GuestScraper, GuestScrapeError
 
@@ -67,6 +80,7 @@ def build_registry(
     *,
     storage_provider: Callable[[], list[DiskUsage]] | None = None,
     metrics: Metrics | None = None,
+    jobs: JobRegistry | None = None,
 ) -> CollectorRegistry:
     """The registry `/metrics` renders.
 
@@ -79,7 +93,7 @@ def build_registry(
     publish. An explicit registry makes the exposition exactly what husk put in
     it."""
     registry = CollectorRegistry()
-    registry.register(SnapshotCollector(snapshot_provider, storage_provider))
+    registry.register(SnapshotCollector(snapshot_provider, storage_provider, jobs))
     if metrics is not None:
         registry.register(metrics)
     return registry
@@ -96,6 +110,8 @@ def make_app(
     metrics: Metrics | None = None,
     console_provider: Callable[[str, str], str | None] | None = None,
     is_active: Callable[[], bool] | None = None,
+    jobs: JobRegistry | None = None,
+    webhook_secret: str | None = None,
 ) -> Quart:
     """Build the app over a per-pool snapshot provider (the same one every
     endpoint reads). Templates resolve relative to this package.
@@ -136,10 +152,24 @@ def make_app(
     holds the controller lock) or a standby waiting for it under a rolling update.
     The dashboard shows a "standby" banner in the latter case so an empty fleet
     reads as "not my job yet", not "everything is gone". Omitted → always active
-    (the single-process / test case)."""
+    (the single-process / test case).
+
+    `jobs` + `webhook_secret` enable `POST /webhook`. Both are required together:
+    the registry is where deliveries land, and the secret is what makes a delivery
+    trustworthy. With either missing the route still EXISTS but refuses everything
+    — a 404 would be indistinguishable from a bad path and make a misconfigured
+    deployment look like a routing bug.
+
+    This is the only endpoint that accepts input, the only POST, and the only one
+    intended to be reachable from outside CERN (a path-scoped OpenShift Route with
+    `ip_whitelist: ""`). Everything else here is unauthenticated and must stay on
+    the CERN-internal route."""
     app = Quart(__name__)
     registry = build_registry(
-        snapshot_provider, storage_provider=storage_provider, metrics=metrics
+        snapshot_provider,
+        storage_provider=storage_provider,
+        metrics=metrics,
+        jobs=jobs,
     )
 
     def _snaps() -> list[ControllerState]:
@@ -176,6 +206,108 @@ def make_app(
         # is the whole handler: everything about which series exist, how they are
         # labelled and how they are escaped lives in husk.metrics.
         return Response(generate_latest(registry), content_type=CONTENT_TYPE_LATEST)
+
+    @app.post("/webhook")
+    async def webhook():
+        """`workflow_job` deliveries → JobRegistry. The one authenticated endpoint.
+
+        Ordering is the security property: read the RAW body, verify the HMAC over
+        those exact bytes, and only then parse JSON. Verifying a re-serialized
+        payload would not reproduce the signed bytes, and parsing first would run a
+        decoder over unauthenticated input.
+
+        Every failure returns a bare status with no detail — which check failed,
+        whether the secret is configured, whether the runner is known — because
+        this is internet-facing and each of those is a probe answered for free.
+        The logs carry the detail instead.
+
+        Returns fast and does no I/O: GitHub abandons a delivery after 10s, and a
+        handler that blocked on a backend would turn a slow hypervisor into lost
+        deliveries. Everything here is an in-memory dict write.
+        """
+        body = await request.get_data()
+        signature = request.headers.get("X-Hub-Signature-256")
+        if not wh.verify(body, signature, webhook_secret):
+            if metrics is not None:
+                metrics.webhook_deliveries.inc("rejected")
+            # Warn, not debug: on a correctly-configured deployment this is either
+            # a rotated secret or someone knocking, and both are worth seeing.
+            log.warning(
+                "rejected webhook delivery: bad or missing signature (secret %s)",
+                "configured" if webhook_secret else "NOT configured",
+            )
+            return Response("", status=401)
+
+        event = request.headers.get("X-GitHub-Event", "")
+        if event != "workflow_job":
+            # 204 rather than 400: a subscription huskd does not handle is GitHub
+            # doing what it was told, not an error, and 4xx here would show up as
+            # failed deliveries in the App's UI.
+            if metrics is not None:
+                metrics.webhook_deliveries.inc("ignored")
+            return Response("", status=204)
+
+        try:
+            payload = json.loads(body)
+            if not isinstance(payload, dict):
+                raise ValueError("payload is not an object")
+        except ValueError:  # covers UnicodeDecodeError and json's own errors
+            if metrics is not None:
+                metrics.webhook_deliveries.inc("malformed")
+            log.warning("webhook delivery had a valid signature but unparseable body")
+            return Response("", status=400)
+
+        _handle_workflow_job(payload)
+        if metrics is not None:
+            metrics.webhook_deliveries.inc("accepted")
+        return Response("", status=204)
+
+    def _handle_workflow_job(payload: dict) -> None:
+        """Apply one verified `workflow_job` to the registry.
+
+        Split out of the route so the dispatch is testable without a request
+        context, and so the route reads as "authenticate, parse, apply"."""
+        if jobs is None:
+            return
+        action, info, runner_name = wh.parse_job(payload)
+        labels = wh.job_labels(payload)
+        target_key = _target_key(payload)
+
+        if action == "queued":
+            if info is not None:
+                jobs.enqueue(target_key, labels, info.job_id)
+        elif action == "in_progress":
+            # Leaving the queue and acquiring a runner are the same instant, so
+            # this both clears the queued entry and records the assignment.
+            if info is not None:
+                jobs.dequeue(target_key, labels, info.job_id)
+                if runner_name:
+                    jobs.start(runner_name, info)
+        elif action == "completed":
+            if info is not None:
+                # A job cancelled while still queued goes straight to `completed`
+                # and never had a runner, so the queued entry must be dropped here
+                # too or it would sit until its TTL.
+                jobs.dequeue(target_key, labels, info.job_id)
+            if runner_name:
+                jobs.finish(runner_name, info.job_id if info else None)
+
+    def _target_key(payload: dict) -> str:
+        """The `Target.key` this delivery belongs to.
+
+        Prefers the org, because that is how husk pools bind (`target = { org }`)
+        and every repo in an installed org shares one queue from huskd's point of
+        view. Falls back to the repo for repo-scoped installs. Both come from the
+        signed payload, so neither is attacker-chosen in the sense that matters
+        for cardinality — but see the metrics module: this is a bounded label
+        only because an installation set is bounded."""
+        org = payload.get("organization")
+        if isinstance(org, dict) and org.get("login"):
+            return f"org:{org['login']}"
+        repo = payload.get("repository")
+        if isinstance(repo, dict) and repo.get("full_name"):
+            return f"repo:{repo['full_name']}"
+        return "unknown"
 
     @app.get("/sd/targets")
     async def sd_targets():

@@ -316,6 +316,19 @@ class Metrics:
             "Proxied libvirt guest metric scrapes that failed",
             ["backend"],
         )
+        # Webhook deliveries, by outcome. `result` is a CLOSED vocabulary —
+        # accepted / rejected / ignored / malformed — deliberately carrying no
+        # repo, job, workflow or sender label: this endpoint is internet-facing,
+        # so anything derived from the request body is attacker-chosen and would
+        # let a stranger mint unbounded series in a counter huskd PERSISTS to
+        # disk. `rejected` (bad signature) is the one to alert on: a nonzero rate
+        # means either a rotated secret huskd has not been restarted for, or
+        # someone probing the endpoint.
+        self.webhook_deliveries = Counter(
+            "husk_webhook_deliveries",
+            "workflow_job webhook deliveries, by result",
+            ["result"],
+        )
         self._instruments: tuple[Counter | Histogram, ...] = (
             self.reconcile_ticks,
             self.reconcile_aborts,
@@ -329,6 +342,7 @@ class Metrics:
             self.github_polls,
             self.github_poll_failures,
             self.guest_scrape_failures,
+            self.webhook_deliveries,
         )
 
     @property
@@ -356,15 +370,50 @@ class SnapshotCollector:
     `sum(husk_image_bytes)` double-count. `storage.collect` has already deduped by
     (host, kind)."""
 
-    def __init__(self, snapshots, storage=None) -> None:
+    def __init__(self, snapshots, storage=None, jobs=None) -> None:
         self._snapshots = snapshots
         self._storage = storage
+        # Optional `JobRegistry`. Queue depth belongs in THIS half rather than
+        # among the event-time counters for the usual reason: a `runs-on` labelset
+        # that stops being used must stop producing samples, and a collector that
+        # reads the live registry gets that for free where a library Gauge would
+        # report a drained queue forever.
+        self._jobs = jobs
 
     def collect(self) -> Iterator:
         snaps = self._snapshots() or []
         yield from self._storage_families()
         yield from self._pool_families(snaps)
         yield from self._slot_families(snaps)
+        yield from self._queue_families()
+
+    # ------------------------------------------------------------------ queue
+    def _queue_families(self) -> Iterator:
+        """Jobs waiting for a runner, per (target, runs-on labelset).
+
+        Observability only — nothing in huskd sizes off this (see husk.webhook on
+        why). It answers "is the queue draining", which `husk_slots{state="busy"}`
+        cannot: a saturated fleet and an idle one both read 100% busy when the
+        queue behind them is 0 or 200 deep.
+
+        Empty whenever no webhook is configured, which is a truthful zero-series
+        rather than a zero: with no deliveries huskd genuinely does not know the
+        queue depth, and reporting 0 would look like an empty queue.
+        """
+        if self._jobs is None:
+            return
+        depth = GaugeMetricFamily(
+            "husk_jobs_queued",
+            "Actions jobs queued and not yet assigned a runner",
+            labels=["target", "labels"],
+        )
+        for (target, labelset), n in sorted(self._jobs.queued_depth().items()):
+            # The labelset is joined into ONE label value rather than exploded
+            # into columns: `runs-on` is a set of arbitrary length, so a column
+            # per label is not expressible in a fixed schema, and the joined form
+            # is what a `=~` query matches against anyway.
+            depth.add_metric([target, ",".join(labelset)], n)
+        yield depth
 
     # ------------------------------------------------------------------ pools
     def _pool_families(self, snaps: list[ControllerState]) -> Iterator:

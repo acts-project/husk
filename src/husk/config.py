@@ -187,10 +187,17 @@ class GithubConfig:
     huskd authenticates as the App (RS256 JWT) and exchanges that for a
     short-lived *installation* token per target; there is no long-lived
     credential. `private_key` holds the resolved PEM contents and is never
-    logged."""
+    logged.
+
+    `webhook_secret` is the shared secret GitHub signs `workflow_job` deliveries
+    with (`X-Hub-Signature-256`). Optional and independent of the App identity:
+    unset simply means huskd has no webhook surface, and `POST /webhook` refuses
+    every delivery. It is NOT a fallback-to-unsigned — an unset secret rejects,
+    it does not accept. Like the private key, never logged."""
 
     app_id: int
     private_key: str
+    webhook_secret: str | None = None
 
 
 @dataclass(frozen=True)
@@ -498,6 +505,11 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         # PEM contents (env HUSK_GITHUB__PRIVATE_KEY); never in TOML
         private_key: str | None = None
         private_key_path: str | None = None  # file / k8s Secret mount
+        # Webhook HMAC secret, same two-source shape as the private key above and
+        # for the same reason: contents via env, or a path to a mounted Secret.
+        # Never in TOML — it is a credential, not configuration.
+        webhook_secret: str | None = None
+        webhook_secret_path: str | None = None
 
     class _Target(_Strict):
         """`target = { org = "acts-project", group = "husk" }` or
@@ -965,6 +977,32 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
             "App settings page generated)"
         )
 
+    # Resolve the webhook secret the same two ways as the private key. Unlike the
+    # key this is OPTIONAL and does not fail closed: huskd is poll-driven and runs
+    # perfectly well with no webhook at all, so an unset secret is a supported
+    # deployment rather than a misconfiguration. What it must never do is degrade
+    # into accepting unsigned deliveries — `POST /webhook` refuses everything when
+    # this is None (see husk.webhook). A configured-but-unreadable path IS an
+    # error, because that is a mounted-Secret problem masquerading as "no webhook".
+    webhook_secret = s.github.webhook_secret
+    if not webhook_secret and s.github.webhook_secret_path:
+        try:
+            webhook_secret = Path(s.github.webhook_secret_path).read_text().strip()
+        except OSError as e:
+            raise RuntimeError(
+                f"[github].webhook_secret_path {s.github.webhook_secret_path!r} "
+                f"could not be read: {e.strerror} — check the Secret is mounted "
+                "there and readable by the huskd uid"
+            ) from None
+    if webhook_secret is not None and not webhook_secret.strip():
+        # An empty secret would make every HMAC comparison run against a known
+        # constant — worse than no webhook, and easy to arrive at by mounting an
+        # empty Secret key. Reject it rather than serve a forgeable endpoint.
+        raise RuntimeError(
+            "[github].webhook_secret is empty — unset it to disable the webhook, "
+            "or set it to the secret configured on the GitHub App"
+        )
+
     if not s.pool:
         # The old-flat-format case is already caught upstream by `_check_top_level`,
         # which sees the stray [runner]/[backend] tables; this is the genuinely
@@ -976,7 +1014,11 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
 
     # Shared across every pool — one App identity + target set, one lock/http
     # per daemon.
-    github = GithubConfig(app_id=s.github.app_id, private_key=private_key)
+    github = GithubConfig(
+        app_id=s.github.app_id,
+        private_key=private_key,
+        webhook_secret=webhook_secret,
+    )
     controller = ControllerConfig(
         lock_path=s.controller.lock_path,
         http_addr=s.controller.http_addr,

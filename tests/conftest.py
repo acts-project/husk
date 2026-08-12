@@ -53,7 +53,7 @@ def _ops_fail_fast(monkeypatch):
     monkeypatch.setattr(OpStore, "__init__", fast_init)
 
 
-def render_metrics(snapshots=(), *, storage=None, metrics=None) -> str:
+def render_metrics(snapshots=(), *, storage=None, metrics=None, jobs=None) -> str:
     """The `/metrics` body for the given state, without standing up a server.
 
     Assertions throughout the suite are written against this text rather than
@@ -68,6 +68,7 @@ def render_metrics(snapshots=(), *, storage=None, metrics=None) -> str:
         lambda: list(snapshots),
         storage_provider=(lambda: list(storage)) if storage is not None else None,
         metrics=metrics,
+        jobs=jobs,
     )
     return generate_latest(registry).decode()
 
