@@ -7,6 +7,7 @@ resources:
   - ../../base
   - pvc.yaml
   - route.yaml
+  - route-webhook.yaml
 
 # See the note in overlays/local: a base's transformers do not reach a generator
 # declared in the overlay, so without this the ConfigMaps are unlabelled and no

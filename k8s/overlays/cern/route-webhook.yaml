@@ -1,0 +1,43 @@
+# The ONE externally-reachable path into huskd.
+#
+# Same host as the huskd Route, split by path. OpenShift/HAProxy routes by
+# longest-prefix match, so this Route wins for /webhook and everything else falls
+# through to the pathless one — which keeps its default CERN-only visibility. That
+# split is the point: the dashboard, /status, /metrics and the slot console
+# endpoint are all unauthenticated, and widening the existing Route instead of
+# adding this one would publish every one of them to the internet.
+#
+# Path matching is a PREFIX match: this also admits /webhookanything, which Quart
+# 404s. So the path is routing hygiene, not the security boundary — the
+# X-Hub-Signature-256 HMAC check in husk.webhook is. huskd refuses every delivery
+# it cannot verify, including when no secret is configured at all.
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: huskd-webhook
+  annotations:
+    # Empty value = no client-IP restriction, i.e. reachable from the internet,
+    # which is what GitHub's delivery hooks need.
+    #
+    # ABSENT IS NOT THE SAME AS EMPTY. CERN's PaaS inserts the default CERN IP
+    # ranges whenever this annotation is missing, so anything that prunes empty
+    # values — or an `oc edit` that deletes the "blank" annotation as noise —
+    # silently makes this CERN-only and GitHub deliveries start timing out with
+    # no error on our side. Watch husk_webhook_deliveries_total if they stop.
+    haproxy.router.openshift.io/ip_whitelist: ""
+spec:
+  # Explicit, and must match the huskd Route's host exactly — two Routes on one
+  # host is what makes the path split work. Both are written out rather than left
+  # to OpenShift's generated name, so the pairing is visible in the repo instead
+  # of being an implicit consequence of object names.
+  host: acts-husk.app.cern.ch
+  path: /webhook
+  to:
+    kind: Service
+    name: huskd
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None

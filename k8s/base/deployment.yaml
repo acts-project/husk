@@ -100,6 +100,20 @@ spec:
                 secretKeyRef:
                   name: huskd-github
                   key: private-key.pem
+            # Enables POST /webhook (which job each busy slot runs, plus queue
+            # depth). `optional: true` because huskd is poll-driven and complete
+            # without it: a cluster with no webhook-secret key in the Secret starts
+            # normally with the endpoint disabled rather than crash-looping. Unset
+            # does NOT mean "accept unsigned" — the route refuses every delivery
+            # until a secret is configured. Not wired into the validate init
+            # container above: it never serves HTTP, so the key is meaningless
+            # there and would only widen where the secret is mounted.
+            - name: HUSK_GITHUB__WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: huskd-github
+                  key: webhook-secret
+                  optional: true
           securityContext:
             runAsNonRoot: true
             allowPrivilegeEscalation: false

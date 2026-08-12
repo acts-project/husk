@@ -3,6 +3,16 @@ kind: Route
 metadata:
   name: huskd
 spec:
+  # Pathless, so this claims everything under the host EXCEPT the longer prefixes
+  # another Route claims (see route-webhook.yaml, which takes /webhook). No
+  # ip_whitelist annotation, which is deliberate and load-bearing: absent means
+  # CERN inserts its own IP ranges, so the dashboard, /status, /metrics and the
+  # slot console stay CERN-internal. Do not add an empty annotation here to "make
+  # it consistent" with the webhook Route — that publishes all of them.
+  #
+  # `host` was generated from the object name until the webhook Route needed to
+  # claim the same host; it is now written out so the two cannot drift apart.
+  host: acts-husk.app.cern.ch
   to:
     kind: Service
     name: huskd

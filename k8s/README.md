@@ -41,7 +41,7 @@ convention already used for the repo-root configs:
 | | committed | local (gitignored) |
 |---|---|---|
 | config | `k8s/overlays/*/config.example.toml` | `k8s/overlays/*/config.toml` |
-| credentials | — | `secrets/private-key.pem`, `secrets/clouds.yaml`, `secrets/id_ed25519` + `secrets/known_hosts` |
+| credentials | — | `secrets/private-key.pem`, `secrets/clouds.yaml`, `secrets/id_ed25519` + `secrets/known_hosts`, `secrets/webhook-secret` |
 
 ```sh
 just k8s-init      # copies each example -> config.toml, creates secrets/
@@ -65,6 +65,31 @@ How they reach the pod: the App PEM arrives as `HUSK_GITHUB__PRIVATE_KEY`
 and `clouds.yaml` mounts at `/app/.config/openstack/` because the image pins
 `HOME=/app`. `k8s-secrets` uses `create --dry-run | apply`, so re-running it
 rotates the values in place.
+
+### Webhooks (optional)
+
+`secrets/webhook-secret` enables `POST /webhook`, which is how the dashboard
+learns *which job* each busy slot is running (the runners API only says
+busy/not-busy) and how `husk_jobs_queued` gets its queue depth. It must match
+the secret set on the App's **Webhook** settings, with the App subscribed to
+**Workflow job** events. Nothing here affects scaling — sizing stays on the poll,
+so a missed delivery costs a dashboard cell, not a wrong fleet size.
+
+Leave the file out and the webhook is simply disabled: the Secret key is
+`optional: true` in the Deployment, and huskd then **refuses** every delivery
+(401) rather than accepting unsigned ones. Because `k8s-secrets` rebuilds the
+whole `huskd-github` Secret, the recipe folds this key into the same
+`create | apply` — applying it separately would drop it on the next rotation.
+
+At CERN the endpoint is reachable from the internet through a *second* Route
+(`k8s/overlays/cern/route-webhook.yaml`) that claims the same host with
+`path: /webhook` and `haproxy.router.openshift.io/ip_whitelist: ""`. The pathless
+`route.yaml` keeps its default CERN-only visibility, which is what stops the
+dashboard, `/status`, `/metrics` and the slot console from being published along
+with it. **Absent ≠ empty** on that annotation: removing it re-inserts the CERN
+ranges and deliveries start timing out silently — watch
+`husk_webhook_deliveries_total{result="rejected"}`, which also catches a rotated
+secret huskd has not been restarted for.
 
 **Rotating a Secret does not restart the pods on its own — run `just
 k8s-restart` after `k8s-secrets`.** The ConfigMap is kustomize-generated

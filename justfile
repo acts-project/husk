@@ -148,6 +148,7 @@ k8s-init:
     echo
     echo "Next: edit those, then drop your credentials into secrets/ :"
     echo "  secrets/private-key.pem   GitHub App private key"
+    echo "  secrets/webhook-secret    OPTIONAL: enables POST /webhook (job names on the dashboard)"
     echo "  secrets/clouds.yaml       openstacksdk profile (or: just k8s-secrets clouds=~/.config/openstack/clouds.yaml)"
     echo "  secrets/id_ed25519        libvirt-host SSH key   (OPTIONAL: libvirt pools only)"
     echo "  secrets/known_hosts       ssh-keyscan -t ed25519 HOST >> secrets/known_hosts"
@@ -225,13 +226,36 @@ k8s-secrets env="local" pem="secrets/private-key.pem" clouds="":
     if ! kubectl get namespace {{k8s_namespace}} >/dev/null 2>&1; then
         kubectl create namespace {{k8s_namespace}}
     fi
+    # OPTIONAL webhook secret (enables POST /webhook — job identity on the
+    # dashboard + queue-depth metrics). It has to be built into the SAME
+    # create|apply below rather than applied separately: that pipe replaces the
+    # whole Secret, so a huskd-github rebuilt without this key would silently drop
+    # a previously-loaded webhook secret and the endpoint would start 401ing every
+    # delivery. Absent file = the key is simply not in the Secret, which the
+    # Deployment declares `optional: true` and huskd treats as "no webhook".
+    wh_arg=()
+    wh_state="absent (webhook disabled)"
+    if [ -f secrets/webhook-secret ]; then
+        # Trailing newlines are what `echo > file` produces and are NOT part of the
+        # secret — GitHub signs with the exact bytes you paste into the App's
+        # webhook settings, so a stray \n here breaks every signature. Normalize
+        # into a temp file rather than trusting how the file was written.
+        wh_tmp="$(mktemp)"
+        trap 'rm -f "$wh_tmp"' EXIT
+        tr -d '\r\n' < secrets/webhook-secret > "$wh_tmp"
+        [ -s "$wh_tmp" ] || { echo "secrets/webhook-secret is empty" >&2; exit 1; }
+        wh_arg=(--from-file=webhook-secret="$wh_tmp")
+        wh_state="loaded ($(wc -c < "$wh_tmp" | tr -d ' ') bytes)"
+    fi
     # --dry-run|apply so re-running rotates the contents instead of erroring.
     # NB "$pem"/"$clouds", not {{pem}}/{{clouds}} — the shell vars are the ~-expanded
-    # ones. The Secret KEYS (private-key.pem, clouds.yaml) are what the Deployment
-    # references, so they're fixed regardless of the source filename.
+    # ones. The Secret KEYS (private-key.pem, clouds.yaml, webhook-secret) are what
+    # the Deployment references, so they're fixed regardless of the source filename.
     kubectl create secret generic huskd-github \
         --from-file=private-key.pem="$pem" \
+        "${wh_arg[@]}" \
         -n {{k8s_namespace}} --dry-run=client -o yaml | kubectl apply -f -
+    echo "  webhook secret: $wh_state"
     kubectl create secret generic huskd-openstack \
         --from-file=clouds.yaml="$clouds" \
         -n {{k8s_namespace}} --dry-run=client -o yaml | kubectl apply -f -
