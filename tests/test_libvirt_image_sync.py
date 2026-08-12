@@ -7,6 +7,9 @@ without a hypervisor (the live I/O is covered by scripts/smoke_libvirt.py)."""
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import pytest
 
 from husk.backend import BackendError
@@ -247,6 +250,57 @@ class _FakeDom:
         if self._ip_raises:
             raise RuntimeError("libvirt hiccup")
         return {}
+
+
+def _real_shell(_host, cmd, data=None):
+    """Runs the constructed probe command through an ACTUAL shell. The bug this
+    guards against lives in shell short-circuit semantics, not in Python, so a
+    mocked _ssh that just returns a canned value would never have caught it."""
+    return subprocess.run(["bash", "-c", cmd], capture_output=True, timeout=5).stdout
+
+
+def test_resolve_emulator_picks_only_the_first_existing_candidate(monkeypatch):
+    """Regression test: `A && B || C && D` (no grouping) does not short-circuit
+    the way it looks. Once `test -x A && echo A` succeeds, `|| test -x C` skips
+    C without updating the exit status — so the stale success from `echo A`
+    still satisfies the `&&` before `echo D`, and D fires too even though C was
+    never checked. On a host where BOTH candidates genuinely exist, that fed a
+    two-line, newline-containing garbage value straight into <emulator>, which
+    broke defineXML outright instead of just picking the first candidate."""
+    import husk.libvirt_backend as lb
+
+    monkeypatch.setattr(lb, "_EMULATOR_CANDIDATES", (sys.executable, "/bin/ls"))
+    b = _backend()
+    host = b._hosts["h1"]
+    b._ssh = _real_shell
+
+    assert b._resolve_emulator(host) == sys.executable
+
+
+def test_resolve_emulator_falls_through_to_the_second_candidate(monkeypatch):
+    import husk.libvirt_backend as lb
+
+    monkeypatch.setattr(
+        lb, "_EMULATOR_CANDIDATES", ("/no/such/binary-xyz", sys.executable)
+    )
+    b = _backend()
+    host = b._hosts["h1"]
+    b._ssh = _real_shell
+
+    assert b._resolve_emulator(host) == sys.executable
+
+
+def test_resolve_emulator_falls_back_when_no_candidate_exists(monkeypatch):
+    import husk.libvirt_backend as lb
+
+    monkeypatch.setattr(
+        lb, "_EMULATOR_CANDIDATES", ("/no/such/binary-a", "/no/such/binary-b")
+    )
+    b = _backend()
+    host = b._hosts["h1"]
+    b._ssh = _real_shell
+
+    assert b._resolve_emulator(host) == lb.lx.DEFAULT_EMULATOR
 
 
 def test_list_slots_filters_by_pool():

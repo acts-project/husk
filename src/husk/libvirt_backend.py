@@ -279,8 +279,17 @@ class LibvirtBackend:
         warning) if none of the candidates exist — matches the old hardcoded
         behavior rather than leaving the domain unbootable outright."""
         if host.emulator is None:
+            # Each candidate MUST be its own `{ ; }` group. `A && B || C && D`
+            # (no braces) does not short-circuit the way it looks: once A && B
+            # succeeds, the || skips C without touching the exit status, so the
+            # stale success from B still satisfies the && before D — D (and
+            # every candidate after the first hit) runs too, echoing every
+            # remaining path regardless of whether it exists. That produced a
+            # multi-line `found` fed straight into <emulator>, which is why a
+            # host with BOTH candidates present broke defineXML outright
+            # instead of picking the first one.
             test = " || ".join(
-                f"test -x {shlex.quote(p)} && echo {shlex.quote(p)}"
+                f"{{ test -x {shlex.quote(p)} && echo {shlex.quote(p)}; }}"
                 for p in _EMULATOR_CANDIDATES
             )
             found = self._ssh(host, f"{test} || true").decode().strip()
