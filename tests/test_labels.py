@@ -109,6 +109,63 @@ def test_cvmfs_label_follows_the_cvmfs_table(tmp_path):
     assert "cvmfs" not in load_config(_write(tmp_path, 'arch = "x64"')).runner.labels
 
 
+# ------------------------------------------------------------------- discovery
+def test_undiscoverable_pool_registers_only_its_name(tmp_path):
+    """The whole point: `runs-on: [self-hosted, linux, x64]` must not reach it."""
+    cfg = load_config(_write(tmp_path, 'discovery = "none"', name="special"))
+    assert cfg.runner.labels == ["husk-pool-special"]
+
+
+def test_undiscoverable_pool_drops_capabilities_too(tmp_path):
+    """A retained `cvmfs` would leave `runs-on: [cvmfs]` matching, and selection by
+    identity settles the capabilities implicitly anyway — husk.labels explains."""
+    toml = _POOL.format(name="special", runner='discovery = "none"') + (
+        '[pool.cvmfs]\nrepositories = ["sft.cern.ch"]\n'
+        'http_proxy = "http://squid:3128"\n'
+    )
+    p = tmp_path / "excl.toml"
+    p.write_text(toml)
+    assert load_config(str(p)).runner.labels == ["husk-pool-special"]
+
+
+def test_undiscoverable_gpu_pool_keeps_no_accelerator_labels():
+    labels = derive_labels(
+        pool_name="reserved-gpu",
+        backend_type="libvirt",
+        size=None,
+        gpu_vendor="nvidia",
+        gpu_model="A100",
+        discoverable=False,
+    )
+    assert labels == ["husk-pool-reserved-gpu"]
+
+
+def test_extras_are_how_a_capability_is_opted_back_in(tmp_path):
+    """The capability namespace is unreserved, so re-advertising one is a
+    deliberate, greppable act rather than an inherited default."""
+    cfg = load_config(
+        _write(tmp_path, 'discovery = "none"\nextra_labels = ["cvmfs"]', name="special")
+    )
+    assert cfg.runner.labels == ["husk-pool-special", "cvmfs"]
+
+
+def test_discovery_survives_a_defaults_merge(tmp_path):
+    """`discoverable = false` was the natural spelling and is unusable: `false` is
+    _with_defaults' decline sentinel, so the key would be stripped before validation
+    and the pool would come up DISCOVERABLE — the opposite of what is written, with
+    no error. A named value cannot be mistaken for the sentinel."""
+    p = tmp_path / "defaults.toml"
+    p.write_text(
+        "[github]\napp_id = 1\n\n"
+        '[defaults]\ntarget = { org = "acts-project" }\n\n'
+        '[[pool]]\nname = "special"\n'
+        '[pool.runner]\ndiscovery = "none"\n'
+        '[pool.backend]\ncloud = "cern"\nimage_name = "img"\n'
+        'flavor_name = "m2.small"\nnetwork_name = "net"\n'
+    )
+    assert load_configs(str(p))[0].runner.labels == ["husk-pool-special"]
+
+
 def test_extra_labels_are_appended_and_deduped():
     labels = derive_labels(
         pool_name="p", backend_type="openstack", extra=["acts", "linux"]
@@ -183,3 +240,13 @@ def test_pool_pinning_still_reads_as_underspecified():
         "arch",
         "class",
     ]
+
+
+def test_pinning_an_undiscoverable_pool_is_fully_specified():
+    """...but naming a pool that carries no other labels is the ONLY way to reach
+    it, so the advice above has nothing to offer and the flag would be noise."""
+    assert underspecified(["husk-pool-special"], undiscoverable_pools=["special"]) == []
+    # Unchanged for every other pool — the exemption is earned, not general.
+    assert underspecified(
+        ["husk-pool-openstack-cpu"], undiscoverable_pools=["special"]
+    ) == ["arch", "class"]

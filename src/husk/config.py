@@ -543,6 +543,18 @@ def load_configs(path: str, *, secrets_dir: str | None = None) -> list[Config]:
         # Capability labels husk has no vocabulary for. Appended verbatim; the
         # husk-* namespace is reserved (see husk.labels.check_extra_label).
         extra_labels: list[str] = []
+        # "none" takes this pool out of the discovery set: it registers as
+        # `husk-pool-<name>` plus extra_labels and nothing else, so only a selector
+        # naming it can land a job here. For the special-purpose box that must not
+        # answer to `runs-on: [self-hosted, linux, x64]`. husk.labels explains why
+        # the capability labels drop too, and why extra_labels is the way to put
+        # one back.
+        #
+        # A named value rather than the `discoverable = false` this obviously wants
+        # to be, because `false` is _with_defaults' decline sentinel: a pool writing
+        # it would have the key STRIPPED before validation and come up discoverable,
+        # silently, which for this knob fails open. test_labels guards it.
+        discovery: Literal["labels", "none"] = "labels"
 
         @field_validator("extra_labels")
         @classmethod
@@ -1070,6 +1082,7 @@ def _pool_config(p, github: GithubConfig, controller: ControllerConfig) -> Confi
                 gpu_model=p.runner.gpu_model,
                 cvmfs=cvmfs is not None,
                 extra=p.runner.extra_labels,
+                discoverable=p.runner.discovery == "labels",
             ),
             arch=p.runner.arch,
             size=p.runner.size,

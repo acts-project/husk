@@ -37,6 +37,25 @@ the same leak the size dimension exists to prevent, one level down. Accelerator
 labels *replace* the size dimension rather than stacking with it. The cost is
 that "a large GPU box" is inexpressible until there is more than one GPU shape,
 at which point `gpu-<model>` says it more precisely anyway.
+
+WHAT `discoverable = false` MEANS: everything above serves *discovery* — a job
+states a requirement and GitHub finds any slot that meets it. A pool can opt out
+of that entirely, and then it registers as `husk-pool-<name>` plus operator
+extras, nothing else. Not even `self-hosted`, because `runs-on: self-hosted` is
+exactly the accidental selection the opt-out exists to prevent.
+
+The capability labels go too, and that is the part worth explaining: keeping
+`cvmfs` on an undiscoverable pool would leave `runs-on: [cvmfs]` matching it, so
+every capability retained is a matching surface the operator has to keep
+auditing. Dropping them costs nothing, because selection by identity settles the
+capabilities implicitly — an author who names one pool has already chosen the
+machine, and the name says more about it than any label could. The two modes do
+not stack; a pool is in the discovery set or it is not.
+
+Extras still apply, and that is the escape hatch: the capability namespace is not
+reserved, so a pool that genuinely wants to advertise one writes it into
+`extra_labels` and opts back in deliberately. Exclusivity fails closed, and every
+exception to it is greppable.
 """
 
 from __future__ import annotations
@@ -71,6 +90,19 @@ def _slug(name: str) -> str:
     return s or "pool"
 
 
+def pool_label(pool_name: str) -> str:
+    """The label that names one pool — its identity, and the only label an
+    undiscoverable pool answers to."""
+    return f"{HUSK_PREFIX}pool-{_slug(pool_name)}"
+
+
+def _dedup(labels: Sequence[str]) -> list[str]:
+    """First occurrence wins, case-insensitively — so an extra that repeats a
+    derived label is a no-op rather than a double registration."""
+    seen: set[str] = set()
+    return [x for x in labels if not (x.lower() in seen or seen.add(x.lower()))]
+
+
 def check_extra_label(label: str) -> str:
     """Validate one operator-supplied extra label, or raise ValueError.
 
@@ -103,6 +135,7 @@ def derive_labels(
     gpu_model: str = "",
     cvmfs: bool = False,
     extra: Sequence[str] = (),
+    discoverable: bool = True,
 ) -> list[str]:
     """The full label set for one pool, in a stable order.
 
@@ -113,12 +146,21 @@ def derive_labels(
     double registration.
 
     `size` is None for accelerator pools — see the module docstring.
+
+    `discoverable=False` collapses the set to identity plus extras, so the pool is
+    reachable only by a selector that names it. Also in the module docstring, and
+    the reason this returns early rather than filtering at the end: the derived
+    labels are not *suppressed* one by one, they are never claimed.
     """
+    if not discoverable:
+        # Always ≥1 label, which GitHub's JIT registration requires.
+        return _dedup([pool_label(pool_name), *extra])
+
     out: list[str] = ["self-hosted", "linux", arch]
     if alias := ARCH_ALIASES.get(arch):
         out.append(alias)
 
-    out += ["husk", f"husk-pool-{_slug(pool_name)}", f"husk-backend-{backend_type}"]
+    out += ["husk", pool_label(pool_name), f"husk-backend-{backend_type}"]
     if size:
         out.append(f"husk-size-{size}")
 
@@ -134,9 +176,7 @@ def derive_labels(
         out.append("cvmfs")
 
     out += list(extra)
-
-    seen: set[str] = set()
-    return [x for x in out if not (x.lower() in seen or seen.add(x.lower()))]
+    return _dedup(out)
 
 
 def arch_labels(labels: Sequence[str]) -> list[str]:
@@ -179,15 +219,31 @@ def class_labels(labels: Sequence[str]) -> list[str]:
 #
 # `husk` satisfies neither: it never narrows anything, which is exactly why it is
 # an enumeration label rather than a routing one.
+#
+# A `husk-pool-*` pin satisfies neither either, and deliberately so: it IS exact
+# (a pool is one hardware shape), but it is exact by naming a supplier rather than
+# by stating a requirement, and blessing it would make "specific" ambiguous
+# between the two. A discoverable pool's jobs should say what they need.
 _DIMENSIONS = {"arch": arch_labels, "class": class_labels}
 
 
-def underspecified(labels: Sequence[str]) -> list[str]:
+def underspecified(
+    labels: Sequence[str], *, undiscoverable_pools: Sequence[str] = ()
+) -> list[str]:
     """Dimensions this `runs-on` selector fails to pin, in a stable order.
 
     Empty means the selector names exactly the hardware it means to. Exposed so
     the dashboard and any workflow linter share one definition of "specified"
     rather than each re-deriving it — and so the answer changes in one place when
     a dimension is added.
+
+    `undiscoverable_pools` names the pools running with `discoverable = false`; a
+    selector pinning one of those is complete by construction, because naming it
+    is the only way to reach it and no requirement-shaped selector ever will. The
+    caller passes the set because this is a pure function over a selector — the
+    label alone cannot say which kind of pool it names.
     """
+    exempt = {pool_label(p) for p in undiscoverable_pools}
+    if exempt.intersection(labels):
+        return []
     return [name for name, pick in _DIMENSIONS.items() if not pick(labels)]

@@ -170,6 +170,15 @@ name = "openstack-cpu"
 # Capability labels husk has no vocabulary for. The husk-* namespace is reserved
 # for derived labels and is rejected here.
 # extra_labels = ["acts"]
+# Take a special-purpose machine OUT of the discovery set. The default ("labels")
+# derives the full set above, so the pool answers to any selector it satisfies —
+# including a bare `runs-on: [self-hosted, linux, x64]`. "none" registers ONLY
+# `husk-pool-<name>` plus extra_labels, so nothing lands here that did not ask for
+# this pool by name. The capability labels drop too (a kept `cvmfs` would leave
+# `runs-on: [cvmfs]` matching); re-advertise one by putting it in extra_labels,
+# which is unreserved. Jobs then use `runs-on: [husk-pool-<name>]` — with no
+# `self-hosted`, which is correct here and looks wrong on purpose.
+# discovery = "none"
 # In-guest metrics (observability.md). Opens :9100 (node_exporter, baked into the
 # golden) to this source ONLY — it has no TLS/auth, so this allowlist IS the access
 # control. Unset (default) = fail-closed: no rule, no exporter.
