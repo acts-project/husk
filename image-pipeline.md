@@ -151,12 +151,36 @@ per-slot, per-job, or meant to change without a rebuild.
 - **Single spec, two variants.** A declarative package/setup list drives a
   `virt-customize` build parameterized by `--variant {base,gpu}`. This replaces
   the manual, GPU-only `scripts/build-golden-image.sh`.
-- **Pinned inputs** (recorded in a manifest annotation on the artifact):
-  base-image URL (a specific dated qcow2, **not** `-latest`), runner version
-  (shared with `[runner] version` in huskd config), driver + toolkit package
-  versions.
-- **Publish via ORAS** to `ghcr.io/<org>/husk-{base,gpu}`, tagged with a
-  release version + the git SHA, and referenced elsewhere by immutable digest.
+- **Pinned inputs** (`images/versions.env`, recorded as manifest annotations on
+  the artifact): base-image URL (a specific dated qcow2, **not** `-latest`),
+  runner version (baked into the image — huskd config has no say in it),
+  node_exporter and cvmfs client versions.
+- **The OS baseline is refreshed at build time,** not frozen at the base image:
+  `build.sh` runs a full `dnf upgrade`, **kernel included**, so a rebuild lands on
+  current errata. This matters because AlmaLinux only cuts a new dated
+  GenericCloud at point releases (~2x/year) — far too slow for kernel CVEs.
+  The `base` variant takes the newest kernel outright; `gpu` excludes it from the
+  upgrade and instead lets the `nvidia-open-kmod` dependency pull the newest
+  kernel that has a matching *precompiled* driver (there is no DKMS — that was
+  the GPU POC's blocker).
+- **CI boots the artifact** ("Boot smoke": NoCloud seed under qemu, assert
+  cloud-init reaches `runcmd`). This is what makes offline kernel upgrades safe —
+  kernel scriptlets run dracut inside the libguestfs appliance against the wrong
+  running kernel, and static `guestfish` checks cannot distinguish a working
+  initramfs from a broken one. Removing that step means re-adding
+  `--exclude='kernel*'` in `build.sh`.
+- **Most inputs are deliberately *not* pinned** — `epel-release`,
+  `cvmfs-release-latest`, the nvidia repos and every `dnf install` resolve to
+  whatever the mirrors serve. The **weekly scheduled rebuild** is what makes that
+  safe: drift becomes a bounded, bisectable weekly delta rather than an unbounded
+  one discovered under time pressure.
+- **Publish via ORAS** to `ghcr.io/<org>/husk-{base,gpu}`, tagged with the **build
+  date** (`YYYY-MM-DD`) + the git SHA, and referenced elsewhere by immutable
+  digest. The hand-minted `v0`-`v9` series is retired: it required someone to
+  remember to increment it, and conveyed nothing a date doesn't. Existing `v*`
+  tags stay pullable as frozen history. Tags are never re-pointed — the publish
+  step hard-errors on a collision, because `image_sync.resolve()` re-resolves
+  tag→digest on every huskd start, so moving a tag drains every slot in the pool.
   Artifact type e.g. `application/vnd.husk.vmimage`, layer mediaType
   `application/vnd.husk.qcow2`.
 - **CI gotchas to handle** (see implementation plan below): `/dev/kvm` may be
