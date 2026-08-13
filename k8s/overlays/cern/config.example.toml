@@ -56,7 +56,7 @@ flavor_name = "m2.small"
 network_name = "CERN_NETWORK"
 keypair = "acts-gha"
 rebuild_microversion = "2.79"
-image_ref = "ghcr.io/acts-project/husk-base:v8"
+image_ref = "ghcr.io/acts-project/husk-base:2026-08-18"
 min_ready = 4
 max_total = 4
 
@@ -131,7 +131,7 @@ vm_prefix = "husk-lv-cpu"
 # and not rate-limiting. huskd oras-pulls this once into the shared controller
 # cache and scp's it to the host's pool dir by digest; the host needs no registry
 # access of its own.
-image_ref = "registry.cern.ch/ghcr.io/acts-project/husk-base:v9"
+image_ref = "registry.cern.ch/ghcr.io/acts-project/husk-base:2026-08-18"
 min_ready = 1
 max_total = 1
 

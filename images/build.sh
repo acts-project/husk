@@ -50,6 +50,23 @@ RUNNER_URL="https://github.com/actions/runner/releases/download/v${RUNNER_VERSIO
 NODE_EXPORTER_TGZ="node_exporter-${NODE_EXPORTER_VERSION}.linux-amd64.tar.gz"
 NODE_EXPORTER_URL="https://github.com/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VERSION}/${NODE_EXPORTER_TGZ}"
 
+# How far the OS upgrade is allowed to move the kernel.
+#
+# base: everything, kernel included — the boot smoke test in CI is what makes
+#   that safe, and kernel CVE cadence makes it necessary.
+# gpu: everything EXCEPT the kernel, which is then pulled in by the nvidia
+#   install below. nvidia-open-kmod is *precompiled* against one exact kernel
+#   build (no DKMS — that was the GPU POC's blocker), so its own dependency
+#   resolves to the newest kernel that actually has a working driver. Upgrading
+#   the kernel first would instead demand a kmod that may not be built yet and
+#   fail the transaction, or leave a driver that won't load — which an offline
+#   build cannot detect and CI has no GPU to catch.
+if [[ "$VARIANT" == gpu ]]; then
+  UPGRADE_CMD="dnf -y --refresh --exclude='kernel*' upgrade"
+else
+  UPGRADE_CMD="dnf -y --refresh upgrade"
+fi
+
 command -v virt-customize >/dev/null || {
   echo "need guestfs-tools (dnf install guestfs-tools / apt install guestfs-tools)" >&2
   exit 1
@@ -84,6 +101,23 @@ ARGS=(
   # slot manages its own resolv.conf (NetworkManager/cloud-init), so this is
   # build-time only in practice.
   --run-command 'printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf'
+
+  # Bring the OS baseline up to current errata, KERNEL INCLUDED. BASE_IMAGE_URL
+  # pins a *starting point*, not the final package set: AlmaLinux only cuts a new
+  # dated GenericCloud at point releases (~2x/year), and that is far too slow a
+  # cadence for kernel CVEs. With this, the weekly scheduled build
+  # (.github/workflows/build-images.yml) is a genuinely patched image.
+  # --refresh because the base image ships a populated, already-stale metadata cache.
+  #
+  # Upgrading the kernel offline is only safe because CI now BOOTS the artifact
+  # (the "Boot smoke" step): kernel RPM scriptlets run dracut inside the
+  # libguestfs appliance, where uname -r is the appliance's kernel, so a bad
+  # initramfs is a real if unquantified risk. Static guestfish checks cannot see
+  # it — an actual boot can. Do not drop that step.
+  #
+  # $UPGRADE_CMD, because the gpu variant handles the kernel differently — see
+  # where it is set above.
+  --run-command "$UPGRADE_CMD"
 
   # Container stack + runner native deps + firewall ENGINE (ruleset is runtime).
   --install "podman,podman-docker,fuse-overlayfs,slirp4netns,netavark,aardvark-dns,libicu,sudo,curl,jq,git,nftables,tar"
@@ -198,10 +232,31 @@ if [[ "$VARIANT" == gpu ]]; then
   )
 fi
 
+# ------------------------------------------------------------- reclaim + finish
+# Last dnf-touching step, deliberately after the gpu block so it also catches the
+# driver/CUDA download cache. AlmaLinux 10 is dnf5 (/var/cache/libdnf5); the dnf4
+# path is cleaned too so this keeps working either way. Matters because the base
+# variant is resized to exactly 10G — CERN's m2.small root disk, a hard ceiling —
+# and `dnf upgrade` above stages every replacement RPM in that cache.
+ARGS+=(
+  --run-command 'dnf -y clean all'
+  --run-command 'rm -rf /var/cache/libdnf5/* /var/cache/dnf/* /var/log/dnf* /var/log/hawkey.log'
+)
+
 ARGS+=(--selinux-relabel)
 
 echo "==> customizing $OUT (variant=$VARIANT, runner=$RUNNER_VERSION)"
 virt-customize "${ARGS[@]}"
 
+# Freeing blocks inside the guest does NOT shrink the qcow2 — without this the
+# published ORAS artifact permanently carries the peak footprint of every build,
+# and a weekly rebuild would ratchet it upward. --in-place discards without
+# needing 2x scratch space. NOT `qemu-img convert -c`: the golden is the backing
+# file for every live overlay, so compressed reads would tax every slot forever.
+echo "==> sparsifying $OUT"
+virt-sparsify --in-place "$OUT"
+
 echo "==> done: $OUT"
 qemu-img info "$OUT" | sed 's/^/    /'
+# Headroom against the per-variant disk size (10G is a hard ceiling for base).
+virt-df -h -a "$OUT" | sed 's/^/    /'

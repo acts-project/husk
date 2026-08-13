@@ -85,7 +85,7 @@ flavor_name = "m2.small"
 network_name = "CERN_NETWORK"
 keypair = "acts-gha"
 rebuild_microversion = "2.79"
-image_ref = "ghcr.io/acts-project/husk-base:v4"
+image_ref = "ghcr.io/acts-project/husk-base:2026-08-18"
 # One slot, so a local test drive can't eat the project quota. The image cache is
 # an emptyDir here, so each pod restart re-pulls the golden (~GBs) — fine for a
 # handful of runs, and the reason the live overlay uses a PVC.

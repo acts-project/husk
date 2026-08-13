@@ -4,16 +4,31 @@ name: build-images
 # the qcow2 artifacts to ghcr.io via ORAS. See image-pipeline.md (Phase A).
 #
 # Build + static smoke run on every relevant push (CI signal). Publishing to
-# ghcr only happens on a manual run (workflow_dispatch) — so feature branches
-# don't push images by accident. Pin a release tag via the `version` input.
+# ghcr only happens on a manual run (workflow_dispatch) or the weekly schedule,
+# and only from main — so feature branches don't push images by accident. Pin a
+# release tag via the `version` input; blank gives today's UTC date.
+#
+# The weekly rebuild exists because most of what goes into the image is NOT
+# pinned: build.sh runs `dnf upgrade`, and epel-release, cvmfs-release-latest and
+# the nvidia repos all resolve to whatever the mirrors serve at build time. Only
+# the base qcow2, the runner, node_exporter and the cvmfs client are pinned. So
+# drift is already real — building weekly makes it a bounded, bisectable delta
+# ("last Tuesday was green") instead of an unbounded surprise cashed in at the
+# worst moment, when you urgently need a fresh image and have three months of
+# candidate causes. Note GitHub auto-disables cron on repos idle for 60 days.
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Image tag to publish (e.g. v1). Blank -> 0.0.0-<date>."
+        description: "Override the tag. Blank -> today's UTC date (the normal case)."
         required: false
         default: ""
+  schedule:
+    # Tue 04:43 UTC — a day after bump-image-inputs.yml's Monday PRs, so a merged
+    # bump gets baked the same week. Odd minute: on-the-hour crons queue behind
+    # the scheduler backlog, and GitHub's cron is best-effort anyway.
+    - cron: "43 4 * * 2"
   push:
     paths:
       - "images/**"
@@ -24,13 +39,23 @@ permissions:
   packages: write
 
 concurrency:
-  group: build-images-${{ github.ref }}
-  cancel-in-progress: true
+  # Keyed on the event too: a push to main would otherwise share a group with a
+  # scheduled/manual run and cancel it mid-`oras push`. Only push runs — the ones
+  # that are pure CI signal — are cancellable.
+  group: build-images-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    # Raised from 60: build.sh now also does a full `dnf upgrade` and a
+    # virt-sparsify pass (together roughly +3-8 min per variant).
+    timeout-minutes: 90
+    env:
+      # Single source of truth for the ORAS steps' `if:`. The branch check is
+      # load-bearing, not belt-and-braces: without it ANY workflow_dispatch on
+      # ANY branch publishes a real tag from unmerged code.
+      PUBLISH: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
     strategy:
       fail-fast: false
       matrix:
@@ -44,7 +69,9 @@ jobs:
       - name: Install build tooling
         run: |
           sudo apt-get update
-          sudo apt-get install -y guestfs-tools qemu-utils
+          # qemu-system-x86 + genisoimage are for the boot smoke step, which
+          # actually boots the artifact with a NoCloud seed.
+          sudo apt-get install -y guestfs-tools qemu-utils qemu-system-x86 genisoimage
 
       - name: Prepare libguestfs backend
         # ubuntu-22.04 ships libguestfs 1.46, whose appliance uses qemu SLIRP
@@ -106,14 +133,113 @@ jobs:
             guestfish --ro -a "$img" -i command "rpm -q nvidia-driver nvidia-container-toolkit"
             [ "$(guestfish --ro -a "$img" -i exists /etc/systemd/system/husk-cdi.service)" = "true" ] || { echo "MISSING: husk-cdi.service"; fail=1; }
           fi
+          echo "==> filesystem headroom"
+          # `dnf upgrade` in build.sh spends disk, and the base variant is sized
+          # to exactly 10G (CERN m2.small root disk) — a ceiling we cannot raise.
+          # Catch the squeeze here as a red build rather than as slots that fail
+          # to come up at CERN, or jobs that run out of scratch mid-build.
+          #
+          # statvfs on the inspected root, not `virt-df` over every filesystem:
+          # the ESP is legitimately near-full on a stock cloud image and would be
+          # a permanent false red. (And not `guestfish command df`, which runs in
+          # a chroot and reports the *appliance's* mounts.)
+          virt-df -h -a "$img" || true
+          stat="$(guestfish --ro -a "$img" -i statvfs /)"
+          bsize="$(echo "$stat" | awk -F': *' '$1=="bsize"{print $2}')"
+          bavail="$(echo "$stat" | awk -F': *' '$1=="bavail"{print $2}')"
+          blocks="$(echo "$stat" | awk -F': *' '$1=="blocks"{print $2}')"
+          if [ -z "$bsize" ] || [ -z "$bavail" ] || [ -z "$blocks" ]; then
+            echo "could not read statvfs / from $img"; fail=1
+          else
+            free_mib=$(( bsize * bavail / 1048576 ))
+            total_mib=$(( bsize * blocks / 1048576 ))
+            # NB: this is the UNGROWN filesystem, so both variants read ~8.7 GiB
+            # here regardless of BASE_/GPU_DISK_SIZE — build.sh resizes the DISK,
+            # and cloud-init's growpart expands the filesystem into it at first
+            # boot. That makes this a conservative measure of a real slot, which
+            # is the right direction for a tripwire.
+            echo "root fs (pre-growpart): ${free_mib} MiB free of ${total_mib} MiB"
+            # Surfaced so week-over-week drift is visible before it is a failure.
+            echo "- \`${{ matrix.variant }}\` root fs (pre-growpart): **${free_mib} MiB** free of ${total_mib} MiB" >> "$GITHUB_STEP_SUMMARY"
+            # Floor, not a percentage: what matters is absolute room, and the
+            # base variant's 10G disk is a hard ceiling (CERN m2.small).
+            if [ "$free_mib" -lt 2048 ]; then
+              echo "TOO FULL: under 2 GiB free on the root filesystem"; fail=1
+            fi
+          fi
           exit $fail
 
+      - name: Boot smoke (${{ matrix.variant }})
+        # THE gate that lets build.sh upgrade the kernel. Every other check here
+        # is static guestfish inspection, which cannot tell a working initramfs
+        # from a broken one — and kernel scriptlets run dracut inside the
+        # libguestfs appliance, against the wrong running kernel. So: actually
+        # boot the thing, under a NoCloud seed, and require cloud-init to reach
+        # runcmd. If you ever remove this, re-add --exclude='kernel*' in build.sh.
+        run: |
+          set -euo pipefail
+          img="husk-${{ matrix.variant }}.qcow2"
+
+          # Overlay: the boot dirties the disk (relabel, logs, machine-id) and the
+          # base file is what gets published.
+          qemu-img create -f qcow2 -b "$img" -F qcow2 boot-test.qcow2 >/dev/null
+
+          mkdir -p seed
+          cat > seed/meta-data <<'EOF'
+          instance-id: husk-boot-smoke
+          local-hostname: husk-boot-smoke
+          EOF
+          # The marker is written to a FILE, and that file is what we assert on
+          # below — reading it back out of the overlay needs no assumption about
+          # console=ttyS0 being on the guest cmdline. The /dev/console copy is
+          # for a live view in the CI log when something goes wrong.
+          # power_state makes qemu exit by itself, so the happy path doesn't sit
+          # out the timeout.
+          cat > seed/user-data <<'EOF'
+          #cloud-config
+          runcmd:
+            - [ sh, -c, "uname -r > /var/lib/husk/boot-smoke-ok" ]
+            - [ sh, -c, "echo HUSK-BOOT-OK kernel=$(uname -r) > /dev/console" ]
+          power_state:
+            mode: poweroff
+            timeout: 30
+            condition: true
+          EOF
+          genisoimage -quiet -output seed.iso -volid cidata -joliet -rock \
+            seed/meta-data seed/user-data
+
+          # -cpu host is only valid under KVM; fall back to max for TCG.
+          if [ -e /dev/kvm ]; then accel=(-enable-kvm -cpu host); else accel=(-cpu max); fi
+
+          # NOT -no-reboot: virt-customize's --selinux-relabel defers to
+          # /.autorelabel, so the guest relabels and reboots ONCE before
+          # cloud-init ever runs. The marker appears on the second boot.
+          timeout 900 qemu-system-x86_64 "${accel[@]}" \
+            -m 2048 -smp 2 \
+            -drive file=boot-test.qcow2,if=virtio,format=qcow2 \
+            -cdrom seed.iso \
+            -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+            -display none -serial file:console.log || true
+
+          echo "===== console tail ====="
+          tail -n 100 console.log || true
+
+          # Authoritative check: did cloud-init actually reach runcmd inside the
+          # booted guest? Read the marker back out of the overlay.
+          if ! booted="$(guestfish --ro -a boot-test.qcow2 -i cat /var/lib/husk/boot-smoke-ok 2>/dev/null)" \
+             || [ -z "$booted" ]; then
+            echo "::error::husk-${{ matrix.variant }} did not boot to cloud-init runcmd (see console tail above)"
+            exit 1
+          fi
+          echo "booted OK, kernel ${booted}"
+          echo "- \`${{ matrix.variant }}\` booted OK on kernel \`${booted}\`" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Set up ORAS
-        if: github.event_name == 'workflow_dispatch'
+        if: env.PUBLISH == 'true'
         uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
 
       - name: Publish to ghcr.io
-        if: github.event_name == 'workflow_dispatch'
+        if: env.PUBLISH == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Kept out of the inline script so an attacker-controllable value can't
@@ -126,12 +252,22 @@ jobs:
           source images/versions.env
 
           version="$INPUT_VERSION"
-          [ -n "$version" ] || version="0.0.0-$(date +%Y%m%d)"
+          [ -n "$version" ] || version="$(date -u +%Y-%m-%d)"
           sha="${GITHUB_SHA::7}"
           repo="ghcr.io/${{ github.repository_owner }}/husk-${{ matrix.variant }}"
           img="husk-${{ matrix.variant }}.qcow2"
 
           echo "$GH_TOKEN" | oras login ghcr.io -u "$ACTOR" --password-stdin
+
+          # Never silently re-point an existing tag. Configs pin tags, and
+          # image_sync.resolve() re-resolves tag -> digest on every huskd start:
+          # moving a tag under a running pool drains every slot in it, onto an
+          # image nobody reviewed. Hits on a same-day manual re-run — pass an
+          # explicit `version` instead.
+          if oras manifest fetch "${repo}:${version}" >/dev/null 2>&1; then
+            echo "::error::${repo}:${version} already exists — pass an explicit version input"
+            exit 1
+          fi
 
           oras push "${repo}:${version},${sha}" \
             --artifact-type application/vnd.husk.vmimage \
