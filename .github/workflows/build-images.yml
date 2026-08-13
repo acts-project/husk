@@ -25,7 +25,7 @@ on:
         required: false
         default: ""
   schedule:
-    # Tue 04:43 UTC — a day after bump-runner.yml's Monday PR, so a merged runner
+    # Tue 04:43 UTC — a day after bump-image-inputs.yml's Monday PRs, so a merged
     # bump gets baked the same week. Odd minute: on-the-hour crons queue behind
     # the scheduler backlog, and GitHub's cron is best-effort anyway.
     - cron: "43 4 * * 2"
@@ -153,11 +153,16 @@ jobs:
           else
             free_mib=$(( bsize * bavail / 1048576 ))
             total_mib=$(( bsize * blocks / 1048576 ))
-            echo "root fs: ${free_mib} MiB free of ${total_mib} MiB"
+            # NB: this is the UNGROWN filesystem, so both variants read ~8.7 GiB
+            # here regardless of BASE_/GPU_DISK_SIZE — build.sh resizes the DISK,
+            # and cloud-init's growpart expands the filesystem into it at first
+            # boot. That makes this a conservative measure of a real slot, which
+            # is the right direction for a tripwire.
+            echo "root fs (pre-growpart): ${free_mib} MiB free of ${total_mib} MiB"
             # Surfaced so week-over-week drift is visible before it is a failure.
-            echo "- \`${{ matrix.variant }}\` root fs: **${free_mib} MiB** free of ${total_mib} MiB" >> "$GITHUB_STEP_SUMMARY"
-            # Floor, not a percentage: what matters is absolute room for CI
-            # scratch, and the two variants have very different totals.
+            echo "- \`${{ matrix.variant }}\` root fs (pre-growpart): **${free_mib} MiB** free of ${total_mib} MiB" >> "$GITHUB_STEP_SUMMARY"
+            # Floor, not a percentage: what matters is absolute room, and the
+            # base variant's 10G disk is a hard ceiling (CERN m2.small).
             if [ "$free_mib" -lt 2048 ]; then
               echo "TOO FULL: under 2 GiB free on the root filesystem"; fail=1
             fi

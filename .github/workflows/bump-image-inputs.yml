@@ -1,0 +1,193 @@
+name: bump-image-inputs
+
+# Weekly watch on the two things in images/versions.env that move upstream on
+# someone else's schedule, and that nothing else would ever notice had moved:
+#
+#   runner      — the actions/runner tarball baked into the image. A stale pin
+#                 means every slot pays a self-update on its first job, and
+#                 eventually GitHub stops accepting the version outright.
+#   base-image  — the dated AlmaLinux GenericCloud qcow2. build.sh now runs a
+#                 full `dnf upgrade` on top, so this is housekeeping rather than
+#                 the way security updates arrive — but a point release can
+#                 change defaults, and it keeps the upgrade transaction small.
+#
+# Both open a PR rather than pushing: the point is a review prompt, not silent
+# mutation. Merging either one ships nothing by itself — an image has to be
+# rebuilt (build-images.yml) and the pools' `image_ref` repointed.
+#
+# PRs are authored with BUMP_PR_TOKEN (a fine-grained PAT with Contents +
+# Pull requests: write), NOT the default GITHUB_TOKEN — see scripts/open-bump-pr.sh
+# for why that distinction is load-bearing. A happy side effect: because a PAT
+# push does trigger workflows, build-images.yml runs on the bump PR and now
+# actually BOOTS the resulting image, so a base-image bump is validated before
+# anyone merges it.
+
+on:
+  schedule:
+    # Mon 06:17 UTC, a day before build-images.yml's Tuesday rebuild, so a merged
+    # bump is baked the same week. Odd minute: on-the-hour crons queue behind the
+    # scheduler backlog. GitHub also auto-disables cron on repos idle 60 days.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bump-image-inputs
+  cancel-in-progress: false # never cancel a half-pushed branch
+
+jobs:
+  runner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Check for a newer runner release
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source images/versions.env
+
+          latest="$(gh api repos/actions/runner/releases/latest -q .tag_name)"
+          latest="${latest#v}"
+          # Validate before this ever reaches sed or a URL: it is remote input.
+          [[ "$latest" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad tag: $latest" >&2; exit 1; }
+
+          if [ "$latest" = "$RUNNER_VERSION" ]; then
+            echo "up to date ($RUNNER_VERSION)"
+            echo "bump=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # Only ever go forward — guards against a yanked release or a
+          # transiently stale /releases/latest handing us an older tag.
+          newest="$(printf '%s\n%s\n' "$RUNNER_VERSION" "$latest" | sort -V | tail -1)"
+          if [ "$newest" != "$latest" ]; then
+            echo "pinned $RUNNER_VERSION is ahead of upstream $latest — nothing to do"
+            echo "bump=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # The release is published before its assets finish uploading. Opening a
+          # PR in that window means a red build for a reason that isn't our code.
+          url="https://github.com/actions/runner/releases/download/v${latest}/actions-runner-linux-x64-${latest}.tar.gz"
+          if ! curl -fsIL -o /dev/null "$url"; then
+            echo "linux-x64 asset not published yet — will retry next week"
+            echo "bump=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          sed -i -E "s|^RUNNER_VERSION=.*|RUNNER_VERSION=${latest}|" images/versions.env
+          { echo "bump=true"; echo "from=$RUNNER_VERSION"; echo "to=$latest"; } >> "$GITHUB_OUTPUT"
+
+      - name: Open or update the PR
+        if: steps.check.outputs.bump == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.BUMP_PR_TOKEN }}
+          FROM: ${{ steps.check.outputs.from }}
+          TO: ${{ steps.check.outputs.to }}
+        run: |
+          set -euo pipefail
+          scripts/open-bump-pr.sh \
+            "bot/bump-runner" \
+            "Bump actions/runner to ${TO}" \
+            "Bump actions/runner ${FROM} -> ${TO}" <<EOF
+          Automated bump of \`RUNNER_VERSION\` in \`images/versions.env\`: \`${FROM}\` -> \`${TO}\`.
+
+          Release notes: https://github.com/actions/runner/releases/tag/v${TO}
+
+          The runner is baked into the golden images, so **merging this ships nothing.**
+          To roll it out: merge, wait for the weekly \`build-images\` rebuild (or run it
+          manually), then repoint \`image_ref\` in the pool configs at the new date tag.
+          EOF
+
+  base-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Check for a newer AlmaLinux cloud image
+        id: check
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source images/versions.env
+
+          dir="${BASE_IMAGE_URL%/*}"
+          cur_file="${BASE_IMAGE_URL##*/}"
+          # Split the pinned filename into <prefix><version><suffix> so the search
+          # stays on the SAME variant and arch. AlmaLinux publishes GenericCloud,
+          # GenericCloud-ext4 and OpenNebula side by side in this directory, each
+          # with a `-latest` alias — matching loosely would silently switch us to a
+          # different image. Deriving the pattern from the pin also means an arch or
+          # variant change here is followed automatically.
+          if [[ ! "$cur_file" =~ ^(.+-)([0-9]+\.[0-9]+-[0-9]+\.[0-9]+)(\..+\.qcow2)$ ]]; then
+            echo "cannot parse BASE_IMAGE_URL filename: $cur_file" >&2; exit 1
+          fi
+          prefix="${BASH_REMATCH[1]}"; cur_ver="${BASH_REMATCH[2]}"; suffix="${BASH_REMATCH[3]}"
+
+          sums="$(curl -fsL "${dir}/CHECKSUM")"
+          # Plain string ops rather than a regex over the whole line: the checksum
+          # file is `<sha256>  <filename>`, and the dated builds are exactly those
+          # whose version part is <point-release>-<date>.<n>.
+          newest="$(printf '%s\n' "$sums" | awk -v p="$prefix" -v s="$suffix" '
+            length($1) == 64 && $1 ~ /^[0-9a-f]+$/ && index($2, p) == 1 {
+              rest = substr($2, length(p) + 1)
+              if (length(rest) <= length(s)) next
+              if (substr(rest, length(rest) - length(s) + 1) != s) next
+              v = substr(rest, 1, length(rest) - length(s))
+              if (v ~ /^[0-9]+\.[0-9]+-[0-9]+\.[0-9]+$/) print v
+            }' | sort -V | tail -1)"
+          if [ -z "$newest" ]; then
+            echo "no dated build matched ${prefix}<version>${suffix} in ${dir}/CHECKSUM" >&2
+            exit 1
+          fi
+
+          if [ "$newest" = "$cur_ver" ]; then
+            echo "up to date ($cur_ver)"
+            echo "bump=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "$(printf '%s\n%s\n' "$cur_ver" "$newest" | sort -V | tail -1)" != "$newest" ]; then
+            echo "pinned $cur_ver is ahead of upstream $newest — nothing to do"
+            echo "bump=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          new_file="${prefix}${newest}${suffix}"
+          new_sha="$(printf '%s\n' "$sums" | awk -v f="$new_file" '$2 == f {print $1}')"
+          [ -n "$new_sha" ] || { echo "no checksum for $new_file" >&2; exit 1; }
+
+          # The two must move together or build.sh's verification fails.
+          sed -i -E "s|^BASE_IMAGE_URL=.*|BASE_IMAGE_URL=${dir}/${new_file}|" images/versions.env
+          sed -i -E "s|^BASE_IMAGE_SHA256=.*|BASE_IMAGE_SHA256=${new_sha}|" images/versions.env
+          { echo "bump=true"; echo "from=$cur_ver"; echo "to=$newest"; } >> "$GITHUB_OUTPUT"
+
+      - name: Open or update the PR
+        if: steps.check.outputs.bump == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.BUMP_PR_TOKEN }}
+          FROM: ${{ steps.check.outputs.from }}
+          TO: ${{ steps.check.outputs.to }}
+        run: |
+          set -euo pipefail
+          scripts/open-bump-pr.sh \
+            "bot/bump-base-image" \
+            "Bump AlmaLinux base image to ${TO}" \
+            "Bump AlmaLinux base image ${FROM} -> ${TO}" <<EOF
+          Automated bump of \`BASE_IMAGE_URL\` + \`BASE_IMAGE_SHA256\` in
+          \`images/versions.env\`: \`${FROM}\` -> \`${TO}\`.
+
+          \`build.sh\` runs a full \`dnf upgrade\` on top of this, so the base pin is a
+          starting point rather than the shipped package set — this is housekeeping
+          (smaller upgrade transaction, cleaner image), **not** how security updates
+          arrive.
+
+          **Worth a real look if the point release changed** (e.g. 10.2 -> 10.3), since
+          that can move defaults. \`build-images\` runs on this PR and now boots both
+          variants, so a base image that does not come up will fail here rather than
+          at CERN.
+          EOF
