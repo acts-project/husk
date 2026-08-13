@@ -9,7 +9,7 @@ dependencies = [
     # asyncio.wait_for (replaces the sync `requests` + daemon-thread deadline hack,
     # which is why `requests` is no longer a direct dependency).
     "httpx>=0.27",
-    "typer>=0.26.8",
+    "typer>=0.27.1",
     "pydantic-settings>=2.14.2",
     "rich>=13",
     # Pure-Python OCI client for pulling golden VM images (no oras CLI dep). Shared
@@ -22,11 +22,11 @@ dependencies = [
     # Prometheus exposition: escaping, metric-family typing and `generate_latest`.
     # husk registers *collectors* rather than library Gauge/Counter objects — see
     # husk.metrics for why (labelsets that must expire, and state we persist).
-    "prometheus-client>=0.20",
+    "prometheus-client>=0.26.0",
     # huskd's single HTTP surface (dashboard + /status /metrics /healthz /events).
     # Quart shares one event loop with the runner poller and the reconcile tasks.
     # hypercorn is the ASGI server Quart's run_task drives.
-    "quart>=0.19",
+    "quart>=0.21.0",
     # Cloud-init/nftables templating (husk/files/*.j2). Already in the tree via
     # Quart, but declared because this module imports it directly.
     "jinja2>=3.1",
@@ -34,9 +34,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff>=0.15.20"]
+dev = ["pytest", "ruff>=0.16.1"]
 # libvirt backend — kept optional so the OpenStack/CI path needs no libvirt headers.
-libvirt = ["libvirt-python>=12.5.0"]
+libvirt = ["libvirt-python>=12.6.0"]
 
 [project.scripts]
 huskd = "husk.cli:huskd"
