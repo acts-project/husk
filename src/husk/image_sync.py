@@ -42,6 +42,12 @@ log = logging.getLogger("husk.image")
 # How often to log registry-pull progress (MiB pulled so far) during a slow pull.
 _PULL_PROGRESS_INTERVAL_S = 30.0
 
+# Socket timeouts for every registry request (see `_bound_timeouts`). The read
+# timeout is per socket read, not per transfer, so a multi-GB blob pull is
+# unaffected by it — only a socket that goes genuinely silent trips it.
+_CONNECT_TIMEOUT_S = 10.0
+_READ_TIMEOUT_S = 60.0
+
 # The layer mediaType the build pipeline stamps on the qcow2 (build-images.yml).
 _QCOW2_MEDIA_TYPE = "application/vnd.husk.qcow2"
 
@@ -135,6 +141,34 @@ class ResolvedImage:
         return self.digest.split(":", 1)[-1][:12]
 
 
+def _bound_timeouts(client):
+    """Give every registry request a connect/read timeout.
+
+    oras-py issues each `session.request` with no `timeout` at all, and its auth
+    backend shares that same session — so a connection to ghcr that is blackholed
+    rather than refused parks the caller on a socket read for as long as the
+    kernel allows (hours). That is the one failure mode `OpStore` cannot recover
+    from: its tenacity give-up deadline is only evaluated *between* attempts, so
+    an attempt that never returns leaves the stage op PENDING forever and the
+    pool defers every recycle behind it. Bounding the socket here turns the hang
+    into an ordinary retryable error, which the op machinery already handles.
+
+    Patching the session (rather than each call site) is what makes this total:
+    it covers the token endpoint, the manifest read and the blob stream alike."""
+    session = getattr(client, "session", None)
+    if session is None:  # a stand-in client (tests) with no requests session
+        return client
+    request = session.request
+
+    def timed(*args, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = (_CONNECT_TIMEOUT_S, _READ_TIMEOUT_S)
+        return request(*args, **kwargs)
+
+    session.request = timed
+    return client
+
+
 def _new_client():  # pragma: no cover - thin import shim, faked in tests
     try:
         import oras.client
@@ -143,7 +177,7 @@ def _new_client():  # pragma: no cover - thin import shim, faked in tests
             "the `oras` Python package is required to sync OCI images; install the "
             "extra: pip install 'husk[libvirt]' (or unset [backend].image_ref)"
         ) from e
-    return oras.client.OrasClient()
+    return _bound_timeouts(oras.client.OrasClient())
 
 
 class ImageSync:
@@ -206,9 +240,10 @@ class ImageSync:
         Idempotent: a ref already cached at its current digest is reused without a
         re-pull. The manifest is read first to learn the qcow2 layer digest, so a
         moved tag re-pulls (new digest ⇒ new cache dir) while a stable tag/digest
-        is a no-op. `report` (if given) receives a live "N/M MiB (P%)" line during
-        a slow pull, for the status board."""
-        digest, size = self._qcow2_layer(ref)
+        is a no-op. `report` (if given) receives a live progress line for the
+        status board — which phase we are in ("reading manifest") and, once the
+        blob is moving, "N/M MiB (P%)"."""
+        digest, size = self._qcow2_layer(ref, report=report)
         dest = os.path.join(self.cache_dir, _dir_for(digest))
         cached = self._qcow2_in(dest)
         if cached is not None:
@@ -341,7 +376,14 @@ class ImageSync:
         `_PULL_PROGRESS_INTERVAL_S`, so a slow multi-GB registry pull isn't a silent
         gap; if given a `report` sink, push the same line onto the op. When the
         manifest gave a layer `total`, report a percentage, else bytes so far.
+
+        A tick that finds *nothing* on disk still reports, as elapsed time: a blob
+        socket that goes silent at zero bytes is otherwise indistinguishable on
+        the status board from a pull that was never reached, since both leave the
+        op showing whatever line the caller set before calling `resolve`.
+
         Best-effort: it stops the moment the pull completes."""
+        started = time.monotonic()
         while not stop.wait(_PULL_PROGRESS_INTERVAL_S):
             try:
                 got = sum(
@@ -358,14 +400,30 @@ class ImageSync:
                     if total > 0
                     else f"pulling golden: {got >> 20} MiB so far"
                 )
-                log.info("%s (%s)", line, ref)
-                if report is not None:
-                    report(line)
+            else:
+                line = (
+                    f"pulling golden: no data yet after "
+                    f"{int(time.monotonic() - started)}s"
+                )
+            log.info("%s (%s)", line, ref)
+            if report is not None:
+                report(line)
 
-    def _qcow2_layer(self, ref: str) -> tuple[str, int]:
+    def _qcow2_layer(self, ref: str, report=None) -> tuple[str, int]:
         """The (digest, size-in-bytes) of the artifact's qcow2 layer. `size` is 0
-        if the manifest omits it (then pull progress falls back to bytes-so-far)."""
+        if the manifest omits it (then pull progress falls back to bytes-so-far).
+
+        Reports its phase to `report` (if given) because this runs *before* the
+        pull-progress thread exists: without it a registry that is failing or slow
+        on the manifest/token round-trip looks, from the status board, exactly
+        like a blob download in progress."""
+
+        def say(msg: str) -> None:
+            if report is not None:
+                report(msg)
+
         last: Exception | None = None
+        say("reading manifest")
         for attempt in range(_MANIFEST_ATTEMPTS):
             try:
                 manifest = self._client_().get_manifest(ref)
@@ -374,6 +432,7 @@ class ImageSync:
                 last = e
                 if attempt + 1 < _MANIFEST_ATTEMPTS:
                     log.debug("manifest read for %s failed (%s); retrying", ref, e)
+                    say(f"manifest read failed ({e}); retrying")
                     time.sleep(_MANIFEST_BACKOFF_S)
         else:
             raise ImageSyncError(

@@ -6,10 +6,12 @@ from __future__ import annotations
 import os
 import threading
 import time
+import types
 
 import pytest
 
-from husk.image_sync import ImageSync, ImageSyncError
+from husk import image_sync
+from husk.image_sync import ImageSync, ImageSyncError, _bound_timeouts
 
 QCOW2_MT = "application/vnd.husk.qcow2"
 LAYER_DIGEST = "sha256:" + "a" * 64
@@ -194,6 +196,92 @@ def test_pull_progress_reports_percent_when_total_known(tmp_path, monkeypatch):
 def test_pull_progress_reports_bytes_when_total_unknown(tmp_path, monkeypatch):
     reports = _run_pull_progress(tmp_path, monkeypatch, total=0)
     assert reports and "2 MiB so far" in reports[0]
+
+
+def test_pull_progress_heartbeats_when_nothing_has_landed(tmp_path, monkeypatch):
+    """A blob socket that stalls at zero bytes must still say something — otherwise
+    it is indistinguishable on the board from a pull that never started."""
+    monkeypatch.setattr("husk.image_sync._PULL_PROGRESS_INTERVAL_S", 0.0)
+    empty = tmp_path / "pull"
+    empty.mkdir()
+    reports: list[str] = []
+    stop = threading.Event()
+    t = threading.Thread(
+        target=ImageSync(str(tmp_path))._log_pull_progress,
+        args=("ghcr.io/org/x:v1", str(empty), stop, 0, reports.append),
+        daemon=True,
+    )
+    t.start()
+    deadline = time.time() + 2.0
+    while not reports and time.time() < deadline:
+        time.sleep(0.01)
+    stop.set()
+    t.join(timeout=1)
+    assert reports and "no data yet after" in reports[0]
+
+
+def test_manifest_phase_is_reported(tmp_path):
+    reports: list[str] = []
+    _sync(tmp_path, FakeOras()).resolve("ghcr.io/org/x:v1", report=reports.append)
+    assert reports[0] == "reading manifest"
+
+
+def test_manifest_retry_is_reported(tmp_path, monkeypatch):
+    """The op's progress line names the manifest failure while it retries, so a
+    registry outage isn't hidden behind a line about pulling."""
+    monkeypatch.setattr("husk.image_sync._MANIFEST_BACKOFF_S", 0)
+    reports: list[str] = []
+
+    class Boom:
+        def get_manifest(self, ref, **kw):
+            raise RuntimeError("401 unauthorized")
+
+    with pytest.raises(ImageSyncError):
+        ImageSync(str(tmp_path), client_factory=lambda: Boom()).resolve(
+            "ghcr.io/x:v1", report=reports.append
+        )
+    assert any("manifest read failed (401 unauthorized)" in r for r in reports)
+
+
+# ------------------------------------------------------------ http timeouts
+
+
+class FakeSession:
+    """Records the kwargs each request was issued with."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def request(self, method, url, **kwargs):
+        self.calls.append(kwargs)
+        return "response"
+
+
+def test_registry_requests_get_a_default_timeout():
+    """oras-py sets no timeout, so a blackholed socket would park the op worker
+    forever — and OpStore's give-up deadline only runs between attempts."""
+    client = types.SimpleNamespace(session=FakeSession())
+    assert _bound_timeouts(client) is client
+
+    client.session.get = lambda url: client.session.request("GET", url)
+    client.session.get("https://ghcr.io/v2/")
+
+    assert client.session.calls[0]["timeout"] == (
+        image_sync._CONNECT_TIMEOUT_S,
+        image_sync._READ_TIMEOUT_S,
+    )
+
+
+def test_explicit_timeout_is_not_overridden():
+    client = _bound_timeouts(types.SimpleNamespace(session=FakeSession()))
+    client.session.request("GET", "https://ghcr.io/v2/", timeout=5)
+    assert client.session.calls[0]["timeout"] == 5
+
+
+def test_client_without_a_session_is_left_alone():
+    """A stand-in client (as tests inject) has no requests session to patch."""
+    client = object()
+    assert _bound_timeouts(client) is client
 
 
 def test_manifest_read_failure_is_wrapped_after_retries(tmp_path, monkeypatch):
