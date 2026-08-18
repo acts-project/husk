@@ -1,9 +1,10 @@
 # Grafana
 
-**The dashboard does not live here.** It is `grafana/husk.json` in
+**The dashboard does not live here.** It is `monitoring/grafana/husk.json` in
 [acts/monitoring](https://gitlab.cern.ch/acts/monitoring) on CERN GitLab,
 alongside the Prometheus config that scrapes huskd and the kustomization that
-deploys both.
+deploys both. That repo has since grown other components beside `monitoring/`,
+which is why the dashboard sits a directory deeper than the repo name suggests.
 
 This repo carried a copy of it, and the copy went stale in the way copies do —
 not evenly, but in both directions at once. The deployed dashboard grew a
@@ -33,6 +34,10 @@ overlays that win over the classified state; `broken` (7, from
 
 ## Editing
 
-Grafana is the editor: change it in the UI, then export via *Dashboard settings →
-JSON Model* (or *Share → Export*) and overwrite the file in acts-monitoring. Keep
-`uid: husk-fleet` so re-imports update in place instead of forking a copy.
+**The file is the source of truth, not the UI.** `husk.json` is provisioned — baked
+into a ConfigMap and mounted into Grafana — so the live dashboard is read-only and
+Save is disabled. Edit the file and `just deploy` (a pod roll, ~15s). For anything
+beyond a small tweak the practical route is *Save as…* a private copy, edit that in
+the UI, export it over `husk.json` keeping `uid: husk-fleet` and dropping any `id`
+field, then delete the copy. The full procedure is in that repo's
+`monitoring/grafana/README.md`.

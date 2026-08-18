@@ -407,7 +407,8 @@ split into two halves that behave very differently.
 
 `husk_slots*`, `husk_slot_last_*_seconds`, `husk_slot_cycle`, `husk_slot_state_code`,
 `husk_slot_info`,
-`husk_slot_failing_seconds`, `husk_slot_failure_streak`, `husk_image*`. These describe the **present**,
+`husk_slot_failing_seconds`, `husk_slot_failure_streak`, `husk_image*`,
+`husk_jobs_queued`. These describe the **present**,
 and huskd already holds a complete immutable description of the present: the
 per-pool `ControllerState` the reconcile loop swaps in each tick. They are rendered
 straight from it at scrape time and are never stored.
@@ -426,7 +427,7 @@ sample and Prometheus's own staleness handling finishes the job.
 `husk_slots_created_total`, `husk_slots_destroyed_total`,
 `husk_slot_recycles_total`, `husk_recycle_duration_seconds`,
 `husk_cloudinit_duration_seconds`, `husk_github_polls_total`, `husk_github_poll_failures_total`,
-`husk_guest_scrape_failures_total`.
+`husk_guest_scrape_failures_total`, `husk_webhook_deliveries_total`.
 
 These describe **what happened between scrapes**, which no snapshot can express: a
 rebuild that failed and was retried leaves no trace in the current state, and a
@@ -454,6 +455,45 @@ slot id in a label mints a new series per slot per action and leaves it behind.
 per-slot label. Every label value comes from config (pool names, target keys) or a
 fixed vocabulary (action, reason, phase). Per-slot detail lives only in the
 snapshot half, where it expires on its own.
+
+### Queue depth — `husk_jobs_queued{target,labels}`
+
+The one metric here that does not come from huskd observing itself. It is fed by
+`workflow_job` webhook deliveries (`src/husk/webhook.py`), and it answers the
+question `husk_slots{state="busy"}` structurally cannot: a fleet reading 100% busy
+looks identical whether nothing or two hundred jobs are queued behind it.
+
+Three properties that shape every query written against it:
+
+- **Absence means "huskd does not know", not "the queue is empty."** With no
+  webhook configured there are no deliveries and therefore no series — reporting 0
+  would be a confident lie about a fleet that might be badly backed up. So, unlike
+  `husk_slot_failing_seconds` (where absence genuinely means healthy and the
+  dashboard's `or vector(0)` is right), queue panels must **not** paper over the
+  gap. "No data" is the correct rendering.
+- **No `backend` label.** A queue belongs to a GitHub target and a `runs-on`
+  labelset, not to a husk pool; several pools can serve one labelset and one pool
+  can serve several. Nothing here is filterable by pool, and the dashboard's `Pool`
+  variable does not apply.
+- **It counts every queued job in the installation**, including jobs bound for
+  GitHub-hosted runners — huskd records the delivery whatever the labels say.
+  Filter on `labels` (a sorted, comma-joined labelset, matched with `=~`) before
+  calling any number "husk's queue depth".
+
+It drives nothing. Sizing stays `min(max_total, busy + min_ready)` off the poll, so
+a lost or forged delivery cannot change fleet size. Queued state is also *not*
+reconstructible from the runner poll, so a huskd restart drops it and depth reads
+low until fresh `queued` deliveries arrive.
+
+`husk_webhook_deliveries_total{result}` is the health signal for the feed itself —
+`accepted` / `ignored` / `malformed` / `rejected`, carrying no repo, sender or job
+label because the endpoint is internet-facing and anything from the body would let
+a stranger mint series in a counter huskd persists to disk. A sustained nonzero
+`rejected` rate is a rotated secret or someone probing:
+
+```promql
+rate(husk_webhook_deliveries_total{result="rejected"}[15m]) > 0
+```
 
 ### Histograms vs. the "last value" gauges
 
