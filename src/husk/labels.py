@@ -61,7 +61,7 @@ exception to it is greppable.
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 # Reserved: only this module may mint labels in this namespace. Operator extras
 # carrying it are rejected at config load — otherwise a hand-written
@@ -247,3 +247,72 @@ def underspecified(
     if exempt.intersection(labels):
         return []
     return [name for name, pick in _DIMENSIONS.items() if not pick(labels)]
+
+
+# --------------------------------------------------------------- matching back
+# Everything above answers "what labels does this pool register?". The two
+# functions below answer the inverse — "which pool could serve this `runs-on`?" —
+# which is the question a webhook delivery asks, since a `workflow_job` names a
+# selector and never a pool.
+
+# Sentinels for the `served_by` metric dimension. Neither is a legal pool name
+# (config slugs cannot collide with them by accident in any query that matters),
+# so a reader can always tell an attributed job from an unattributed one.
+SERVED_BY_NONE = "none"
+SERVED_BY_MULTIPLE = "multiple"
+
+
+def serving_pools(
+    runs_on: Sequence[str], pool_labels: Mapping[str, Sequence[str]]
+) -> tuple[str, ...]:
+    """Names of the pools whose registered labels can serve `runs_on`, sorted.
+
+    GitHub's own rule, mirrored: a runner matches when it carries **every** label
+    the job asked for; labels it carries in addition are ignored. Subset, not
+    equality — a pool advertising nine labels serves `runs-on: [self-hosted]`, and
+    an equality test would attribute almost nothing.
+
+    Case-insensitive, because GitHub compares labels that way and because
+    `derive_labels` emits `linux` while workflow authors habitually write `Linux`.
+    Getting this wrong fails in the quiet direction: every job looks unservable.
+
+    An empty selector matches nothing rather than everything. A job whose labels
+    husk could not read is not a job every pool can serve.
+    """
+    if not runs_on:
+        return ()
+    want = {x.lower() for x in runs_on}
+    return tuple(
+        sorted(
+            name
+            for name, have in pool_labels.items()
+            if want <= {x.lower() for x in have}
+        )
+    )
+
+
+def served_by(runs_on: Sequence[str], pool_labels: Mapping[str, Sequence[str]]) -> str:
+    """`runs_on` collapsed to ONE label value drawn from a bounded vocabulary.
+
+    This exists because of where its output goes. The job histograms and counters
+    are event-time instruments, and `husk.metrics_store` persists those to disk —
+    so a label value that any repo in the installation can invent would let a
+    single typo (`runs-on: [self-hosted, husl-x64]`) mint a series that lives in
+    that file for ever. The raw labelset is exactly such a value. Collapsing it
+    against the configured pools bounds the dimension by config, which is the rule
+    the whole event-time half is built on.
+
+    The live `husk_jobs_queued` gauge keeps the full labelset instead, and is right
+    to: a collector-derived series stops being emitted the moment the queue drains,
+    so nothing accumulates.
+
+    `multiple` is a real answer, not a failure — `runs-on: [self-hosted]` genuinely
+    matches every discoverable pool. `none` covers the jobs bound for GitHub-hosted
+    runners, which huskd is told about too and must not silently count as its own.
+    """
+    matches = serving_pools(runs_on, pool_labels)
+    if not matches:
+        return SERVED_BY_NONE
+    if len(matches) > 1:
+        return SERVED_BY_MULTIPLE
+    return matches[0]

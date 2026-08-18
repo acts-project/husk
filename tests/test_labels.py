@@ -14,6 +14,8 @@ from husk.labels import (
     check_extra_label,
     class_labels,
     derive_labels,
+    served_by,
+    serving_pools,
     underspecified,
 )
 
@@ -250,3 +252,58 @@ def test_pinning_an_undiscoverable_pool_is_fully_specified():
     assert underspecified(
         ["husk-pool-openstack-cpu"], undiscoverable_pools=["special"]
     ) == ["arch", "class"]
+
+
+# ------------------------------------------------------------ matching back
+#
+# The inverse question: a webhook delivery names a `runs-on`, never a pool, and
+# the job metrics have to attribute it to one.
+
+CPU = ("self-hosted", "linux", "x64", "x86_64", "husk", "husk-pool-cpu")
+GPU = ("self-hosted", "linux", "x64", "husk", "husk-pool-gpu", "gpu", "cuda")
+POOLS = {"cpu": CPU, "gpu": GPU}
+
+
+def test_a_pool_serves_a_selector_it_is_a_superset_of():
+    """GitHub's rule: the runner must carry every label asked for, and extras are
+    ignored. Equality instead of subset would attribute almost nothing, since
+    every pool advertises far more labels than any selector names."""
+    assert serving_pools(["self-hosted", "cuda"], POOLS) == ("gpu",)
+
+
+def test_matching_ignores_case():
+    """derive_labels emits `linux`; workflow authors write `Linux`. GitHub treats
+    them as one label, and a case-sensitive match here would fail in the quiet
+    direction — every job would look unservable."""
+    assert serving_pools(["Self-Hosted", "LINUX", "X64"], POOLS) == ("cpu", "gpu")
+
+
+def test_a_selector_no_pool_satisfies_matches_nothing():
+    assert serving_pools(["ubuntu-latest"], POOLS) == ()
+    assert serving_pools(["self-hosted", "arm64"], POOLS) == ()
+
+
+def test_an_empty_selector_matches_nothing_rather_than_everything():
+    """A job husk could not read the labels of is not a job every pool can serve."""
+    assert serving_pools([], POOLS) == ()
+
+
+def test_served_by_collapses_to_one_bounded_value():
+    assert served_by(["self-hosted", "cuda"], POOLS) == "gpu"
+    assert served_by(["self-hosted", "linux"], POOLS) == "multiple"
+    assert served_by(["ubuntu-latest"], POOLS) == "none"
+
+
+def test_served_by_is_bounded_by_config_not_by_the_selector():
+    """The reason this function exists. These series are persisted, so a typo in
+    somebody's workflow must not be able to add a row to the state file."""
+    vocabulary = {
+        served_by(sel, POOLS)
+        for sel in (
+            ["husl-x64"],
+            ["totally", "made", "up"],
+            ["self-hosted", "typo-here"],
+            ["ubuntu-latest"],
+        )
+    }
+    assert vocabulary == {"none"}

@@ -15,10 +15,17 @@ Three deliberate non-goals, each of which would otherwise look like an omission:
   `min(max_total, busy + min_ready)` off the poll, so a lost or forged delivery
   cannot change fleet size — the blast radius of this whole module is "the
   dashboard shows a stale job name".
-* **It does not persist.** Job assignments are ephemeral (bounded by
+* **It keeps no durable state.** Job assignments are ephemeral (bounded by
   `max_job_duration_sec`) and reconstructible: after a restart, a busy slot shows
   no job until its next one starts. Paying for durability here would cost huskd
   its "no durable state, rebuild from provider tags" property for a display field.
+
+  The *statistics* derived from these deliveries do survive, and that is not a
+  contradiction — they are event-time observations recorded into `husk.metrics`,
+  which `husk.metrics_store` persists, rather than state this module holds. The
+  split is deliberate: `queue_wait_seconds` and `run_seconds` below read the
+  payload's own clock, so nothing has to be remembered between two deliveries for
+  the observation to be correct, and a restart in the middle costs nothing.
 * **It is not the security boundary's only layer, but it is the real one.** The
   OpenShift Route scopes the path, but path matching is a prefix match and the
   endpoint is internet-facing by design. `verify()` below is what actually keeps
@@ -92,6 +99,12 @@ class JobInfo:
     run_url: str  # html_url of the RUN, which is what a human wants to open
     started_at: float  # wall-clock, for the dashboard's elapsed column
     epoch: float  # when huskd recorded it — drives TTL eviction
+    # The remaining three are for the job METRICS, not the dashboard, and default
+    # so that a JobInfo built for a display test stays a one-liner. All three come
+    # straight off the payload; none is ever used to decide anything, only counted.
+    created_at: float = 0.0  # when the job entered the queue, per GitHub
+    completed_at: float = 0.0  # set on `completed` deliveries only
+    conclusion: str = ""  # success/failure/cancelled/… on `completed`
 
 
 def parse_job(payload: dict[str, Any]) -> tuple[str, JobInfo | None, str | None]:
@@ -128,9 +141,6 @@ def parse_job(payload: dict[str, Any]) -> tuple[str, JobInfo | None, str | None]
     # the job's own view within the run, which is the more useful landing page.
     run_url = str(job.get("html_url") or "")
 
-    started = job.get("started_at")
-    started_at = _parse_iso8601(started) if isinstance(started, str) else 0.0
-
     return (
         action,
         JobInfo(
@@ -139,8 +149,11 @@ def parse_job(payload: dict[str, Any]) -> tuple[str, JobInfo | None, str | None]
             workflow=str(job.get("workflow_name") or ""),
             repo=repo,
             run_url=run_url,
-            started_at=started_at,
+            started_at=_ts(job.get("started_at")),
             epoch=time.time(),
+            created_at=_ts(job.get("created_at")),
+            completed_at=_ts(job.get("completed_at")),
+            conclusion=str(job.get("conclusion") or ""),
         ),
         runner_name,
     )
@@ -161,6 +174,81 @@ def job_labels(payload: dict[str, Any]) -> tuple[str, ...]:
     if not isinstance(labels, list):
         return ()
     return tuple(sorted({str(x) for x in labels if x}))
+
+
+# A delta outside this range is not a slow job, it is a bad payload: clock skew,
+# a field husk misread, or GitHub reporting a creation weeks before the run. The
+# guard matters more here than for a gauge, because these observations land in a
+# histogram `_sum` that `husk.metrics_store` persists indefinitely — one garbage
+# value permanently skews every mean and quantile derived from it, with no way to
+# retract it short of deleting the state file.
+MAX_PLAUSIBLE_SPAN_S = 14 * 24 * 3600.0
+
+# GitHub's own vocabulary for how a job ended. Anything outside it is counted as
+# `other` rather than minting a series: the value is read out of a delivery body,
+# and this counter is persisted, so an unexpected string must not be able to grow
+# the state file. A new GitHub conclusion showing up as `other` is a one-line fix.
+CONCLUSIONS = frozenset(
+    {
+        "success",
+        "failure",
+        "cancelled",
+        "skipped",
+        "timed_out",
+        "action_required",
+        "neutral",
+        "stale",
+    }
+)
+CONCLUSION_OTHER = "other"
+
+
+def _span(start: float, end: float) -> float | None:
+    """`end - start` if both are readable and the result is plausible."""
+    if start <= 0.0 or end <= 0.0:
+        return None
+    delta = end - start
+    if delta < 0.0 or delta > MAX_PLAUSIBLE_SPAN_S:
+        return None
+    return delta
+
+
+def queue_wait_seconds(info: JobInfo) -> float | None:
+    """How long the job waited for a runner, from the payload's OWN timestamps.
+
+    Deliberately *not* measured as "how long the entry sat in `JobRegistry`". Two
+    reasons, and the second is the whole point of this metric:
+
+    * huskd's receipt time charges its own delivery lag and downtime to the fleet,
+      which is precisely the number this is supposed to hold the fleet to.
+    * A job queued while huskd was down has no registry entry to measure, so the
+      restart would swallow exactly the waits most worth seeing. Read off the
+      payload, that job still reports its true wait the moment `in_progress`
+      arrives — which is why the queue statistics survive a restart while the
+      depth gauge cannot.
+    """
+    return _span(info.created_at, info.started_at)
+
+
+def run_seconds(info: JobInfo) -> float | None:
+    """Runner pickup to completion — the job's own runtime, not its wait."""
+    return _span(info.started_at, info.completed_at)
+
+
+def conclusion_label(info: JobInfo) -> str:
+    """`info.conclusion` if GitHub still spells it that way, else `other`."""
+    c = info.conclusion.lower()
+    return c if c in CONCLUSIONS else CONCLUSION_OTHER
+
+
+def _ts(value: object) -> float:
+    """One payload timestamp → epoch seconds, 0.0 for anything unreadable.
+
+    A single funnel for every timestamp so that "absent", "null" and "not a
+    string" all arrive at the same sentinel — the durations below then have one
+    condition to check instead of three.
+    """
+    return _parse_iso8601(value) if isinstance(value, str) else 0.0
 
 
 def _parse_iso8601(s: str) -> float:

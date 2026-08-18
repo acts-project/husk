@@ -427,7 +427,9 @@ sample and Prometheus's own staleness handling finishes the job.
 `husk_slots_created_total`, `husk_slots_destroyed_total`,
 `husk_slot_recycles_total`, `husk_recycle_duration_seconds`,
 `husk_cloudinit_duration_seconds`, `husk_github_polls_total`, `husk_github_poll_failures_total`,
-`husk_guest_scrape_failures_total`, `husk_webhook_deliveries_total`.
+`husk_guest_scrape_failures_total`, `husk_webhook_deliveries_total`,
+`husk_jobs_enqueued_total`, `husk_job_queue_wait_seconds`,
+`husk_job_duration_seconds`, `husk_jobs_completed_total`.
 
 These describe **what happened between scrapes**, which no snapshot can express: a
 rebuild that failed and was retried leaves no trace in the current state, and a
@@ -484,6 +486,56 @@ It drives nothing. Sizing stays `min(max_total, busy + min_ready)` off the poll,
 a lost or forged delivery cannot change fleet size. Queued state is also *not*
 reconstructible from the runner poll, so a huskd restart drops it and depth reads
 low until fresh `queued` deliveries arrive.
+
+That last property is why the gauge is not the whole queue story, and why the four
+instruments below exist instead of a persisted depth.
+
+### The durable half — job statistics
+
+`husk_jobs_enqueued_total{served_by}`, `husk_job_queue_wait_seconds{served_by}`,
+`husk_job_duration_seconds{served_by}` and
+`husk_jobs_completed_total{served_by,conclusion}` are event-time, so they live in
+the persisted half and a p95 wait over a month keeps meaning what it says across
+deploys.
+
+**Every duration is computed from the payload's own timestamps** — `created_at` →
+`started_at` for the wait, `started_at` → `completed_at` for the runtime — never
+from how long an entry sat in `JobRegistry`. Two reasons, and the second is the
+whole design:
+
+- huskd's receipt time charges its own delivery lag and downtime to the fleet,
+  which is exactly the number these metrics hold the fleet to.
+- A job queued while huskd was down has no registry entry to measure. Read off the
+  payload, it still reports its true wait the moment `in_progress` lands, so the
+  statistics survive a restart even though the depth gauge cannot.
+
+A timestamp pair yielding a negative or implausible (>14d) span is dropped rather
+than clamped. A histogram `_sum` is persisted indefinitely, so one garbage value
+skews every quantile derived from it with no way to retract it short of deleting
+the state file.
+
+**`served_by` is the cardinality answer.** It is the pool whose registered labels
+can serve the job's `runs-on` (GitHub's own subset rule, case-insensitive — see
+`husk.labels.served_by`), collapsing to `multiple` when several pools qualify and
+`none` for the jobs bound for GitHub-hosted runners. The raw labelset is *not*
+usable here: it is a string any repo in the installation can invent, and these
+series are written to disk, so one typo would mint a row in the state file for
+ever. The live gauge above can afford the full labelset precisely because a
+collector-derived series stops being emitted when the queue drains.
+
+`_count` on the wait histogram is the rate jobs **start**; `husk_jobs_enqueued_total`
+is the rate they **arrive**. The gap between the two is the queue growing, which a
+depth gauge can only show you after the fact:
+
+```promql
+sum(rate(husk_jobs_enqueued_total{served_by!="none"}[15m]))
+  - sum(rate(husk_job_queue_wait_seconds_count{served_by!="none"}[15m]))
+```
+
+A redelivery double-counts an observation. GitHub retries anything that did not
+2xx and huskd answers 204 in microseconds, so this is an exception path — and the
+exact fix, gating each observation on the registry's queued entry, would
+reintroduce the restart blind spot the payload timestamps exist to avoid.
 
 `husk_webhook_deliveries_total{result}` is the health signal for the feed itself —
 `accepted` / `ignored` / `malformed` / `rejected`, carrying no repo, sender or job

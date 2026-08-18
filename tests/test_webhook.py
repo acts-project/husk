@@ -21,7 +21,16 @@ from husk.metrics import Metrics
 from husk.slot import SlotState
 from husk.snapshot import ControllerState
 from husk.web import make_app
-from husk.webhook import JobInfo, JobRegistry, job_labels, parse_job, verify
+from husk.webhook import (
+    JobInfo,
+    JobRegistry,
+    conclusion_label,
+    job_labels,
+    parse_job,
+    queue_wait_seconds,
+    run_seconds,
+    verify,
+)
 
 SECRET = "s3cret"
 
@@ -38,15 +47,24 @@ def payload(
     labels=("self-hosted", "husk-x64"),
     org="acts-project",
     repo="acts-project/acts",
+    created_at="2026-08-12T09:59:00Z",
+    started_at="2026-08-12T10:00:00Z",
+    completed_at=None,
+    conclusion=None,
 ):
     job = {
         "id": job_id,
         "name": "build (ubuntu-24.04)",
         "workflow_name": "CI",
         "html_url": f"https://github.com/{repo}/actions/runs/99/job/{job_id}",
-        "started_at": "2026-08-12T10:00:00Z",
+        "started_at": started_at,
+        "created_at": created_at,
         "labels": list(labels),
     }
+    if completed_at is not None:
+        job["completed_at"] = completed_at
+    if conclusion is not None:
+        job["conclusion"] = conclusion
     if runner_name is not None:
         job["runner_name"] = runner_name
     out = {"action": action, "workflow_job": job, "repository": {"full_name": repo}}
@@ -300,13 +318,21 @@ def post(
     event="workflow_job",
     sig=True,
     raw=None,
+    metrics=None,
+    pool_labels=None,
 ):
     """One delivery against a real app, synchronously.
 
     The suite has no pytest-asyncio, and standing up a server (`serve_in_thread`)
     is more machinery than a request/response assertion needs — Quart's test
     client driven through `asyncio.run` exercises the same handler."""
-    app = make_app(lambda: [], jobs=reg or JobRegistry(), webhook_secret=configured)
+    app = make_app(
+        lambda: [],
+        jobs=reg or JobRegistry(),
+        webhook_secret=configured,
+        metrics=metrics,
+        pool_labels=pool_labels,
+    )
     payload_bytes = raw if raw is not None else json.dumps(body).encode()
     headers = {"X-GitHub-Event": event}
     if sig:
@@ -414,3 +440,144 @@ def test_delivery_outcomes_are_counted():
     m.webhook_deliveries.inc("rejected")
     text = render_metrics(metrics=m)
     assert 'husk_webhook_deliveries_total{result="rejected"} 2.0' in text
+
+
+# ------------------------------------------------------- durable job statistics
+#
+# The half of the queue story that outlives the process: these land in `Metrics`,
+# which metrics_store persists, so they must be computed from the payload rather
+# than from registry state that a restart takes with it.
+
+POOLS = {"cpu": ("self-hosted", "linux", "x64", "husk", "husk-x64")}
+
+
+def test_queue_wait_comes_from_the_payloads_own_clock():
+    """created_at → started_at, not "how long huskd held the entry". A wait
+    measured against huskd's receipt time would bill huskd's downtime and delivery
+    lag to the fleet, which is the number this metric exists to hold it to."""
+    _, info, _ = parse_job(payload("in_progress"))
+    assert queue_wait_seconds(info) == 60.0
+
+
+def test_run_seconds_spans_pickup_to_completion():
+    _, info, _ = parse_job(
+        payload("completed", completed_at="2026-08-12T10:05:00Z", conclusion="success")
+    )
+    assert run_seconds(info) == 300.0
+
+
+@pytest.mark.parametrize(
+    "desc,kwargs",
+    [
+        ("no created_at", {"created_at": None}),
+        ("unparseable created_at", {"created_at": "yesterday"}),
+        ("started before created (clock skew)", {"created_at": "2026-08-12T10:01:00Z"}),
+        (
+            "implausibly old (bad payload, not a slow job)",
+            {"created_at": "2020-01-01T00:00:00Z"},
+        ),
+    ],
+)
+def test_unusable_timestamps_produce_no_observation(desc, kwargs):
+    """None, never 0.0. A histogram `_sum` is persisted for ever, so one garbage
+    value skews every quantile derived from it with no way to retract it."""
+    _, info, _ = parse_job(payload("in_progress", **kwargs))
+    assert queue_wait_seconds(info) is None, desc
+
+
+def test_conclusion_outside_githubs_vocabulary_becomes_other():
+    """The value is read out of a delivery body and the counter is persisted, so
+    an unexpected string must not be able to mint a series in the state file."""
+    _, ok, _ = parse_job(payload("completed", conclusion="success"))
+    _, weird, _ = parse_job(payload("completed", conclusion="quantum_superposition"))
+    assert conclusion_label(ok) == "success"
+    assert conclusion_label(weird) == "other"
+
+
+def test_queued_delivery_counts_an_arrival_against_its_pool():
+    m = Metrics()
+    post(payload("queued", runner_name=None), metrics=m, pool_labels=POOLS)
+    assert m.jobs_enqueued.value("cpu") == 1.0
+
+
+def test_in_progress_delivery_records_the_wait():
+    m = Metrics()
+    post(payload("in_progress"), metrics=m, pool_labels=POOLS)
+    assert m.job_queue_wait.count("cpu") == 1.0
+    assert m.job_queue_wait.sum("cpu") == 60.0
+
+
+def test_completed_delivery_records_runtime_and_conclusion():
+    m = Metrics()
+    post(
+        payload("completed", completed_at="2026-08-12T10:05:00Z", conclusion="failure"),
+        metrics=m,
+        pool_labels=POOLS,
+    )
+    assert m.job_duration.sum("cpu") == 300.0
+    assert m.jobs_completed.value("cpu", "failure") == 1.0
+
+
+def test_a_job_cancelled_while_queued_is_counted_but_not_timed():
+    """It completed, so it counts; it never ran, so averaging a runtime in would
+    understate every job that did."""
+    m = Metrics()
+    post(
+        payload("completed", runner_name=None, started_at=None, conclusion="cancelled"),
+        metrics=m,
+        pool_labels=POOLS,
+    )
+    assert m.jobs_completed.value("cpu", "cancelled") == 1.0
+    assert m.job_duration.count("cpu") == 0.0
+
+
+def test_a_job_no_pool_can_serve_is_attributed_to_none():
+    """huskd is told about every queued job in the installation, GitHub-hosted
+    ones included. Counting those as husk's own would flatter every statistic."""
+    m = Metrics()
+    post(
+        payload("queued", runner_name=None, labels=("ubuntu-latest",)),
+        metrics=m,
+        pool_labels=POOLS,
+    )
+    assert m.jobs_enqueued.value("none") == 1.0
+    assert m.jobs_enqueued.value("cpu") == 0.0
+
+
+def test_job_statistics_survive_a_restart(tmp_path):
+    """The whole point of putting these in the event-time half: depth resets when
+    huskd does, but the distribution behind it must not."""
+    from husk.metrics_store import MetricsStore
+
+    path = str(tmp_path / "metrics.json")
+    before = Metrics()
+    post(payload("in_progress"), metrics=before, pool_labels=POOLS)
+    MetricsStore(path, before).save()
+
+    after = Metrics()
+    MetricsStore(path, after).load()
+    assert after.job_queue_wait.count("cpu") == 1.0
+    assert after.job_queue_wait.sum("cpu") == 60.0
+
+
+def test_job_metrics_are_recorded_without_a_registry():
+    """The two consumers are independent: an embedding that wants the statistics
+    but not the dashboard's job names must still get them."""
+    m = Metrics()
+    app = make_app(
+        lambda: [], jobs=None, webhook_secret=SECRET, metrics=m, pool_labels=POOLS
+    )
+    body = json.dumps(payload("in_progress")).encode()
+
+    async def go():
+        return await app.test_client().post(
+            "/webhook",
+            data=body,
+            headers={
+                "X-GitHub-Event": "workflow_job",
+                "X-Hub-Signature-256": sign(body),
+            },
+        )
+
+    assert asyncio.run(go()).status_code == 204
+    assert m.job_queue_wait.count("cpu") == 1.0

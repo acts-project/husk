@@ -81,6 +81,19 @@ _STATE_CODE = {s.value: i for i, s in enumerate(SlotState, start=1)}
 BRINGUP_BUCKETS = (15, 30, 45, 60, 75, 90, 120, 150, 180, 240, 300, 600)
 TICK_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60)
 
+# A job's queue wait runs from "a warm slot took it instantly" to "it sat out the
+# afternoon", so these are geometric where the bring-up buckets are near-linear.
+# The resolution that matters is at the short end: the difference between 15s and
+# 60s is the difference between a ready slot and one being built, which is the
+# distinction the whole fleet exists to manage. Past an hour, only the order of
+# magnitude is actionable.
+QUEUE_WAIT_BUCKETS = (5, 15, 30, 60, 120, 300, 600, 1800, 3600, 7200)
+
+# Job runtimes, which are a property of the *workload*, not of husk. Kept mainly
+# so utilisation and right-sizing arguments have a distribution to stand on, and
+# so a slot-count change can be read against whether the jobs themselves moved.
+JOB_DURATION_BUCKETS = (60, 300, 600, 1800, 3600, 7200, 14400, 21600)
+
 Labels = tuple[str, ...]
 
 
@@ -329,6 +342,46 @@ class Metrics:
             "workflow_job webhook deliveries, by result",
             ["result"],
         )
+        # ------------------------------------------------------------- jobs
+        # The durable half of the queue story. `husk_jobs_queued` (the snapshot
+        # collector) is a live reading that resets when huskd restarts, because
+        # queued state cannot be rebuilt from the runner poll. These four are
+        # event-time instead, so `husk.metrics_store` persists them and a p95 wait
+        # over a month keeps meaning what it says across deploys.
+        #
+        # Every one is labelled `served_by` — the pool that can serve the job's
+        # `runs-on`, per `husk.labels.served_by`, with `none`/`multiple` sentinels
+        # — and NOT by the raw labelset. That distinction is the cardinality rule
+        # doing its job: a labelset is a string any repo in the installation can
+        # invent, and these series are written to disk.
+        self.jobs_enqueued = Counter(
+            "husk_jobs_enqueued",
+            "Actions jobs that entered the queue",
+            ["served_by"],
+        )
+        # `_count` on this histogram is the rate jobs START, which against
+        # `husk_jobs_enqueued_total` (the rate they ARRIVE) is the queue-growth
+        # signal — the thing a depth gauge can only show you after the fact.
+        self.job_queue_wait = Histogram(
+            "husk_job_queue_wait_seconds",
+            "Job created to runner pickup (queue wait)",
+            ["served_by"],
+            QUEUE_WAIT_BUCKETS,
+        )
+        self.job_duration = Histogram(
+            "husk_job_duration_seconds",
+            "Runner pickup to job completion",
+            ["served_by"],
+            JOB_DURATION_BUCKETS,
+        )
+        # `conclusion` is bounded to GitHub's own vocabulary by
+        # `husk.webhook.conclusion_label`, which folds anything unrecognised into
+        # `other` — same reason as above: it comes out of a delivery body.
+        self.jobs_completed = Counter(
+            "husk_jobs_completed",
+            "Actions jobs that finished, by conclusion",
+            ["served_by", "conclusion"],
+        )
         self._instruments: tuple[Counter | Histogram, ...] = (
             self.reconcile_ticks,
             self.reconcile_aborts,
@@ -343,6 +396,10 @@ class Metrics:
             self.github_poll_failures,
             self.guest_scrape_failures,
             self.webhook_deliveries,
+            self.jobs_enqueued,
+            self.job_queue_wait,
+            self.job_duration,
+            self.jobs_completed,
         )
 
     @property

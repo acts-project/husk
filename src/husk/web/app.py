@@ -41,6 +41,7 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Mapping, Sequence
 from typing import Callable
 
 from hypercorn.asyncio import serve
@@ -53,6 +54,7 @@ from husk.webhook import JobRegistry
 
 from husk.guest_scrape import GuestScraper, GuestScrapeError
 
+from husk.labels import served_by
 from husk.metrics import Metrics, SnapshotCollector
 from husk.snapshot import ControllerState
 from husk.storage import DiskUsage
@@ -112,6 +114,7 @@ def make_app(
     is_active: Callable[[], bool] | None = None,
     jobs: JobRegistry | None = None,
     webhook_secret: str | None = None,
+    pool_labels: Mapping[str, Sequence[str]] | None = None,
 ) -> Quart:
     """Build the app over a per-pool snapshot provider (the same one every
     endpoint reads). Templates resolve relative to this package.
@@ -263,33 +266,69 @@ def make_app(
         return Response("", status=204)
 
     def _handle_workflow_job(payload: dict) -> None:
-        """Apply one verified `workflow_job` to the registry.
+        """Apply one verified `workflow_job` to the registry and the job metrics.
 
         Split out of the route so the dispatch is testable without a request
-        context, and so the route reads as "authenticate, parse, apply"."""
-        if jobs is None:
-            return
+        context, and so the route reads as "authenticate, parse, apply".
+
+        Two consumers, fed from one dispatch, with opposite lifetimes. The
+        registry holds live state for the dashboard and dies with the process.
+        The metrics are event-time, so `husk.metrics_store` persists them — which
+        is why every duration below is computed from the payload's own timestamps
+        rather than from how long an entry sat in the registry. A job queued while
+        huskd was down still reports its true wait (see
+        `husk.webhook.queue_wait_seconds`), so the statistics survive a restart
+        even though the depth gauge cannot.
+
+        A redelivery double-counts an observation. GitHub retries anything that
+        did not 2xx, and huskd answers 204 in microseconds, so this is an
+        exception path — and the exact fix, gating each observation on the
+        registry's queued entry, would reintroduce precisely the restart loss the
+        payload timestamps exist to avoid. Skew from a retry storm is preferable
+        to a blind spot around every deploy.
+        """
         action, info, runner_name = wh.parse_job(payload)
         labels = wh.job_labels(payload)
         target_key = _target_key(payload)
+        # Bounded to the configured pools before it ever reaches an instrument —
+        # see husk.labels.served_by for why the raw labelset must not.
+        who = served_by(labels, pool_labels or {})
 
         if action == "queued":
             if info is not None:
-                jobs.enqueue(target_key, labels, info.job_id)
+                if jobs is not None:
+                    jobs.enqueue(target_key, labels, info.job_id)
+                if metrics is not None:
+                    metrics.jobs_enqueued.inc(who)
         elif action == "in_progress":
             # Leaving the queue and acquiring a runner are the same instant, so
             # this both clears the queued entry and records the assignment.
             if info is not None:
-                jobs.dequeue(target_key, labels, info.job_id)
-                if runner_name:
-                    jobs.start(runner_name, info)
+                if jobs is not None:
+                    jobs.dequeue(target_key, labels, info.job_id)
+                    if runner_name:
+                        jobs.start(runner_name, info)
+                if metrics is not None:
+                    wait = wh.queue_wait_seconds(info)
+                    if wait is not None:
+                        metrics.job_queue_wait.observe(wait, who)
         elif action == "completed":
             if info is not None:
                 # A job cancelled while still queued goes straight to `completed`
                 # and never had a runner, so the queued entry must be dropped here
                 # too or it would sit until its TTL.
-                jobs.dequeue(target_key, labels, info.job_id)
-            if runner_name:
+                if jobs is not None:
+                    jobs.dequeue(target_key, labels, info.job_id)
+                if metrics is not None:
+                    metrics.jobs_completed.inc(who, wh.conclusion_label(info))
+                    # None for a job that never ran (cancelled while queued), which
+                    # is a completion worth counting but not a runtime worth
+                    # recording — averaging those zeros in would understate every
+                    # real job.
+                    ran = wh.run_seconds(info)
+                    if ran is not None:
+                        metrics.job_duration.observe(ran, who)
+            if runner_name and jobs is not None:
                 jobs.finish(runner_name, info.job_id if info else None)
 
     def _target_key(payload: dict) -> str:

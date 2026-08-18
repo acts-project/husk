@@ -643,6 +643,13 @@ async def _serve(
     # entries simply age out. Shared by the app (writer) and every controller
     # (reader), so it must outlive any single reconcile plane.
     jobs = JobRegistry()
+    # The bounded vocabulary the job metrics classify a delivery's `runs-on` into
+    # (husk.labels.served_by). Built from CONFIG, not from live snapshots: a
+    # standby pod serves the webhook route before it holds the lock and has no
+    # facade at all, and it must classify a delivery exactly as the active pod
+    # would — otherwise the same job lands in different series depending on which
+    # pod the router happened to pick.
+    pool_labels = {c.backend.name: tuple(c.runner.labels) for c in cfgs}
     scraper = GuestScraper(ssh_targets) if ssh_targets else None
     state = _Serving()
 
@@ -660,6 +667,7 @@ async def _serve(
         is_active=lambda: state.active,
         jobs=jobs,
         webhook_secret=webhook_secret,
+        pool_labels=pool_labels,
     )
     host, port = parse_addr(http_addr)
     display_host = "127.0.0.1" if host == "0.0.0.0" else host
