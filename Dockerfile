@@ -50,8 +50,11 @@ FROM python:3.13-slim-trixie
 # libvirt0 provides libvirt.so.0 that the compiled binding links against;
 # openssh-client is the transport huskd uses to reach libvirt hosts (qemu+ssh://)
 # and to bridge each guest's metrics scrape over the SSH channel it already holds.
+# tini reaps orphaned children from SSH ControlPersist daemonization. Without an
+# init process, exited SSH children accumulate as zombies under huskd and can
+# eventually exhaust process limits, preventing both scrapes and reconciliation.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libvirt0 openssh-client \
+    && apt-get install -y --no-install-recommends libvirt0 openssh-client tini \
     && rm -rf /var/lib/apt/lists/*
 
 # Run as non-root; the lock lives under /tmp and config is mounted read-only.
@@ -87,5 +90,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
 # entrypoint to add — an external ASGI server would serve the Quart surface but
 # skip the reconcile loop entirely. (huskd is a single-command Typer app, so the
 # daemon is `huskd <opts>` with no subcommand.) Mount config + secrets at these paths.
-ENTRYPOINT ["huskd"]
+# Tini owns PID 1 and forwards shutdown signals to huskd, which retains its
+# graceful shutdown and controller-lock handoff.
+ENTRYPOINT ["/usr/bin/tini", "--", "huskd"]
 CMD ["--config", "/etc/husk/config.toml"]

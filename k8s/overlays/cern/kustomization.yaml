@@ -34,10 +34,10 @@ images:
   #
   # NB the build still PUSHES to ghcr.io (a proxy cache is pull-only) — see
   # oc_image vs oc_pull_image in the justfile. Both must agree with this, or
-  # `oc set image` in k8s-live-deploy silently stamps ghcr.io back over it.
+  # `oc set image` in k8s-live-deploy-ci uses this same proxy path.
   - name: ghcr.io/acts-project/husk
     newName: registry.cern.ch/ghcr.io/acts-project/husk
-    newTag: latest  # `just k8s-live-deploy` overwrites this with the sha- tag
+    newTag: latest  # deploy pins a cluster digest; deploy-ci pins the CI sha- tag
 
 patches:
   # Swap the base's emptyDir volumes for PVCs: the golden-image cache, and huskd's

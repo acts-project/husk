@@ -662,7 +662,7 @@ k8s-live-check:
 #  * `oc run --attach` exits with the container's own exit code, so a validation
 #    failure aborts the recipe — and with it the deploy — before `oc apply`.
 # Validate the config in-cluster against this commit's image, changing nothing.
-k8s-live-preflight:
+k8s-live-preflight image_ref=(oc_pull_image + ":" + oc_sha):
     #!/usr/bin/env bash
     set -euo pipefail
     cfg="k8s/overlays/cern/config.toml"
@@ -679,13 +679,13 @@ k8s-live-preflight:
     oc create configmap "$cm" --from-file=config.toml="$cfg" -n "$ns" \
         --dry-run=client -o yaml | oc apply -n "$ns" -f - >/dev/null
 
-    echo "preflight: validating $cfg against {{oc_image}}:{{oc_sha}} in $ns..."
+    echo "preflight: validating $cfg against {{image_ref}} in $ns..."
     overrides=$(cat <<JSON
     {"spec": {
       "restartPolicy": "Never",
       "containers": [{
         "name": "$pod",
-        "image": "{{oc_image}}:{{oc_sha}}",
+        "image": "{{image_ref}}",
         "command": ["huskctl", "validate", "--config", "/etc/husk/config.toml"],
         "env": [{"name": "HUSK_GITHUB__PRIVATE_KEY",
                  "valueFrom": {"secretKeyRef": {"name": "huskd-github", "key": "private-key.pem"}}}],
@@ -699,7 +699,7 @@ k8s-live-preflight:
     }}
     JSON
     )
-    oc run "$pod" -n "$ns" --image="{{oc_image}}:{{oc_sha}}" --restart=Never \
+    oc run "$pod" -n "$ns" --image="{{image_ref}}" --restart=Never \
         --attach --rm --quiet --pod-running-timeout=5m --overrides="$overrides" \
         --command -- huskctl validate --config /etc/husk/config.toml
 
@@ -731,8 +731,38 @@ k8s-live-diff:
 # That fails as the initContainer crash-looping on a config that is actually
 # valid, and it reproduces only on the nodes with a stale copy.
 # Deploy: validate locally, check the image, validate in-cluster, apply, pin, wait.
-k8s-live-deploy: (k8s-validate "cern") k8s-live-check k8s-live-preflight k8s-live-apply
+k8s-live-deploy-ci: (k8s-validate "cern") k8s-live-check k8s-live-preflight k8s-live-apply
     oc set image deployment/huskd huskd={{oc_pull_image}}:{{oc_sha}} validate-config={{oc_pull_image}}:{{oc_sha}} -n {{k8s_namespace}}
+    oc rollout status deployment/huskd -n {{k8s_namespace}} --timeout=10m
+
+# Build committed HEAD on OpenShift workers (source=working-tree includes local edits).
+k8s-live-build source="HEAD":
+    python3 scripts/oc-build.py --namespace {{k8s_namespace}} --source {{quote(source)}}
+
+# Build in OpenShift, validate the exact image, then apply with both images pinned.
+k8s-live-deploy source="HEAD": (k8s-validate "cern")
+    #!/usr/bin/env bash
+    set -euo pipefail
+    staged=$(mktemp -d)
+    trap 'rm -rf "$staged"' EXIT
+    python3 scripts/oc-build.py --namespace {{k8s_namespace}} --source {{quote(source)}} --output "$staged/image"
+    built_image=$(cat "$staged/image")
+    just k8s-live-preflight "$built_image"
+    # An outer overlay pins the image BEFORE apply, avoiding an intermediate
+    # rollout of :latest. Kustomize applies this to the init container as well.
+    python3 - "$staged" "$PWD/k8s/overlays/cern" "$built_image" <<'PY'
+    import json, os, pathlib, sys
+    staged, overlay, image = sys.argv[1:]
+    repository, digest = image.split("@", 1)
+    pathlib.Path(staged, "kustomization.yaml").write_text(json.dumps({
+        "apiVersion": "kustomize.config.k8s.io/v1beta1",
+        "kind": "Kustomization",
+        "resources": [os.path.relpath(pathlib.Path(overlay).resolve(), pathlib.Path(staged).resolve())],
+        "images": [{"name": "{{oc_pull_image}}", "newName": repository, "digest": digest}],
+    }))
+    PY
+    oc kustomize "$staged" --load-restrictor=LoadRestrictionsNone > "$staged/manifests.yaml"
+    oc apply -n {{k8s_namespace}} -f "$staged/manifests.yaml"
     oc rollout status deployment/huskd -n {{k8s_namespace}} --timeout=10m
 
 # Roll back the live deployment one revision.
@@ -741,7 +771,7 @@ k8s-live-rollback:
 
 # ESCAPE HATCH for iterating on the live cluster without waiting for CI: build the
 # image here and push it over this commit's CI tag. It PUSHES ONLY — deploying is
-# still `just k8s-live-deploy`, which validates the config and applies the overlay.
+# still `just k8s-live-deploy-ci`, which validates the config and applies the overlay.
 #
 # That split is the whole point. The recipe this replaced also rolled the
 # deployment, which meant it shipped new CODE against whatever ConfigMap was
@@ -763,11 +793,11 @@ k8s-live-rollback:
 # the tag: both containers are imagePullPolicy IfNotPresent, so a node that already
 # cached this tag (from CI's build of the same commit, or an earlier push) can
 # silently reuse those layers and "deploy" the old image. A digest the node has
-# never seen always pulls. `k8s-live-deploy` sets the tag, which is right for a CI
+# never seen always pulls. `k8s-live-deploy-ci` sets the tag, which is right for a CI
 # image — after a local push, re-pin by digest with the command this prints.
 #
 # The tag it overwrites no longer matches what CI built from that commit, so the
-# provenance k8s-live-deploy relies on is broken until the next CI build. Use it to
+# provenance k8s-live-deploy-ci relies on is broken until the next CI build. Use it to
 # iterate; land the change and let CI rebuild before anything you intend to keep.
 #
 # The first amd64 build is SLOW: libvirt-python compiles from source under QEMU.
@@ -792,7 +822,7 @@ k8s-live-push:
     echo "pushed digest: $digest"
     echo
     echo "deploy it with (validates the config, applies the overlay, pins the tag):"
-    echo "    just k8s-live-deploy"
+    echo "    just k8s-live-deploy-ci"
     echo "then re-pin by digest, so IfNotPresent cannot serve a cached copy of this tag:"
     echo "    oc set image deployment/huskd huskd={{oc_pull_image}}@$digest validate-config={{oc_pull_image}}@$digest -n {{k8s_namespace}}"
     echo "    oc rollout status deployment/huskd -n {{k8s_namespace}} --timeout=10m"

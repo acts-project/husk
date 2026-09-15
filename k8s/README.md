@@ -179,6 +179,10 @@ Two different images, easily confused:
   `ghcr.io/acts-project/husk`, pushed on **every main commit** (and `v*` tags),
   tagged `sha-<short>` among others. This is what runs on Kubernetes.
 
+The default live deployment also builds the daemon directly in OpenShift and
+pushes to the internal `huskd` ImageStream (see below). GitHub Actions remains
+an alternative publisher.
+
 Note the naming: the daemon is the bare repo name `husk`; the goldens are
 `husk-base`/`husk-gpu`. Easy to mix up.
 
@@ -194,25 +198,45 @@ reconcile loop faithfully, but not the exact binary artifact.
 
 ## Live (CERN OpenShift)
 
-Untested — the local run comes first.
-
-**Deploy is manual, by design.** The CERN OpenShift API isn't reachable from
-GitHub-hosted runners, so CI stops at pushing the image and deployment is a
-hands-on step over the CERN VPN. Setup: VPN up, `oc login`, `oc new-project husk`,
-`just k8s-secrets`. Then:
+**Deploy is manual.** Connect to the CERN VPN and log in with `oc`. The default
+workflow builds the daemon on OpenShift workers, pushes it into the cluster's
+internal registry, validates the config against that exact image, and applies
+the CERN overlay with both `huskd` and `validate-config` pinned to its digest.
+No local Docker engine or GHCR push credentials are needed.
 
 ```sh
-just k8s-live-diff      # what would change
-just k8s-live-deploy    # verify CI image exists, apply, pin SHA, wait
-just k8s-live-rollback  # undo one revision
+just k8s-live-build                 # build committed HEAD only; no deployment
+just k8s-live-deploy                # build HEAD, validate, apply, wait
+just k8s-live-deploy working-tree   # explicitly include uncommitted daemon changes
+just k8s-live-rollback              # undo one deployment revision
 ```
 
-`k8s-live-deploy` pins `ghcr.io/acts-project/husk:sha-<HEAD>` — the artifact CI built
-from that commit — rather than building on your laptop. So it fails fast if CI
-hasn't built the current commit, and warns if the tree is dirty or HEAD isn't on
-`origin/main`; all three mean the thing you're about to deploy isn't the thing you
-tested. (`sentinel` routes `oc` through `ssh lxplus`; husk doesn't need that now
-the VPN exists.)
+The BuildConfig and ImageStream in `k8s/build.yaml` are created on first build.
+This uses OpenShift's binary Docker build strategy, like Cheerenkov: the laptop
+uploads source; cluster workers build the image. It requires permission to
+create BuildConfigs, ImageStreams and Builds in the `husk` namespace.
+
+Only `Dockerfile`, `pyproject.toml`, `uv.lock`, and `src/` are uploaded. The default
+exports those inputs from committed HEAD. `working-tree` includes their local
+edits and nonignored new source files. Local secrets, configuration, `.git`, and
+the virtual environment are outside the upload. Deployment still uses the local
+CERN overlay and config, as before; runtime Secrets are managed separately.
+
+The digest comes from the **specific completed Build**, never by looking up a
+mutable `latest` tag. A failed build or preflight stops deployment. Image pins
+are applied before the manifests reach the API, so there is no intermediate
+rollout of `latest`. Re-deploying identical image/config content is a no-op;
+use `oc -n husk rollout restart deployment/huskd` for an intentional restart.
+
+The previous CI-image path remains available as `just k8s-live-deploy-ci`.
+It checks the SHA tag published by GitHub Actions and pulls it through CERN's
+Harbor cache. `just k8s-live-push` remains a local-build escape hatch for that
+CI-image path. Neither is required for cluster builds.
+
+The daemon image runs under Tini so orphaned SSH ControlPersist children are
+reaped. Without a reaper, SSH zombies can accumulate until new processes and
+threads fail to start, stopping libvirt reconciliation. Tini also forwards
+SIGTERM to huskd for its graceful shutdown and controller-lock handoff.
 
 ### Golden-image cache sizing
 
