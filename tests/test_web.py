@@ -308,55 +308,9 @@ def test_slot_metrics_503_when_lease_missing():
     assert _client_get(app, "/slot/pool-gpu/husk-g-1/metrics")[0] == 503
 
 
-# ── on-demand serial console ──────────────────────────────────────────────────
-# Boot timing comes from the guest itself now (node_exporter textfile), and
-# nothing polls the console. It survives for the case metrics structurally
-# cannot cover: a slot that died before the exporter ever started.
-
-
-def test_slot_console_returns_the_text():
-    calls = []
-
-    def provider(backend, slot_id):
-        calls.append((backend, slot_id))
-        return "===== husk-bootreport =====\nrunner_started 18.6\n"
-
-    app = make_app(lambda: [_libvirt_snap()], console_provider=provider)
-    code, body = _client_get(app, "/slot/pool-gpu/husk-g-1/console")
-    assert code == 200
-    assert b"runner_started 18.6" in body
-    # Resolved to the slot's ID from the snapshot, not the name in the URL.
-    assert calls == [("pool-gpu", "vm-1")]
-
-
-def test_slot_console_is_not_an_open_relay():
-    calls = []
-    app = make_app(
-        lambda: [_libvirt_snap()],
-        console_provider=lambda b, s: calls.append((b, s)) or "x",
-    )
-    assert _client_get(app, "/slot/pool-gpu/not-a-slot/console")[0] == 404
-    assert _client_get(app, "/slot/other-pool/husk-g-1/console")[0] == 404
-    assert calls == []
-
-
-def test_slot_console_503_without_a_provider():
+def test_slot_console_endpoint_removed():
     app = make_app(lambda: [_libvirt_snap()])
-    assert _client_get(app, "/slot/pool-gpu/husk-g-1/console")[0] == 503
-
-
-def test_slot_console_503_when_the_backend_has_none():
-    # libvirt has no captured serial log yet, so its console_output returns None.
-    app = make_app(lambda: [_libvirt_snap()], console_provider=lambda b, s: None)
-    assert _client_get(app, "/slot/pool-gpu/husk-g-1/console")[0] == 503
-
-
-def test_slot_console_reports_a_raising_provider_as_502():
-    def boom(backend, slot_id):
-        raise RuntimeError("cloud said no")
-
-    app = make_app(lambda: [_libvirt_snap()], console_provider=boom)
-    assert _client_get(app, "/slot/pool-gpu/husk-g-1/console")[0] == 502
+    assert _client_get(app, "/slot/pool-gpu/husk-g-1/console")[0] == 404
 
 
 def test_metrics_concats_pools():

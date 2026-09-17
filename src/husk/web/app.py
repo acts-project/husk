@@ -32,7 +32,7 @@ names (not secrets) — bind to localhost unless it sits behind network controls
 it is deliberately exposed to the internet so GitHub can reach it. The two must
 not be confused when configuring ingress: the OpenShift Route that opens
 `/webhook` is path-scoped for exactly this reason, and widening it to the whole
-app would publish the dashboard, `/status` and the console endpoint along with it.
+app would publish the dashboard, `/status` and `/metrics` along with it.
 """
 
 from __future__ import annotations
@@ -110,7 +110,6 @@ def make_app(
     advertise_scheme: str = "http",
     storage_provider: Callable[[], list[DiskUsage]] | None = None,
     metrics: Metrics | None = None,
-    console_provider: Callable[[str, str], str | None] | None = None,
     is_active: Callable[[], bool] | None = None,
     jobs: JobRegistry | None = None,
     webhook_secret: str | None = None,
@@ -144,12 +143,6 @@ def make_app(
     the same object the controllers and the poller record into. Omitted, `/metrics`
     still serves everything derivable from the snapshot — which is what `huskctl`
     and most tests want.
-
-    `console_provider` reads a slot's serial console (backend, slot name) → text.
-    It backs `/slot/<backend>/<slot>/console`, which exists for the one case the
-    metrics path structurally cannot cover: a slot that never got far enough for
-    node_exporter to be scraped publishes nothing, and its console is the only
-    remaining evidence. On demand only — nothing polls it.
 
     `is_active`, if given, reports whether THIS pod is the active reconciler (it
     holds the controller lock) or a standby waiting for it under a rolling update.
@@ -422,40 +415,6 @@ def make_app(
                 metrics.guest_scrape_failures.inc(backend)
             return Response(f"{e}\n", status=502)
         return Response(body, content_type="text/plain; version=0.0.4; charset=utf-8")
-
-    @app.get("/slot/<backend>/<slot>/console")
-    async def slot_console(backend: str, slot: str):
-        """The slot's serial console, as text. Deliberately on-demand: boot timing
-        now arrives via node_exporter (husk_cloudinit_step_seconds & co.), and
-        nothing polls the console any more. What it is still for is the case that
-        path cannot reach — a slot that died before the exporter started, where
-        the console is the only thing that saw what happened.
-
-        Like /metrics above, the slot is resolved through the current snapshot
-        rather than trusted from the URL, so this can only read a slot huskd
-        manages."""
-        if console_provider is None:
-            return Response("no console provider configured\n", status=503)
-        view = next(
-            (
-                v
-                for s in _snaps()
-                if s.backend == backend
-                for v in s.slots
-                if v.name == slot
-            ),
-            None,
-        )
-        if view is None:
-            return Response(f"no such slot {slot!r} in pool {backend!r}\n", status=404)
-        try:
-            text = await asyncio.to_thread(console_provider, backend, view.id)
-        except Exception as e:  # the backend seam promises not to, but be safe
-            log.warning("console read failed for %s/%s: %s", backend, slot, e)
-            return Response(f"console read failed: {e}\n", status=502)
-        if not text:
-            return Response(f"no console output for slot {slot!r}\n", status=503)
-        return Response(text, content_type="text/plain; charset=utf-8")
 
     @app.get("/livez")
     async def livez():

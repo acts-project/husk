@@ -3,8 +3,8 @@
 # Same host as the huskd Route, split by path. OpenShift/HAProxy routes by
 # longest-prefix match, so this Route wins for /webhook and everything else falls
 # through to the pathless one — which keeps its default CERN-only visibility. That
-# split is the point: the dashboard, /status, /metrics and the slot console
-# endpoint are all unauthenticated, and widening the existing Route instead of
+# split is the point: the dashboard, /status and /metrics
+# are all unauthenticated, and widening the existing Route instead of
 # adding this one would publish every one of them to the internet.
 #
 # Path matching is a PREFIX match: this also admits /webhookanything, which Quart

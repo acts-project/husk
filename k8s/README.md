@@ -85,7 +85,7 @@ At CERN the endpoint is reachable from the internet through a *second* Route
 (`k8s/overlays/cern/route-webhook.yaml`) that claims the same host with
 `path: /webhook` and `haproxy.router.openshift.io/ip_whitelist: ""`. The pathless
 `route.yaml` keeps its default CERN-only visibility, which is what stops the
-dashboard, `/status`, `/metrics` and the slot console from being published along
+dashboard, `/status` and `/metrics` from being published along
 with it. **Absent ≠ empty** on that annotation: removing it re-inserts the CERN
 ranges and deliveries start timing out silently — watch
 `husk_webhook_deliveries_total{result="rejected"}`, which also catches a rotated

@@ -313,9 +313,8 @@ image or set up once per host.**
    slot reports on itself" below. huskd's own clock still supplies
    `husk_slot_last_cloudinit_seconds` / `husk_slot_last_recycle_seconds`, which is
    the outer frame that guest-side numbers sit inside.
-2. ~~**Console-log exfil.**~~ **Superseded** by the same change. The console is
-   still readable on demand at `GET /slot/<backend>/<slot>/console`, for a slot
-   that never came up far enough to publish anything; nothing polls it.
+2. ~~**Console-log exfil.**~~ **Superseded** by the same change. The HTTP console endpoint
+   has also been removed. Read boot failures through the backend console tools.
 3. **The `husk_slot_info` join table** on `/metrics`:
    ```
    husk_slot_info{backend="cern-cpu", slot="...", ip="...",
@@ -949,9 +948,8 @@ soft-failing (`[ -n "$ips" ]`), nothing else would ever tell you.
   Per the O1 experience: **canary recycle time before rolling out.**
 - **Needs `scrape_cidr` set** — node_exporter is fail-closed, so a pool without it
   starts no exporter and publishes nothing.
-- **A slot that dies before the exporter starts publishes nothing at all.** That
-  is what `GET /slot/<backend>/<slot>/console` is for: an on-demand read of the
-  serial console, resolved through huskd's own snapshot. Nothing polls it.
+- **A slot that dies before the exporter starts publishes nothing at all.** Use
+  OpenStack console-log tools or `virsh console` to diagnose these boot failures.
 
 -----
 

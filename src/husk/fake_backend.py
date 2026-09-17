@@ -32,8 +32,6 @@ class FakeBackend:
         self.raise_on_rebuild = False  # emulate a backend rejecting the rebuild
         self.calls: list[tuple] = []
         self._ids = itertools.count(1)
-        self.console_text: str | None = None  # scripted serial console (bootreport)
-        self.console_reads: list[str] = []  # slot ids read (console_output is no-op)
 
     # --- Backend protocol -------------------------------------------------
     def list_slots(self) -> list[Slot]:
@@ -90,10 +88,6 @@ class FakeBackend:
 
     def image_ready(self, slot: Slot) -> bool:
         return self._image_ready
-
-    def console_output(self, slot: Slot, *, lines: int | None = None) -> str | None:
-        self.console_reads.append(slot.id)  # read-only: kept out of .calls (actions)
-        return self.console_text
 
     # --- test helpers -----------------------------------------------------
     def set_status(self, slot_id: str, **changes) -> None:

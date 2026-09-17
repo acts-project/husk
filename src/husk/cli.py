@@ -582,11 +582,6 @@ class _Serving:
     def snapshots(self) -> list[ControllerState]:
         return self.facade.snapshots() if self.facade is not None else []
 
-    def console_output(self, backend: str, slot_id: str):
-        if self.facade is None:
-            return None
-        return self.facade.console_output(backend, slot_id)
-
     def storage(self):
         from husk.storage import collect as collect_storage
 
@@ -661,7 +656,6 @@ async def _serve(
         advertise_scheme=advertise_scheme,
         storage_provider=state.storage,
         metrics=metrics,
-        console_provider=state.console_output,
         # The dashboard reads this to show whether THIS pod is the active reconciler
         # or a standby waiting for the lock (see _Serving).
         is_active=lambda: state.active,
