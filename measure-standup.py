@@ -261,7 +261,6 @@ def do_rebuild(conn, server, image, with_ssh_probe, timings, label):
     """Rebuild an existing server, time the lifecycle."""
     print(f"  --- {label} (rebuild) ---")
 
-    rebuild_kwargs = dict(image=image.id)
     # Note: passing user-data on rebuild requires microversion 2.57+; not all
     # clouds support it. We don't pass new user-data here — just measure the
     # baseline rebuild cost.

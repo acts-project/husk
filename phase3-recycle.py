@@ -36,7 +36,6 @@ USAGE:
 import argparse
 import base64
 import os
-import socket
 import subprocess
 import sys
 import time
